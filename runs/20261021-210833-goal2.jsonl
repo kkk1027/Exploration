@@ -1,0 +1,5 @@
+{"ts":"2026-10-21T21:08:34+08:00","tag":"goal2",""check":"pre_launch","nodes":0,"gzserver":0,"residue":"""}
+{"ts":"2026-10-21T21:08:34+08:00","tag":"goal2",""check":"pose","x":-0.3,"y":0.4,"yaw":3.1416"}
+{"ts":"2026-10-21T21:08:37+08:00","tag":"goal2",""check":"launch","pgid":"65201""}
+{"ts":"2026-10-21T21:12:57+08:00","tag":"goal2",""check":"post_teardown","nodes":0,"gzserver":0,"residue":"""}
+{"ts":"2026-10-21T21:12:57+08:00","tag":"goal2",""verdict":"PASS_clean""}
