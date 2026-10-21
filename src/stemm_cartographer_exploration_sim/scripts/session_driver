@@ -20,7 +20,9 @@ import time
 import rclpy
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid, Odometry
+from rclpy.action import ActionClient
 from rclpy.node import Node
+from nav2_msgs.action import NavigateToPose
 from std_srvs.srv import SetBool
 
 MAP_FRAME = 'map'
@@ -54,6 +56,9 @@ class SessionDriver(Node):
         self.map_msg = None
         self.create_subscription(OccupancyGrid, '/map', self._on_map, qos_map)
         self.cli = self.create_client(SetBool, '/stemm_cartographer/set_mapping_done')
+        # 兜底：向 Nav2 发 cancel-all（goal_id 全零 = 取消所有目标），
+        # 用于解开"等活跃目标取消"的僵局（已获授权，仅改仿真侧）
+        self.nav_client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
         self.pose_xy = None
         self.create_timer(1.0, self._tick)
         self.get_logger().info(
@@ -109,6 +114,25 @@ class SessionDriver(Node):
             return
         now = time.monotonic()
 
+        # 阶段0：给车端未传 use_sim_time 的节点补运行时参数（已确认 mapping_tf_guard 缺）
+        # 它用墙钟 now() 比仿真的 TF 时间戳 → 30 s 内必超时；这里在前 30 s 内反复尝试直到成功。
+        if not getattr(self, '_patch_done', False) and now - self.t_boot < 30.0:
+            if now - getattr(self, '_last_patch_try', 0.0) >= 2.0:
+                self._last_patch_try = now
+                try:
+                    r = subprocess.run(['bash', '-lc',
+                        'source /opt/ros/humble/setup.bash && '
+                        'source /home/kbf/stemm_sim_ws/install/setup.bash && '
+                        'source /home/kbf/stemm_explore_ws/install/setup.bash && '
+                        'export ROS_DOMAIN_ID=42 && '
+                        'ros2 param set /stemm_cartographer_mapping_tf_guard use_sim_time true'],
+                        capture_output=True, text=True, timeout=15)
+                    if 'True' in (r.stdout or ''):
+                        self._patch_done = True
+                        self.get_logger().info('已给 mapping_tf_guard 补 use_sim_time=true')
+                except Exception:
+                    pass
+
         # 阶段1：等探索开始（带看门狗：60 s 无第一个前沿目标 → 记异常并尝试重新使能）
         if self.t_first_goal is None:
             if (not getattr(self, '_wd_warned', False)
@@ -148,6 +172,9 @@ class SessionDriver(Node):
             self.get_logger().warn(
                 f'返航未启动，第 {self._retries} 次重发 set_mapping_done（等活跃目标取消可能卡住）')
             self._call_done()
+            if self._retries >= 2 and self.nav_client.wait_for_server(timeout_sec=2.0):
+                self.nav_client.cancel_goal_async(NavigateToPose.Goal())
+                self.get_logger().warn('已向 /navigate_to_pose 发送 cancel-all 兜底')
         dist = None
         if self.pose_xy is not None:
             dist = math.hypot(self.pose_xy[0], self.pose_xy[1])

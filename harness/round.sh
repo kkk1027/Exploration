@@ -35,6 +35,9 @@ if [ "$NODES" -gt 1 ] || [ "$GZ" -gt 0 ]; then
   [ "$NODES" -gt 1 ] || [ "$GZ" -gt 0 ] && { say "清理不彻底，放弃本轮"; rec '"verdict":"FAIL_preclean"'; exit 10; }
 fi
 
+rm -f /home/kbf/stemm_sim_ws/maps/explore_latest.pgm /home/kbf/stemm_sim_ws/maps/explore_latest.yaml
+T_START=$(date +%s)
+
 # ---- 2) 启动（记录真实 PGID） ----
 setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE" \
   > "$OUT/launch.log" 2>&1 < /dev/null &
@@ -53,7 +56,8 @@ else
   while [ "$waited" -lt "$MAXW" ]; do
     sleep 10; waited=$((waited+10))
     if grep -q "会话结束" "$OUT/launch.log" 2>/dev/null; then say "检测到会话结束（${waited}s）"; break; fi
-    if [ -f /home/kbf/stemm_sim_ws/maps/explore_latest.pgm ]; then say "地图已落盘（${waited}s）"; break; fi
+    MF=/home/kbf/stemm_sim_ws/maps/explore_latest.pgm
+    if [ -f "$MF" ] && [ "$(stat -c %Y "$MF")" -ge "$T_START" ]; then say "地图已落盘（${waited}s）"; break; fi
     pgrep -x gzserver >/dev/null || { say "gzserver 已退出（${waited}s）"; break; }
   done
 fi
