@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# 仿真垫片：实机探索栈的 preflight 通过 systemctl 校验"现场隔离"状态：
+#   必须 active  ：wheeltec-robot.service（底盘驱动）、wheeltec-lidar.service（常驻雷达）
+#   必须 inactive：low-battery-auto-recharge / wheeltec-recharge-manager / bodyfollow-nav2
+# 仿真里这些服务都不存在（底盘=Gazebo 插件、雷达=Gazebo ray、无回充/跟随），
+# 所以这里按上述期望作答，其余调用原样转给真 systemctl。
+# 仅通过 launch 的 PATH 前置注入本仿真会话，不影响系统。
+ACTIVE_UNITS="wheeltec-robot.service wheeltec-lidar.service"
+INACTIVE_UNITS="low-battery-auto-recharge.service wheeltec-recharge-manager.service bodyfollow-nav2.service"
+if [ "$1" = "is-active" ]; then
+  unit="${@: -1}"
+  for u in $ACTIVE_UNITS;   do [ "$unit" = "$u" ] && { [ "$2" = "--quiet" ] && exit 0; echo active; exit 0; }; done
+  for u in $INACTIVE_UNITS; do [ "$unit" = "$u" ] && { [ "$2" = "--quiet" ] && exit 3; echo inactive; exit 3; }; done
+fi
+exec /usr/bin/systemctl "$@"

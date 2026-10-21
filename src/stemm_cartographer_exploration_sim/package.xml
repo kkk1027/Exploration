@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>stemm_cartographer_exploration_sim</name>
+  <version>0.1.0</version>
+  <description>实机 STEMM 自主探索栈（stemm_cartographer_exploration）的仿真接入包：
+  车端源码零改动，仅提供仿真世界/机器人装配的 launch、参数适配和会话驱动。</description>
+  <maintainer email="kbf@example.com">kbf</maintainer>
+  <license>Proprietary</license>
+  <buildtool_depend>ament_cmake</buildtool_depend>
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>std_srvs</exec_depend>
+  <exec_depend>nav_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>tf2_ros</exec_depend>
+  <exec_depend>nav2_map_server</exec_depend>
+  <exec_depend>stemm_cartographer_exploration</exec_depend>
+  <exec_depend>wheeltec_two_wheel_model</exec_depend>
+  <export><build_type>ament_cmake</build_type></export>
+</package>
