@@ -28,4 +28,9 @@ done
 for N in /controller_server /planner_server /bt_navigator /behavior_server /global_costmap/global_costmap /local_costmap/local_costmap; do
   ros2 param set "$N" transform_tolerance 0.5 >/dev/null 2>&1 && echo "[patch_sim_time] ${N} transform_tolerance=0.5 ✓"
 done
+# 车端 return_home 的末段姿态对齐有 25 s 上限；仿真控制器末端易小幅摆动，
+# 放宽 Nav2 的目标容差让 BT 能更早宣告成功（仅仿真侧运行时参数）
+ros2 param set /controller_server yaw_goal_tolerance 0.15   >/dev/null 2>&1 && echo "[patch_sim_time] controller_server yaw_goal_tolerance=0.15 ✓"
+ros2 param set /controller_server xy_goal_tolerance 0.15    >/dev/null 2>&1 && echo "[patch_sim_time] controller_server xy_goal_tolerance=0.15 ✓"
+ros2 param set /controller_server xy_goal_tolerance 0.15    >/dev/null 2>&1
 echo "[patch_sim_time] 部分未成功：$DONE"; exit 0
