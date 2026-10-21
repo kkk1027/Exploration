@@ -140,6 +140,7 @@ class SessionDriver(Node):
                     f'=== 探索限时到（{self.explore_sec:.0f}s），调用 set_mapping_done 结束建图 ===')
                 self.t_done_called = now
                 self.done_sent = True
+                self._start_clock_resampler_for_return()
                 self._call_done()
             return
 
@@ -173,6 +174,35 @@ class SessionDriver(Node):
                     f'{dist if dist is None else round(dist, 2)} m）—— 实机为无限时，'
                     f'此处仅告警，请人工判断是否卡死')
 
+    def _start_clock_resampler_for_return(self):
+        """返航阶段启用时钟细化：探索期关（cartographer 对 TF 新鲜度敏感），
+        返航期开（Nav2 的 now() 需要细粒度，否则 coarse 10 Hz 时钟会导致
+        'Extrapolation Error looking up target frame'）。"""
+        if getattr(self, '_clk', None) is not None:
+            return
+        import os
+        env = dict(os.environ)
+        env['ROS_DOMAIN_ID'] = os.environ.get('ROS_DOMAIN_ID', '42')
+        try:
+            self._clk = subprocess.Popen(
+                ['bash', '-lc',
+                 'source /opt/ros/humble/setup.bash && '
+                 'source /home/kbf/stemm_sim_ws/install/setup.bash && '
+                 'exec ros2 run wheeltec_two_wheel_model sim_clock_resampler'],
+                env=env)
+            self.get_logger().info('返航阶段已启用时钟细化节点（2 ms）')
+        except Exception as exc:                     # noqa: BLE001
+            self.get_logger().warn(f'启用时钟细化失败：{exc}')
+
+    def _stop_clock_resampler(self):
+        c = getattr(self, '_clk', None)
+        if c is not None:
+            try:
+                c.terminate()
+            except Exception:
+                pass
+            self._clk = None
+
     def _call_done(self):
         if not self.cli.wait_for_service(timeout_sec=10.0):
             self.get_logger().error('set_mapping_done 服务不可用（10s 超时）—— 探索栈可能未起来')
@@ -185,6 +215,7 @@ class SessionDriver(Node):
 
     def _finish(self):
         self.finished = True
+        self._stop_clock_resampler()
         explore = (self.t_done_called - self.t_first_goal) if self.t_done_called else None
         ret = (time.monotonic() - self.t_done_called) if self.t_done_called else None
         self.get_logger().info(
