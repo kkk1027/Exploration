@@ -17,6 +17,7 @@ from launch import LaunchDescription
 from launch.actions import (DeclareLaunchArgument, ExecuteProcess,
                             IncludeLaunchDescription, SetEnvironmentVariable,
                             TimerAction)
+from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration
 from ament_index_python.packages import get_package_prefix
@@ -25,6 +26,8 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     model = get_package_share_directory('wheeltec_two_wheel_model')
+    nav_share = get_package_share_directory('wheeltec_two_wheel_nav')
+    rviz_cfg = os.path.join(nav_share, 'rviz', 'slam.rviz')
     explore = get_package_share_directory('stemm_cartographer_exploration')
     sim_pkg = get_package_share_directory('stemm_cartographer_exploration_sim')
 
@@ -59,6 +62,11 @@ def generate_launch_description():
                           'lib', 'stemm_cartographer_exploration_sim', 'patch_sim_time')],
         output='screen')
 
+    rviz = Node(package='rviz2', executable='rviz2', name='rviz2', output='screen',
+                condition=IfCondition(LaunchConfiguration('rviz')),
+                arguments=['-d', rviz_cfg],
+                parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')}])
+
     driver = Node(
         package='stemm_cartographer_exploration_sim',
         executable='session_driver',
@@ -78,6 +86,8 @@ def generate_launch_description():
         DeclareLaunchArgument('world', default_value=os.path.join(
             model, 'world', 'custom_room_2ms.world'),
             description='仿真世界（默认 2 ms 步长版）'),
+        DeclareLaunchArgument('rviz', default_value='true',
+            description='是否启动 rviz2（地图/激光/机器人模型可视化）'),
         DeclareLaunchArgument('spawn_x', default_value='0.0'),
         DeclareLaunchArgument('spawn_y', default_value='0.0'),
         DeclareLaunchArgument('spawn_yaw', default_value='0.0'),
@@ -93,4 +103,5 @@ def generate_launch_description():
                         '约需 30~40 s，而探索栈内的 mapping_tf_guard 只有 30 s 超时'),
         robot,
         TimerAction(period=stack_delay, actions=[stack, patch_sim_time]),
-        TimerAction(period=stack_delay, actions=[driver])])
+        TimerAction(period=stack_delay, actions=[driver]),
+        rviz])
