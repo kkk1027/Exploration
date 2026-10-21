@@ -55,6 +55,7 @@ class SessionDriver(Node):
         self.create_subscription(OccupancyGrid, '/map', self._on_map, qos_map)
         self.cli = self.create_client(SetBool, '/stemm_cartographer/set_mapping_done')
         self.pose_xy = None
+        self._start_clock_resampler_for_return()   # 栈启动即启用（滞后插值，不会超前引擎时间）
         self.create_timer(1.0, self._tick)
         self.get_logger().info(
             f'session_driver 就绪：探索限时 {self.explore_sec:.0f}s（从收到第一个探索目标算起）；'
