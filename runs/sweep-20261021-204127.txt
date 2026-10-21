@@ -1,0 +1,6 @@
+sweep 开始 2026-10-21T20:41:27+08:00  共 6 轮（120s×4 + 180s×2）
+--- 第 1 轮（explore=120.0s）---
+本轮随机起点：x=0.4 y=0.3 yaw=1.5708 → FAIL
+!!! 第 1 轮失败，停止 sweep（连续计数 0）
+日志: /home/kbf/stemm_exploration_sim_ws/logs/round_20261021-204127_sweep1/launch.log
+sweep 结束 2026-10-21T20:45:52+08:00  连续通过 0 轮
