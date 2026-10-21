@@ -42,7 +42,7 @@ T_START=$(date +%s)
 
 # 随机起点（5 个候选，房间原点附近的安全偏移位姿）
 POSES=("0.0 0.0 0.0" "0.4 0.3 1.5708" "-0.3 0.4 3.1416" "0.3 -0.4 -1.5708" "-0.4 -0.3 0.7854")
-POSE=${POSES[$((RANDOM % ${#POSES[@]}))]}
+POSE=${POSE_OVERRIDE:-${POSES[$((RANDOM % ${#POSES[@]}))]}}
 set -- $POSE; SX=$1; SY=$2; SYAW=$3
 say "本轮随机起点：x=$SX y=$SY yaw=$SYAW"
 rec "\"check\":\"pose\",\"x\":$SX,\"y\":$SY,\"yaw\":$SYAW"
