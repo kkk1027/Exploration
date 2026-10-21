@@ -20,9 +20,7 @@ import time
 import rclpy
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import OccupancyGrid, Odometry
-from rclpy.action import ActionClient
 from rclpy.node import Node
-from nav2_msgs.action import NavigateToPose
 from std_srvs.srv import SetBool
 
 MAP_FRAME = 'map'
@@ -56,9 +54,6 @@ class SessionDriver(Node):
         self.map_msg = None
         self.create_subscription(OccupancyGrid, '/map', self._on_map, qos_map)
         self.cli = self.create_client(SetBool, '/stemm_cartographer/set_mapping_done')
-        # 兜底：向 Nav2 发 cancel-all（goal_id 全零 = 取消所有目标），
-        # 用于解开"等活跃目标取消"的僵局（已获授权，仅改仿真侧）
-        self.nav_client = ActionClient(self, NavigateToPose, '/navigate_to_pose')
         self.pose_xy = None
         self.create_timer(1.0, self._tick)
         self.get_logger().info(
@@ -155,9 +150,7 @@ class SessionDriver(Node):
                 f'返航未启动，第 {self._retries} 次重发 set_mapping_done（等活跃目标取消可能卡住）')
             try:
                 self._call_done()
-                if self._retries >= 1 and self.nav_client.server_is_ready():
-                    self.nav_client.cancel_goal_async(NavigateToPose.Goal())
-                    self.get_logger().warn('已向 /navigate_to_pose 发送 cancel-all 兜底')
+                pass  # cancel-all 需 goal handle，rclpy 不便实现；实测"重发 set_mapping_done"已足够
             except Exception as exc:                 # noqa: BLE001
                 self.get_logger().error(f'重试/取消兜底异常（已忽略）：{type(exc).__name__}: {exc}')
         dist = None

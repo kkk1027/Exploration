@@ -40,7 +40,10 @@ def generate_launch_description():
         PythonLaunchDescriptionSource(
             os.path.join(model, 'launch', '_t_classic.launch.py')),
         launch_arguments=[('gui', 'false'), ('world', world_cfg),
-                          ('use_sim_time', use_sim_time)])
+                          ('use_sim_time', use_sim_time),
+                          ('spawn_x', LaunchConfiguration('spawn_x')),
+                          ('spawn_y', LaunchConfiguration('spawn_y')),
+                          ('spawn_yaw', LaunchConfiguration('spawn_yaw'))])
 
     stack = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -75,6 +78,9 @@ def generate_launch_description():
         DeclareLaunchArgument('world', default_value=os.path.join(
             model, 'world', 'custom_room_2ms.world'),
             description='仿真世界（默认 2 ms 步长版）'),
+        DeclareLaunchArgument('spawn_x', default_value='0.0'),
+        DeclareLaunchArgument('spawn_y', default_value='0.0'),
+        DeclareLaunchArgument('spawn_yaw', default_value='0.0'),
         DeclareLaunchArgument('explore_sec', default_value='180.0'),
         DeclareLaunchArgument('frontier_source', default_value='rrt'),
         DeclareLaunchArgument('auto_explore', default_value='true'),

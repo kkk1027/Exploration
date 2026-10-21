@@ -40,8 +40,15 @@ fi
 rm -f /home/kbf/stemm_sim_ws/maps/explore_latest.pgm /home/kbf/stemm_sim_ws/maps/explore_latest.yaml
 T_START=$(date +%s)
 
+# 随机起点（5 个候选，房间原点附近的安全偏移位姿）
+POSES=("0.0 0.0 0.0" "0.4 0.3 1.5708" "-0.3 0.4 3.1416" "0.3 -0.4 -1.5708" "-0.4 -0.3 0.7854")
+POSE=${POSES[$((RANDOM % ${#POSES[@]}))]}
+set -- $POSE; SX=$1; SY=$2; SYAW=$3
+say "本轮随机起点：x=$SX y=$SY yaw=$SYAW"
+rec "\"check\":\"pose\",\"x\":$SX,\"y\":$SY,\"yaw\":$SYAW"
+
 # ---- 2) 启动（记录真实 PGID） ----
-setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE" \
+setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE spawn_x:=$SX spawn_y:=$SY spawn_yaw:=$SYAW" \
   > "$OUT/launch.log" 2>&1 < /dev/null &
 sleep 3; PGID=$(cat "$OUT/pgid" 2>/dev/null || echo "")
 say "已启动：PGID=$PGID  日志 $OUT/launch.log"
