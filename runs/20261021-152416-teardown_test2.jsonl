@@ -1,0 +1,5 @@
+{"ts":"2026-10-21T15:24:16+08:00","tag":"teardown_test2",""check":"pre_launch","nodes":6,"gzserver":0"}
+{"ts":"2026-10-21T15:24:21+08:00","tag":"teardown_test2",""check":"post_cleanup","nodes":0,"gzserver":0"}
+{"ts":"2026-10-21T15:24:24+08:00","tag":"teardown_test2",""check":"launch","pgid":"20742""}
+{"ts":"2026-10-21T15:25:17+08:00","tag":"teardown_test2",""check":"post_teardown","nodes":6,"gzserver":0,"residue":"""}
+{"ts":"2026-10-21T15:25:17+08:00","tag":"teardown_test2",""verdict":"PASS_clean""}

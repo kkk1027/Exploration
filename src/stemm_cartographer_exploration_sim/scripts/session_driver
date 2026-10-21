@@ -19,7 +19,7 @@ import time
 
 import rclpy
 from geometry_msgs.msg import PoseStamped
-from nav_msgs.msg import Odometry
+from nav_msgs.msg import OccupancyGrid, Odometry
 from rclpy.node import Node
 from std_srvs.srv import SetBool
 
@@ -36,6 +36,7 @@ class SessionDriver(Node):
             'map_out', '~/stemm_sim_ws/maps/explore_latest').value
         self.hard_warn = float(self.declare_parameter('hard_warn_sec', HARD_WARN_SEC).value)
 
+        self.t_boot = time.monotonic()   # 栈启动时刻（看门狗基准）
         self.t_first_goal = None      # 探索起点
         self.t_done_called = None     # 调 set_mapping_done 的时刻
         self.return_home_ok = None
@@ -46,6 +47,12 @@ class SessionDriver(Node):
         self.create_subscription(PoseStamped, '/assigned_frontier_goal',
                                  self._on_goal, 10)
         self.create_subscription(Odometry, '/odom_combined', self._on_odom, 20)
+        # /map 是 RELIABLE+TRANSIENT_LOCAL（2 s/帧）；自己缓存最后一帧，结束时不依赖 map_saver 时机
+        from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+        qos_map = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                             durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.map_msg = None
+        self.create_subscription(OccupancyGrid, '/map', self._on_map, qos_map)
         self.cli = self.create_client(SetBool, '/stemm_cartographer/set_mapping_done')
         self.pose_xy = None
         self.create_timer(1.0, self._tick)
@@ -90,6 +97,9 @@ class SessionDriver(Node):
             self.t_first_goal = now
             self.get_logger().info('=== 自主探索开始计时（收到第一个前沿目标）===')
 
+    def _on_map(self, msg):
+        self.map_msg = msg
+
     def _on_odom(self, msg):
         self.pose_xy = (msg.pose.pose.position.x, msg.pose.pose.position.y)
 
@@ -99,17 +109,23 @@ class SessionDriver(Node):
             return
         now = time.monotonic()
 
-        # 阶段0：探索栈起来后补一次 use_sim_time（只做一次）
-        if not getattr(self, '_patched', False):
-            self._patched = True
-            self.create_timer(0.1, lambda: None)   # 占位，避免空转
-            try:
-                self._patch_sim_time()
-            except Exception as exc:                # noqa: BLE001
-                self.get_logger().warn(f'use_sim_time 补丁失败：{exc}')
-
-        # 阶段1：等探索开始
+        # 阶段1：等探索开始（带看门狗：60 s 无第一个前沿目标 → 记异常并尝试重新使能）
         if self.t_first_goal is None:
+            if (not getattr(self, '_wd_warned', False)
+                    and now - self.t_boot > 60.0):
+                self._wd_warned = True
+                self.get_logger().error(
+                    '探索看门狗：启动 60 s 内未收到任何前沿目标 —— 本轮记为异常，尝试重新使能 auto_explore')
+                try:
+                    subprocess.run(['bash', '-lc',
+                        'source /opt/ros/humble/setup.bash && '
+                        'source /home/kbf/stemm_sim_ws/install/setup.bash && '
+                        'source /home/kbf/stemm_explore_ws/install/setup.bash && '
+                        'export ROS_DOMAIN_ID=42 && '
+                        'ros2 param set /stemm_cartographer_nav2_manager auto_explore true'],
+                        timeout=20, check=False)
+                except Exception:
+                    pass
             return
 
         # 阶段2：到点则触发"结束建图"（与实机同一条服务）
@@ -168,8 +184,41 @@ class SessionDriver(Node):
             f' + 返航 {ret if ret is None else round(ret,1)}s；返航成功={self.return_home_ok} ===')
         self._save_map()
 
+    def _write_map_files(self):
+        """用缓存的 /map 一帧自己写 pgm+yaml（nav2 口径：free=254 occupied=0 unknown=205）"""
+        import os
+        msg = self.map_msg
+        if msg is None:
+            return False
+        w, h, res = msg.info.width, msg.info.height, msg.info.resolution
+        img = bytearray(w * h)
+        for i, v in enumerate(msg.data):
+            if v < 0:
+                img[i] = 205
+            elif v >= 65:
+                img[i] = 0
+            elif v <= 25:
+                img[i] = 254
+            else:
+                img[i] = 205
+        out = os.path.expanduser(self.map_out)
+        os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
+        with open(out + '.pgm', 'wb') as fh:
+            fh.write(b'P5\n%d %d\n255\n' % (w, h))
+            fh.write(bytes(img))
+        o = msg.info.origin
+        with open(out + '.yaml', 'w', encoding='utf-8') as fh:
+            fh.write(f'image: {os.path.basename(out)}.pgm\n'
+                     f'mode: trinary\nresolution: {res}\n'
+                     f'origin: [{o.position.x}, {o.position.y}, 0.0]\n'
+                     f'negate: 0\noccupied_thresh: 0.65\nfree_thresh: 0.196\n')
+        return True
+
     def _save_map(self):
         out = self.map_out
+        if self._write_map_files():
+            self.get_logger().info(f'已用缓存 /map 写图：{out}.pgm/.yaml')
+            return
         self.get_logger().info(f'保存地图到 {out}（只保留最新一份）')
         try:
             subprocess.run(
