@@ -1,0 +1,12 @@
+sweep 开始 2026-10-21T21:21:25+08:00  共 6 轮（120s×4 + 180s×2）
+--- 第 1 轮（explore=120.0s）---
+本轮随机起点：x=-0.4 y=-0.3 yaw=0.7854 → PASS
+--- 第 2 轮（explore=120.0s）---
+本轮随机起点：x=-0.3 y=0.4 yaw=3.1416 → PASS
+--- 第 3 轮（explore=120.0s）---
+本轮随机起点：x=0.0 y=0.0 yaw=0.0 → PASS
+--- 第 4 轮（explore=120.0s）---
+ → 
+!!! 第 4 轮失败，停止 sweep（连续计数 3）
+日志: /home/kbf/stemm_exploration_sim_ws/logs/round_20261021-213339_sweep4/launch.log
+sweep 结束 2026-10-21T21:33:44+08:00  连续通过 3 轮

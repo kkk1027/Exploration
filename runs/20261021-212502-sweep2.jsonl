@@ -1,0 +1,5 @@
+{"ts":"2026-10-21T21:25:02+08:00","tag":"sweep2",""check":"pre_launch","nodes":1,"gzserver":0,"residue":"""}
+{"ts":"2026-10-21T21:25:02+08:00","tag":"sweep2",""check":"pose","x":-0.3,"y":0.4,"yaw":3.1416"}
+{"ts":"2026-10-21T21:25:05+08:00","tag":"sweep2",""check":"launch","pgid":"71904""}
+{"ts":"2026-10-21T21:29:19+08:00","tag":"sweep2",""check":"post_teardown","nodes":7,"gzserver":0,"residue":"""}
+{"ts":"2026-10-21T21:29:19+08:00","tag":"sweep2",""verdict":"PASS_clean""}

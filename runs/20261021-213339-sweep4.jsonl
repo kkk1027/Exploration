@@ -1,0 +1,3 @@
+{"ts":"2026-10-21T21:33:39+08:00","tag":"sweep4",""check":"pre_launch","nodes":14,"gzserver":0,"residue":"73846 74601 74759 ""}
+{"ts":"2026-10-21T21:33:44+08:00","tag":"sweep4",""check":"post_cleanup","nodes":13,"gzserver":0,"residue":"74601 ""}
+{"ts":"2026-10-21T21:33:44+08:00","tag":"sweep4",""verdict":"FAIL_preclean""}

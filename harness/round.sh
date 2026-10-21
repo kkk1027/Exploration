@@ -19,7 +19,7 @@ say() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$OUT/harness.log"; }
 rec() { printf '{"ts":"%s","tag":"%s","%s"}\n' "$(date -Iseconds)" "$TAG" "$1" >> "$J"; }
 
 # ---- 1) 启动前断言：域 42 零节点 + 无 gzserver ----
-proc_residue() { pgrep -af "waypoint_follower|controller_server|planner_server|bt_navigator|behavior_server|smoother_server|cartographer_node|occupancy_grid|stemm_|robot_state_publisher|ekf_node|imu_bias_shim|scan_deadzone_relay|async_slam_toolbox" 2>/dev/null | grep -E "/(lib/|install/|opt/ros)" | grep -v "harness/round.sh" | awk '{print $1}' | tr '\n' ' '; }
+proc_residue() { pgrep -af "waypoint_follower|controller_server|planner_server|bt_navigator|behavior_server|smoother_server|cartographer_node|occupancy_grid|stemm_cartographer|robot_state_publisher|ekf_node|imu_bias_shim|scan_deadzone_relay|async_slam_toolbox|nav2_" 2>/dev/null | grep -vE "harness/(round|sweep)\.sh|grep|pgrep" | awk '{print $1}' | tr '\n' ' '; }
 NODES=$(ros2 node list 2>/dev/null | wc -l)
 GZ=$(pgrep -cx gzserver)
 PRES=$(proc_residue)
@@ -27,9 +27,9 @@ say "启动前：ROS 节点数=$NODES（含DDS僵尸，仅记录）  gzserver=$G
 rec "\"check\":\"pre_launch\",\"nodes\":$NODES,\"gzserver\":$GZ,\"residue\":\"${PRES}\""
 if [ -n "$PRES" ] || [ "$GZ" -gt 0 ]; then
   say "存在残留，先清理"
-  pgrep -af "waypoint_follower|controller_server|planner_server|bt_navigator|behavior_server|smoother_server|cartographer_node|occupancy_grid|stemm_|ros2 launch|robot_state_publisher|ekf_node|imu_bias_shim|scan_deadzone_relay|sim_clock_resampler|async_slam_toolbox" 2>/dev/null \
-    | grep -E "/(lib/|install/|opt/ros|nodes/|scripts/)" | grep -v "harness/round.sh" \
-    | awk '{print $1}' | while read pid; do kill -TERM "$pid" 2>/dev/null; done
+  for p in $(proc_residue); do kill -TERM "$p" 2>/dev/null; done
+  sleep 2
+  for p in $(proc_residue); do kill -9 "$p" 2>/dev/null; done
   pkill -x gzserver 2>/dev/null; sleep 4
   NODES=$(ros2 node list 2>/dev/null | wc -l); GZ=$(pgrep -cx gzserver); PRES=$(proc_residue)
   say "清理后：ROS 节点数=$NODES  gzserver=$GZ  进程残留=[${PRES}]"
