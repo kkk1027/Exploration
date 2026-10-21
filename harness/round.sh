@@ -19,20 +19,22 @@ say() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$OUT/harness.log"; }
 rec() { printf '{"ts":"%s","tag":"%s","%s"}\n' "$(date -Iseconds)" "$TAG" "$1" >> "$J"; }
 
 # ---- 1) 启动前断言：域 42 零节点 + 无 gzserver ----
+proc_residue() { pgrep -af "waypoint_follower|controller_server|planner_server|bt_navigator|behavior_server|smoother_server|cartographer_node|occupancy_grid|stemm_|robot_state_publisher|ekf_node|imu_bias_shim|scan_deadzone_relay|async_slam_toolbox" 2>/dev/null | grep -E "/(lib/|install/|opt/ros)" | grep -v "harness/round.sh" | awk '{print $1}' | tr '\n' ' '; }
 NODES=$(ros2 node list 2>/dev/null | wc -l)
 GZ=$(pgrep -cx gzserver)
-say "启动前：ROS 节点数=$NODES  gzserver 进程=$GZ"
-rec "\"check\":\"pre_launch\",\"nodes\":$NODES,\"gzserver\":$GZ"
-if [ "$NODES" -gt 1 ] || [ "$GZ" -gt 0 ]; then
+PRES=$(proc_residue)
+say "启动前：ROS 节点数=$NODES（含DDS僵尸，仅记录）  gzserver=$GZ  进程残留=[${PRES}]"
+rec "\"check\":\"pre_launch\",\"nodes\":$NODES,\"gzserver\":$GZ,\"residue\":\"${PRES}\""
+if [ -n "$PRES" ] || [ "$GZ" -gt 0 ]; then
   say "存在残留，先清理"
   pgrep -af "waypoint_follower|controller_server|planner_server|bt_navigator|behavior_server|smoother_server|cartographer_node|occupancy_grid|stemm_|ros2 launch|robot_state_publisher|ekf_node|imu_bias_shim|scan_deadzone_relay|sim_clock_resampler|async_slam_toolbox" 2>/dev/null \
     | grep -E "/(lib/|install/|opt/ros|nodes/|scripts/)" | grep -v "harness/round.sh" \
     | awk '{print $1}' | while read pid; do kill -TERM "$pid" 2>/dev/null; done
   pkill -x gzserver 2>/dev/null; sleep 4
-  NODES=$(ros2 node list 2>/dev/null | wc -l); GZ=$(pgrep -cx gzserver)
-  say "清理后：ROS 节点数=$NODES  gzserver=$GZ"
-  rec "\"check\":\"post_cleanup\",\"nodes\":$NODES,\"gzserver\":$GZ"
-  [ "$NODES" -gt 1 ] || [ "$GZ" -gt 0 ] && { say "清理不彻底，放弃本轮"; rec '"verdict":"FAIL_preclean"'; exit 10; }
+  NODES=$(ros2 node list 2>/dev/null | wc -l); GZ=$(pgrep -cx gzserver); PRES=$(proc_residue)
+  say "清理后：ROS 节点数=$NODES  gzserver=$GZ  进程残留=[${PRES}]"
+  rec "\"check\":\"post_cleanup\",\"nodes\":$NODES,\"gzserver\":$GZ,\"residue\":\"${PRES}\""
+  { [ -n "$PRES" ] || [ "$GZ" -gt 0 ]; } && { say "清理不彻底，放弃本轮"; rec '"verdict":"FAIL_preclean"'; exit 10; }
 fi
 
 rm -f /home/kbf/stemm_sim_ws/maps/explore_latest.pgm /home/kbf/stemm_sim_ws/maps/explore_latest.yaml

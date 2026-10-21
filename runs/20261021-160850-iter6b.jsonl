@@ -1,0 +1,4 @@
+{"ts":"2026-10-21T16:08:50+08:00","tag":"iter6b",""check":"pre_launch","nodes":0,"gzserver":0,"residue":"""}
+{"ts":"2026-10-21T16:08:53+08:00","tag":"iter6b",""check":"launch","pgid":"26203""}
+{"ts":"2026-10-21T16:12:47+08:00","tag":"iter6b",""check":"post_teardown","nodes":6,"gzserver":0,"residue":"""}
+{"ts":"2026-10-21T16:12:47+08:00","tag":"iter6b",""verdict":"PASS_clean""}

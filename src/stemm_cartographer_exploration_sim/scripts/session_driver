@@ -114,25 +114,6 @@ class SessionDriver(Node):
             return
         now = time.monotonic()
 
-        # 阶段0：给车端未传 use_sim_time 的节点补运行时参数（已确认 mapping_tf_guard 缺）
-        # 它用墙钟 now() 比仿真的 TF 时间戳 → 30 s 内必超时；这里在前 30 s 内反复尝试直到成功。
-        if not getattr(self, '_patch_done', False) and now - self.t_boot < 30.0:
-            if now - getattr(self, '_last_patch_try', 0.0) >= 2.0:
-                self._last_patch_try = now
-                try:
-                    r = subprocess.run(['bash', '-lc',
-                        'source /opt/ros/humble/setup.bash && '
-                        'source /home/kbf/stemm_sim_ws/install/setup.bash && '
-                        'source /home/kbf/stemm_explore_ws/install/setup.bash && '
-                        'export ROS_DOMAIN_ID=42 && '
-                        'ros2 param set /stemm_cartographer_mapping_tf_guard use_sim_time true'],
-                        capture_output=True, text=True, timeout=15)
-                    if 'True' in (r.stdout or ''):
-                        self._patch_done = True
-                        self.get_logger().info('已给 mapping_tf_guard 补 use_sim_time=true')
-                except Exception:
-                    pass
-
         # 阶段1：等探索开始（带看门狗：60 s 无第一个前沿目标 → 记异常并尝试重新使能）
         if self.t_first_goal is None:
             if (not getattr(self, '_wd_warned', False)
@@ -165,14 +146,14 @@ class SessionDriver(Node):
         # 阶段3：跟踪返航；若卡在"等活跃目标取消"，每 6 s 重发一次 set_mapping_done
         # （重发在目标结束后会命中 _dispatch_pending_home_goal 分支）
         if (self.return_home_ok is None and self.t_done_called is not None
-                and now - self.t_done_called > 6.0
-                and now - self.t_done_called > 6.0 * (getattr(self, '_retries', 0) + 1)
+                and now - self.t_done_called > 3.0
+                and now - self.t_done_called > 3.0 * (getattr(self, '_retries', 0) + 1)
                 and getattr(self, '_retries', 0) < 10):
             self._retries = getattr(self, '_retries', 0) + 1
             self.get_logger().warn(
                 f'返航未启动，第 {self._retries} 次重发 set_mapping_done（等活跃目标取消可能卡住）')
             self._call_done()
-            if self._retries >= 2 and self.nav_client.wait_for_server(timeout_sec=2.0):
+            if self._retries >= 1 and self.nav_client.wait_for_server(timeout_sec=2.0):
                 self.nav_client.cancel_goal_async(NavigateToPose.Goal())
                 self.get_logger().warn('已向 /navigate_to_pose 发送 cancel-all 兜底')
         dist = None

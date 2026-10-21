@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# patch_sim_time —— 给车端未传 use_sim_time 的节点补运行时参数（仿真专用）。
+# 已确认：stemm_cartographer_mapping_tf_guard 在 launch 里没有 use_sim_time 参数，
+# 仿真里它会用墙钟 now() 与仿真的 TF 时间戳比较 → 30 s 内必判"TF 不新鲜"。
+# 这里以 0.5 s 间隔重试，直到参数设置成功或超时（默认 30 s）。
+set +u
+source /opt/ros/humble/setup.bash
+source /home/kbf/stemm_sim_ws/install/setup.bash
+source /home/kbf/stemm_explore_ws/install/setup.bash
+export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-42}"
+TARGET="${1:-/stemm_cartographer_mapping_tf_guard}"
+DEADLINE=$(( $(date +%s) + ${2:-30} ))
+while [ "$(date +%s)" -lt "$DEADLINE" ]; do
+  OUT=$(ros2 param set "$TARGET" use_sim_time true 2>&1)
+  case "$OUT" in
+    *"True"*) echo "[patch_sim_time] ${TARGET} use_sim_time=true ✓"; exit 0 ;;
+  esac
+  sleep 0.5
+done
+echo "[patch_sim_time] 超时未成功（${TARGET}）"; exit 1
