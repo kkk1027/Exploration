@@ -1,5 +1,0 @@
-{"ts":"2026-10-21T16:43:01+08:00","tag":"iter13",""check":"pre_launch","nodes":41,"gzserver":1,"residue":"35015 35018 35020 35024 35026 35028 35317 35517 35519 35521 35523 35821 35823 35825 35827 35829 35831 36011 36069 36071 36073 36075 36077 ""}
-{"ts":"2026-10-21T16:43:06+08:00","tag":"iter13",""check":"post_cleanup","nodes":33,"gzserver":0,"residue":"""}
-{"ts":"2026-10-21T16:43:09+08:00","tag":"iter13",""check":"launch","pgid":"36705""}
-{"ts":"2026-10-21T16:47:02+08:00","tag":"iter13",""check":"post_teardown","nodes":6,"gzserver":0,"residue":"""}
-{"ts":"2026-10-21T16:47:02+08:00","tag":"iter13",""verdict":"PASS_clean""}

@@ -50,6 +50,12 @@ def generate_launch_description():
                           ('frontier_source', frontier_source),
                           ('use_sim_time', use_sim_time)])
 
+    # 与栈同时启动的运行时参数补丁（独立进程，0.5 s 重试，抢在 guard 的 30 s 判定前落地）
+    patch_sim_time = ExecuteProcess(
+        cmd=[os.path.join(get_package_prefix('stemm_cartographer_exploration_sim'),
+                          'lib', 'stemm_cartographer_exploration_sim', 'patch_sim_time')],
+        output='screen')
+
     driver = Node(
         package='stemm_cartographer_exploration_sim',
         executable='session_driver',
@@ -80,5 +86,5 @@ def generate_launch_description():
             description='探索栈延迟启动秒数：Gazebo 里机器人 spawn + EKF 出 odom_combined '
                         '约需 30~40 s，而探索栈内的 mapping_tf_guard 只有 30 s 超时'),
         robot,
-        TimerAction(period=stack_delay, actions=[stack]),
+        TimerAction(period=stack_delay, actions=[stack, patch_sim_time]),
         TimerAction(period=stack_delay, actions=[driver])])

@@ -1,5 +1,3 @@
 {"ts":"2026-10-21T16:38:25+08:00","tag":"iter11",""check":"pre_launch","nodes":41,"gzserver":1,"residue":"32079 32082 32084 32088 32090 32092 32350 32534 32536 32538 32540 32796 32798 32800 32802 32804 32806 33010 33047 33049 33051 33053 33055 ""}
 {"ts":"2026-10-21T16:38:29+08:00","tag":"iter11",""check":"post_cleanup","nodes":23,"gzserver":0,"residue":"""}
 {"ts":"2026-10-21T16:38:32+08:00","tag":"iter11",""check":"launch","pgid":"33610""}
-{"ts":"2026-10-21T16:43:18+08:00","tag":"iter11",""check":"post_teardown","nodes":44,"gzserver":1,"residue":"36756 36758 ""}
-{"ts":"2026-10-21T16:43:18+08:00","tag":"iter11",""verdict":"FAIL_residue""}
