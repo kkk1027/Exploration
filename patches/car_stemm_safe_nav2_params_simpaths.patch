@@ -1,0 +1,15 @@
+diff --git a/src/stemm_cartographer_exploration/config/stemm_safe_nav2_params.yaml b/src/stemm_cartographer_exploration/config/stemm_safe_nav2_params.yaml
+index 636aaf5..60b95b1 100644
+--- a/src/stemm_cartographer_exploration/config/stemm_safe_nav2_params.yaml
++++ b/src/stemm_cartographer_exploration/config/stemm_safe_nav2_params.yaml
+@@ -67,8 +67,8 @@ bt_navigator:
+     odom_topic: /odom_combined
+     bt_loop_duration: 10        #BT 执行每次迭代的持续时间（以毫秒为单位
+     default_server_timeout: 200 #给Jetson负载波动留出Action确认时间，避免恢复阶段请求风暴
+-    default_nav_to_pose_bt_xml: "/home/hnh/wheeltec_ros2/install/stemm_nav2_manager/share/stemm_nav2_manager/config/stemm_no_backup_nav_to_pose.xml"
+-    default_nav_through_poses_bt_xml: "/home/hnh/wheeltec_ros2/install/stemm_nav2_manager/share/stemm_nav2_manager/config/stemm_no_backup_nav_through_poses.xml"
++    default_nav_to_pose_bt_xml: "/home/kbf/stemm_explore_ws/install/stemm_nav2_manager/share/stemm_nav2_manager/config/stemm_no_backup_nav_to_pose.xml"
++    default_nav_through_poses_bt_xml: "/home/kbf/stemm_explore_ws/install/stemm_nav2_manager/share/stemm_nav2_manager/config/stemm_no_backup_nav_through_poses.xml"
+     # 'default_nav_through_poses_bt_xml' and 'default_nav_to_pose_bt_xml' are use defaults:
+     # nav2_bt_navigator/navigate_to_pose_w_replanning_and_recovery.xml
+     # nav2_bt_navigator/navigate_through_poses_w_replanning_and_recovery.xml
