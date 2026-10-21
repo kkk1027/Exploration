@@ -1,0 +1,5 @@
+{"ts":"2026-10-21T20:28:53+08:00","tag":"check1",""check":"pre_launch","nodes":0,"gzserver":0,"residue":"""}
+{"ts":"2026-10-21T20:28:53+08:00","tag":"check1",""check":"pose","x":0.4,"y":0.3,"yaw":1.5708"}
+{"ts":"2026-10-21T20:28:56+08:00","tag":"check1",""check":"launch","pgid":"54352""}
+{"ts":"2026-10-21T20:33:27+08:00","tag":"check1",""check":"post_teardown","nodes":0,"gzserver":0,"residue":"""}
+{"ts":"2026-10-21T20:33:27+08:00","tag":"check1",""verdict":"PASS_clean""}
