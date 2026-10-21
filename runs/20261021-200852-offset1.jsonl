@@ -1,0 +1,5 @@
+{"ts":"2026-10-21T20:08:53+08:00","tag":"offset1",""check":"pre_launch","nodes":0,"gzserver":0,"residue":"""}
+{"ts":"2026-10-21T20:08:53+08:00","tag":"offset1",""check":"pose","x":0.4,"y":0.3,"yaw":1.5708"}
+{"ts":"2026-10-21T20:08:56+08:00","tag":"offset1",""check":"launch","pgid":"50377""}
+{"ts":"2026-10-21T20:13:00+08:00","tag":"offset1",""check":"post_teardown","nodes":12,"gzserver":0,"residue":"""}
+{"ts":"2026-10-21T20:13:01+08:00","tag":"offset1",""verdict":"PASS_clean""}
