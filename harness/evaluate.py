@@ -15,8 +15,8 @@ checks['tf_healthy'] = has('mapping TF is healthy')
 checks['nav2_active'] = has('stably ready') or has('ready_guard_timing')
 checks['frontier'] = has('assigned RRT frontier') or has('Begin navigating')
 checks['mapping_done'] = has('SetBool_Response', 'success=True') or has('mapping done acknowledged')
-m = re.findall(r'返航到位：距 map 原点 ([\d.]+) m', txt)
-checks['return_home'] = f'距原点 {m[-1]} m' if m else None
+m = re.findall(r'返航(?:到位|完成)[^\n]*', txt)
+checks['return_home'] = m[-1][:120] if m else None
 mapfile = os.path.expanduser('~/stemm_sim_ws/maps/explore_latest.pgm')
 checks['map_saved'] = f'{os.path.getsize(mapfile)} B' if os.path.exists(mapfile) else None
 ok = all(v for k, v in checks.items() if k != 'return_home')

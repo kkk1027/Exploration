@@ -1,0 +1,5 @@
+{"ts":"2026-10-21T21:15:04+08:00","tag":"rdone1",""check":"pre_launch","nodes":0,"gzserver":0,"residue":"""}
+{"ts":"2026-10-21T21:15:04+08:00","tag":"rdone1",""check":"pose","x":-0.4,"y":-0.3,"yaw":0.7854"}
+{"ts":"2026-10-21T21:15:07+08:00","tag":"rdone1",""check":"launch","pgid":"67416""}
+{"ts":"2026-10-21T21:19:21+08:00","tag":"rdone1",""check":"post_teardown","nodes":6,"gzserver":0,"residue":"""}
+{"ts":"2026-10-21T21:19:21+08:00","tag":"rdone1",""verdict":"PASS_clean""}
