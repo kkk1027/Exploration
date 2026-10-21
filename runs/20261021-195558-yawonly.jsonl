@@ -1,0 +1,3 @@
+{"ts":"2026-10-21T19:55:58+08:00","tag":"yawonly",""check":"pre_launch","nodes":1,"gzserver":0,"residue":"""}
+{"ts":"2026-10-21T19:55:58+08:00","tag":"yawonly",""check":"pose","x":0.0,"y":0.0,"yaw":1.5708"}
+{"ts":"2026-10-21T19:56:01+08:00","tag":"yawonly",""check":"launch","pgid":"46519""}

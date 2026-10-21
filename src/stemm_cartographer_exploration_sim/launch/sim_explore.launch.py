@@ -88,7 +88,7 @@ def generate_launch_description():
         DeclareLaunchArgument('map_out', default_value=os.path.expanduser(
             '~/stemm_sim_ws/maps/explore_latest')),
         DeclareLaunchArgument(
-            'stack_delay', default_value='50.0',
+            'stack_delay', default_value='65.0',
             description='探索栈延迟启动秒数：Gazebo 里机器人 spawn + EKF 出 odom_combined '
                         '约需 30~40 s，而探索栈内的 mapping_tf_guard 只有 30 s 超时'),
         robot,
