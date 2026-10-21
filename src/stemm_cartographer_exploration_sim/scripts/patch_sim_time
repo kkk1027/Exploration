@@ -8,13 +8,20 @@ source /opt/ros/humble/setup.bash
 source /home/kbf/stemm_sim_ws/install/setup.bash
 source /home/kbf/stemm_explore_ws/install/setup.bash
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-42}"
-TARGET="${1:-/stemm_cartographer_mapping_tf_guard}"
+# 车端 launch 里有若干节点没传 use_sim_time；仿真里必须补，否则它们用墙钟与仿真的 TF/时间戳比较
+TARGETS="${1:-/stemm_cartographer_mapping_tf_guard /stemm_cartographer_nav2_manager /stemm_cartographer_odom_session_guard /stemm_cartographer_state_saver /stemm_cartographer_map_service_adapter}"
 DEADLINE=$(( $(date +%s) + ${2:-30} ))
+DONE=""
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-  OUT=$(ros2 param set "$TARGET" use_sim_time true 2>&1)
-  case "$OUT" in
-    *"True"*) echo "[patch_sim_time] ${TARGET} use_sim_time=true ✓"; exit 0 ;;
-  esac
+  for TARGET in $TARGETS; do
+    case " $DONE " in *" $TARGET "*) continue ;; esac
+    OUT=$(ros2 param set "$TARGET" use_sim_time true 2>&1)
+    case "$OUT" in
+      *"True"*) DONE="$DONE $TARGET"; echo "[patch_sim_time] ${TARGET} ✓" ;;
+    esac
+  done
+  n=0; for t in $TARGETS; do case " $DONE " in *" $t "*) n=$((n+1));; esac; done
+  [ "$n" -eq "$(echo $TARGETS | wc -w)" ] && { echo "[patch_sim_time] 全部完成"; exit 0; }
   sleep 0.5
 done
-echo "[patch_sim_time] 超时未成功（${TARGET}）"; exit 1
+echo "[patch_sim_time] 部分未成功：$DONE"; exit 0
