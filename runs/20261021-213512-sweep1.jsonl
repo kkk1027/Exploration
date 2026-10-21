@@ -1,0 +1,6 @@
+{"ts":"2026-10-21T21:35:12+08:00","tag":"sweep1",""check":"pre_launch","nodes":4,"gzserver":0,"residue":"44164 74601 ""}
+{"ts":"2026-10-21T21:35:18+08:00","tag":"sweep1",""check":"post_cleanup","nodes":4,"gzserver":0,"residue":"""}
+{"ts":"2026-10-21T21:35:18+08:00","tag":"sweep1",""check":"pose","x":-0.3,"y":0.4,"yaw":3.1416"}
+{"ts":"2026-10-21T21:35:21+08:00","tag":"sweep1",""check":"launch","pgid":"75622""}
+{"ts":"2026-10-21T21:39:12+08:00","tag":"sweep1",""check":"post_teardown","nodes":0,"gzserver":0,"residue":"""}
+{"ts":"2026-10-21T21:39:12+08:00","tag":"sweep1",""verdict":"PASS_clean""}
