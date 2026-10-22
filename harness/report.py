@@ -63,7 +63,9 @@ def launch_events(path):
             ev.append((t, 'fail', line.strip()))
         elif is_mgr and 'navigation goal canceled' in line:
             ev.append((t, 'cancel', line.strip()))
-        elif is_mgr and 'mapping done acknowledged' in line:
+        elif (is_mgr and 'mapping done acknowledged' in line) \
+                or '探索限时到（' in line:
+            # 结束建图的"起点"：manager 确认行，或会话驱动打印的"探索限时到"
             ev.append((t, 'done', line.strip()))
         elif is_mgr and ('return-home completed' in line
                          or 'return-home goal reached' in line):
