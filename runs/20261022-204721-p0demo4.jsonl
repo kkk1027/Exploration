@@ -1,0 +1,4 @@
+{"ts":"2026-10-22T20:47:21+08:00","tag":"p0demo4",""check":"pre_launch","nodes":0,"gzserver":0,"residue":"""}
+{"ts":"2026-10-22T20:47:21+08:00","tag":"p0demo4",""check":"pose","x":0.0,"y":0.0,"yaw":0.0"}
+{"ts":"2026-10-22T20:47:21+08:00","tag":"p0demo4",""check":"variant","disable_retreat":1,"supervisor":"true""}
+{"ts":"2026-10-22T20:47:24+08:00","tag":"p0demo4",""check":"launch","pgid":"40624""}
