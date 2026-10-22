@@ -56,11 +56,38 @@ SUPERVISOR="${SUPERVISOR:-true}"
 CAR_ESCAPE="${CAR_ESCAPE:-$([ "${DISABLE_CAR_ESCAPE:-1}" = "1" ] && echo false || echo true)}"
 say "P0 变体：disable_retreat=$DISABLE_RETREAT escape_supervisor=$SUPERVISOR"
 rec "\"check\":\"variant\",\"disable_retreat\":$DISABLE_RETREAT,\"supervisor\":\"$SUPERVISOR\""
-setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE spawn_x:=$SX spawn_y:=$SY spawn_yaw:=$SYAW disable_retreat:=$DISABLE_RETREAT escape_supervisor:=$SUPERVISOR car_escape:=$CAR_ESCAPE rviz:=${RVIZ:-false} probe_log:=$OUT/probe.jsonl supervisor_log:=$OUT/supervisor.jsonl" \
+setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE spawn_x:=$SX spawn_y:=$SY spawn_yaw:=$SYAW disable_retreat:=$DISABLE_RETREAT escape_supervisor:=$SUPERVISOR car_escape:=$CAR_ESCAPE rviz:=${RVIZ:-false} stack_delay:=${STACK_DELAY:-0.0} probe_log:=$OUT/probe.jsonl supervisor_log:=$OUT/supervisor.jsonl" \
   > "$OUT/launch.log" 2>&1 < /dev/null &
 sleep 3; PGID=$(cat "$OUT/pgid" 2>/dev/null || echo "")
 say "已启动：PGID=$PGID  日志 $OUT/launch.log"
 rec "\"check\":\"launch\",\"pgid\":\"$PGID\""
+
+if [ "${SMOKE:-0}" = "1" ]; then
+  say "SMOKE 模式：等就绪后做 10 项自检（不跑探索）"
+  # 等"栈就绪 + 运行期补丁全部落地"两个条件都满足，再做自检
+  for i in $(seq 1 30); do
+    grep -q "ready_guard_timing" "$OUT/launch.log" 2>/dev/null && break
+    sleep 3
+  done
+  for i in $(seq 1 25); do
+    grep -q "全部阶段完成" "$OUT/launch.log" 2>/dev/null && break
+    sleep 2
+  done
+  sleep 6
+  bash harness/smoke_check.sh "$OUT/launch.log" | tee -a "$OUT/harness.log"
+  SMOKE_RC=${PIPESTATUS[0]}
+  rec "\"check\":\"smoke\",\"rc\":$SMOKE_RC"
+  [ "$SMOKE_RC" = "0" ] && rec '"verdict":"PASS_smoke"' || rec '"verdict":"FAIL_smoke"'
+  PGID_SAVED=$PGID
+  teardown_once() {
+    [ -n "$PGID_SAVED" ] && kill -TERM -- "-$PGID_SAVED" 2>/dev/null
+    for i in $(seq 1 20); do pgrep -x gzserver >/dev/null || break; sleep 1; done
+    pkill -x gzserver 2>/dev/null; sleep 2
+  }
+  teardown_once
+  echo "JSONL: $J"
+  exit "$SMOKE_RC"
+fi
 
 if [ "$HOLD" -gt 0 ]; then
   sleep "$HOLD"
@@ -168,6 +195,12 @@ try:
 except Exception as e:
     print('[evaluate] 解析失败:', e)
 PYEOF
+fi
+if [ -f "$OUT/launch.log" ]; then
+  echo
+  python3 harness/report.py "$OUT" "$TAG" > "$OUT/report.stdout" 2>&1 || true
+  head -40 "$OUT/report.stdout"
+  echo "[report] 完整报告：$OUT/report.md"
 fi
 if [ -f "$OUT/supervisor.jsonl" ]; then
   echo "[supervisor] 事件汇总：" 

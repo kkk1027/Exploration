@@ -1,0 +1,101 @@
+#!/usr/bin/env python3
+"""wait_robot_ready —— 机器人层就绪门闸（替代固定 65 s 栈延迟）。
+
+背景：探索栈里 `mapping_tf_guard` 只有 30 s 硬超时，超时会 SIGINT 整个 launch，所以
+栈不能起得太早；但原来用固定 `stack_delay=65 s` 又白等 30~40 s（每轮固定损耗）。
+这里用事件驱动：等"Gazebo 已起 + /odom_combined 有连续数据 + odom→base TF 可用 + 稳定
+N 秒"，立刻返回，launch 用 OnProcessExit 事件接上探索栈。
+
+就绪判据（全部满足，且稳定 settle_sec 秒）：
+  * 收到 /odom_combined 且累计 >= min_msgs 帧
+  * TF odom_combined -> base_footprint 可查
+  * /scan_raw 有新数据（雷达出图，说明 spawn 完成、传感器在跑）
+超时（timeout_sec）也会退出（exit 0），只是打印警告 —— 不让门闸本身成为新的卡点。
+"""
+import sys
+import time
+
+import rclpy
+from nav_msgs.msg import Odometry
+from rclpy.duration import Duration
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from rclpy.time import Time
+from sensor_msgs.msg import LaserScan
+from tf2_ros import Buffer, TransformListener
+
+
+def arg(flag, default):
+    if flag in sys.argv:
+        i = sys.argv.index(flag)
+        if i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return default
+
+
+class ReadyGate(Node):
+    def __init__(self, settle, min_msgs, timeout):
+        super().__init__('wait_robot_ready')
+        self.settle = settle
+        self.min_msgs = min_msgs
+        self.timeout = timeout
+        self.odom_n = 0
+        self.scan_n = 0
+        self.buf = Buffer(cache_time=Duration(seconds=10))
+        TransformListener(self.buf, self)
+        self.create_subscription(Odometry, '/odom_combined', self._odom, 20)
+        self.create_subscription(LaserScan, '/scan_raw', self._scan, qos_profile_sensor_data)
+        self.t0 = time.monotonic()
+        self.ok_since = None
+
+    def _odom(self, _m):
+        self.odom_n += 1
+
+    def _scan(self, _m):
+        self.scan_n += 1
+
+    def poll(self):
+        now = time.monotonic()
+        tf_ok = False
+        try:
+            tf_ok = self.buf.can_transform('odom_combined', 'base_footprint', Time())
+        except Exception:
+            tf_ok = False
+        cond = (self.odom_n >= self.min_msgs and self.scan_n > 0 and tf_ok)
+        if cond:
+            self.ok_since = self.ok_since or now
+            if now - self.ok_since >= self.settle:
+                self.get_logger().info(
+                    'robot ready: odom=%d scan=%d tf=ok after %.1fs → 启动探索栈'
+                    % (self.odom_n, self.scan_n, now - self.t0))
+                return True
+        else:
+            self.ok_since = None
+        if now - self.t0 > self.timeout:
+            self.get_logger().warn(
+                'robot ready gate 超时 %.0fs（odom=%d scan=%d tf=%s）→ 仍启动探索栈，风险自负'
+                % (self.timeout, self.odom_n, self.scan_n, tf_ok))
+            return True
+        return False
+
+
+def main():
+    settle = float(arg('--settle', '3.0'))
+    min_msgs = int(arg('--min-odom', '20'))
+    timeout = float(arg('--timeout', '75.0'))
+    rclpy.init()
+    node = ReadyGate(settle, min_msgs, timeout)
+    try:
+        while rclpy.ok():
+            rclpy.spin_once(node, timeout_sec=0.2)
+            if node.poll():
+                break
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

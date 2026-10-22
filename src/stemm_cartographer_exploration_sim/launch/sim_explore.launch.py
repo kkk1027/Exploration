@@ -15,8 +15,9 @@ import os
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import (DeclareLaunchArgument, ExecuteProcess,
-                            IncludeLaunchDescription, SetEnvironmentVariable,
-                            TimerAction)
+                            IncludeLaunchDescription, RegisterEventHandler,
+                            SetEnvironmentVariable, TimerAction)
+from launch.event_handlers import OnProcessExit
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import EnvironmentVariable, LaunchConfiguration
@@ -108,6 +109,14 @@ def generate_launch_description():
                      'explore_sec': explore_sec,
                      'map_out': map_out}])
 
+    # 就绪门闸脚本（仅保留供实验，不接进主链；见 stack_delay 的注释）
+    ready_gate = ExecuteProcess(
+        cmd=[os.path.join(get_package_prefix('stemm_cartographer_exploration_sim'),
+                          'lib', 'stemm_cartographer_exploration_sim',
+                          'wait_robot_ready'),
+             '--settle', '3.0', '--min-odom', '20', '--timeout', '75.0'],
+        output='screen')
+
     # 把仿真垫片目录前置到 PATH（只影响本次 launch 起的进程）
     shim_dir = os.path.join(
         get_package_prefix('stemm_cartographer_exploration_sim'),
@@ -147,8 +156,9 @@ def generate_launch_description():
             description='1=运行期关闭车端盲退（P0 默认）；0=保留（对照基线）'),
         DeclareLaunchArgument(
             'stack_delay', default_value='65.0',
-            description='探索栈延迟启动秒数：Gazebo 里机器人 spawn + EKF 出 odom_combined '
-                        '约需 30~40 s，而探索栈内的 mapping_tf_guard 只有 30 s 超时'),
+            description='探索栈延迟启动秒数。2026-10-23 实测：改成"机器人就绪即起栈"'
+                        '（约 25 s）会让 Nav2 生命周期在仿真还没稳时超时'
+                        '（ready_guard 90 s 内未激活、整轮被打断），故恢复固定延迟。'),
         robot,
         probe,
         TimerAction(period=stack_delay, actions=[stack, patch_sim_time, arbiter, supervisor]),
