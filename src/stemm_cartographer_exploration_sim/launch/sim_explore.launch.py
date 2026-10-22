@@ -98,6 +98,8 @@ def generate_launch_description():
                                    'enabled': LaunchConfiguration('escape_supervisor'),
                                    'unit_max_sec': LaunchConfiguration('supervisor_unit_max_sec'),
                                    'recovery_timeout_sec': LaunchConfiguration('supervisor_recovery_timeout'),
+                                   'rotate_min_range': LaunchConfiguration('supervisor_rotate_min_range'),
+                                   'advance_stop_range': LaunchConfiguration('supervisor_advance_stop_range'),
                                    'log_path': LaunchConfiguration('supervisor_log')}])
 
     driver = Node(
@@ -150,6 +152,10 @@ def generate_launch_description():
             description='前沿收益函数版本：v1=旧未知格数/就近，v2=邻域未知占比，v3=朝前未知+贴已知边界'),
         DeclareLaunchArgument('supervisor_unit_max_sec', default_value='8.0',
             description='脱困单元硬顶秒数（单元测试时调小以快速触发降级）'),
+        DeclareLaunchArgument('supervisor_rotate_min_range', default_value='0.30',
+            description='脱困旋转时"扫过扇区"的最小测距门槛（低于此值不转）'),
+        DeclareLaunchArgument('supervisor_advance_stop_range', default_value='0.30',
+            description='脱困前进时前向 ±45° 的最小测距门槛'),
         DeclareLaunchArgument('supervisor_recovery_timeout', default_value='40.0',
             description='累计受阻多少秒后退出脱困（用户要求的 40 s 兜底）'),
         DeclareLaunchArgument('stack', default_value='true',
