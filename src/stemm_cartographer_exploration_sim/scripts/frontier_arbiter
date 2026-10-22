@@ -55,6 +55,7 @@ class Arbiter(Node):
         self.blacklist = []      # [(x, y, expire_ts)]
         self.last_pub = 0.0
         self.last_goal = None
+        self.pending = None
         self.stats = {'seen': 0, 'rejected_size': 0, 'rejected_path': 0,
                       'rejected_black': 0, 'published': 0}
 
@@ -115,9 +116,13 @@ class Arbiter(Node):
         k = min(self.pullback, d * 0.5) / d
         return x + dx * k, y + dy * k
 
-    def reachable(self, x, y):
-        if not self.cli.wait_for_service(timeout_sec=1.0):
-            return True                       # 服务不可用时不阻塞探索
+    def reachable_async(self, x, y):
+        """异步可达性校验：返回 future 或 None（不可用/已有在途请求）"""
+        if self.pending is not None:
+            return None
+        if not self.cli.service_is_ready():
+            if not self.cli.wait_for_service(timeout_sec=0.2):
+                return None
         req = ComputePathToPose.Request()
         req.goal = PoseStamped()
         req.goal.header.frame_id = self.frame
@@ -126,16 +131,8 @@ class Arbiter(Node):
         req.goal.pose.orientation.w = 1.0
         req.use_start = False
         fut = self.cli.call_async(req)
-        t0 = time.monotonic()
-        while not fut.done() and time.monotonic() - t0 < self.path_timeout:
-            rclpy.spin_once(self, timeout_sec=0.05)
-        if not fut.done():
-            return True                       # 超时保守放行（避免阻塞）
-        try:
-            res = fut.result()
-            return bool(res and res.path and len(res.path.poses) > 0)
-        except Exception:
-            return False
+        self.pending = (fut, x, y)
+        return fut
 
     # ---- 主循环 ----
     def tick(self):
@@ -158,24 +155,40 @@ class Arbiter(Node):
                 continue
             scored.append((u, -math.hypot(x - self.pose[0], y - self.pose[1]), x, y))
         scored.sort(reverse=True)
+        if self.pending is not None:
+            return
         for u, negd, x, y in scored[:self.max_cand]:
             gx, gy = self.pull_back(x, y)
-            if self.reachable(gx, gy):
-                msg = PoseStamped()
-                msg.header.frame_id = self.frame
-                msg.header.stamp = self.get_clock().now().to_msg()
-                msg.pose.position.x, msg.pose.position.y = gx, gy
-                msg.pose.orientation.w = 1.0
-                self.pub.publish(msg)
-                self.last_pub = now
-                self.last_goal = (gx, gy)
-                self.stats['published'] += 1
-                self.get_logger().info(
-                    f'仲裁通过：未知格 {u}，目标 ({gx:.2f},{gy:.2f})；统计 {self.stats}')
+            fut = self.reachable_async(gx, gy)
+            if fut is None:
                 return
+            fut.add_done_callback(lambda f, gx=gx, gy=gy, u=u: self.on_path_result(f, gx, gy, u))
+            return
+        self.get_logger().warn(f'本轮候选全部被拒：{self.stats}')
+
+    def on_path_result(self, fut, gx, gy, u):
+        self.pending = None
+        now = time.monotonic()
+        ok = False
+        try:
+            res = fut.result()
+            ok = bool(res and res.path and len(res.path.poses) > 0)
+        except Exception:
+            ok = False
+        if not ok:
             self.blacklist.append((gx, gy, now + self.bl_sec))
             self.stats['rejected_path'] += 1
-        self.get_logger().warn(f'本轮候选全部被拒：{self.stats}')
+            return
+        msg = PoseStamped()
+        msg.header.frame_id = self.frame
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.pose.position.x, msg.pose.position.y = gx, gy
+        msg.pose.orientation.w = 1.0
+        self.pub.publish(msg)
+        self.last_pub = now
+        self.last_goal = (gx, gy)
+        self.stats['published'] += 1
+        self.get_logger().info(f'仲裁通过：未知格 {u}，目标 ({gx:.2f},{gy:.2f})；统计 {self.stats}')
 
 
 def main():
