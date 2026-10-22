@@ -73,7 +73,9 @@ class EscapeSupervisor(Node):
     def __init__(self):
         super().__init__('escape_supervisor')
         p = self.declare_parameter
-        self.enabled = bool(p('enabled', True).value)
+        # launch 传进来的是字符串，必须自己解析（bool('false') 为 True 会踩坑）
+        _en = str(p('enabled', True).value).strip().lower()
+        self.enabled = _en in ('true', '1', 'yes', 'on')
         self.scan_topic = str(p('scan_topic', '/scan_raw').value)
         self.odom_topic = str(p('odom_topic', '/odom_combined').value)
         self.cmd_topic = str(p('cmd_topic', '/cmd_vel').value)

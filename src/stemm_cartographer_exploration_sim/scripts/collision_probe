@@ -96,9 +96,11 @@ class CollisionProbe(Node):
         self.scan_stamp = 0.0
         self.bumper_until = 0.0
         self.bumper_last = None
+        self.near = []
+        self.n_in_body = 0
 
         self.stats = {'contacts': 0, 'grazes': 0, 'alerts': 0, 'bumpers': 0,
-                      'reverse_windows': 0, 'reverse_secs': 0.0,
+                      'reverse_msgs': 0, 'reverse_windows': 0, 'reverse_secs': 0.0,
                       'reverse_dist': 0.0, 'forward_secs': 0.0,
                       'stalls': 0}
         self.min_d_ever = None
@@ -108,10 +110,12 @@ class CollisionProbe(Node):
         self._in_graze = False
         self._in_alert = False
         self._last_event = {'contact': 0.0, 'graze': 0.0, 'alert': 0.0}
-        # 后退窗口
+        # 后退窗口（带 0.5 s 滞回：Nav2/manager 之间夹零速度不会把一段后退切碎）
+        self._rev_active = False
         self._rev_start = None
         self._rev_odom = None
         self._rev_dist = 0.0
+        self._rev_last_neg = 0.0
         # 停滞（有前进指令但不动）
         self._stall_from = None
         self._stall_pose = None
@@ -142,6 +146,7 @@ class CollisionProbe(Node):
     def log(self, rec):
         rec.setdefault('t', round(time.monotonic(), 3))
         rec.setdefault('sim', round(self.now_stamp(), 3))
+        rec.setdefault('wall', round(time.time(), 3))      # 便于和 launch.log 的墙钟行对齐
         if self._fh is not None:
             self._fh.write(json.dumps(rec, ensure_ascii=False) + '\n')
         else:
@@ -157,7 +162,7 @@ class CollisionProbe(Node):
     def on_odom(self, m):
         q = m.pose.pose
         self.pose = (q.position.x, q.position.y, yaw_of(q.orientation))
-        if self._rev_start is not None and self._rev_odom is not None:
+        if self._rev_active and self._rev_odom is not None:
             self._rev_dist += math.hypot(self.pose[0] - self._rev_odom[0],
                                          self.pose[1] - self._rev_odom[1])
         self._rev_odom = (self.pose[0], self.pose[1])
@@ -165,24 +170,17 @@ class CollisionProbe(Node):
     def on_cmd(self, m):
         self.cmd = (m.linear.x, m.angular.z)
         now = time.monotonic()
-        # 后退窗口：linear.x < -0.02 —— 用户要求"任何情况下不得后退"，这里做取证
+        # 后退取证：用户要求"任何情况下不得后退"(linear.x >= 0)，这里逐条计数。
         if m.linear.x < -0.02:
-            if self._rev_start is None:
+            self.stats['reverse_msgs'] += 1
+            self._rev_last_neg = now
+            if not self._rev_active:
+                self._rev_active = True
                 self._rev_start = now
                 self._rev_odom = (self.pose[0], self.pose[1]) if self.pose else None
                 self._rev_dist = 0.0
                 self.stats['reverse_windows'] += 1
                 self.log({'type': 'reverse', 'phase': 'begin', 'vx': m.linear.x})
-        else:
-            if self._rev_start is not None:
-                dur = now - self._rev_start
-                self.stats['reverse_secs'] += dur
-                self.stats['reverse_dist'] += self._rev_dist
-                self.log({'type': 'reverse', 'phase': 'end',
-                          'dur': round(dur, 2), 'dist': round(self._rev_dist, 3),
-                          'pos': [round(v, 2) for v in (self.pose or (0, 0, 0))[:2]],
-                          'nav': self.nav_state})
-                self._rev_start = None
 
     def on_nav(self, m):
         self.nav_state = m.data or ''
@@ -214,6 +212,7 @@ class CollisionProbe(Node):
         min_d = float('inf')
         min_circ = float('inf')
         min_bearing = 0.0
+        near = []               # 车体附近(<0.6m)的点，事后取最近 5 个判断几何
         r_lo = max(0.0, m.range_min * 0.999 - 0.001)
         r_hi = min(m.range_max, 49.0) if m.range_max > 0 else 49.0
         cos, sin = math.cos, math.sin
@@ -231,6 +230,9 @@ class CollisionProbe(Node):
             if d < min_d:
                 min_d = d
                 min_bearing = math.atan2(y, x)
+            if d < 0.60:
+                near.append((round(d, 3), round(r, 3), round(math.degrees(th), 1),
+                             round(x, 3), round(y, 3)))
             c = math.hypot(x, y)
             if c < min_circ:
                 min_circ = c
@@ -240,12 +242,27 @@ class CollisionProbe(Node):
         self.circ_d = min_circ
         self.bearing = min_bearing
         self.scan_stamp = time.monotonic()
+        if near:
+            near.sort()
+            self.near = near[:5]
+            self.n_in_body = sum(1 for n in near if n[0] <= 0.0)
         self.min_d_ever = min_d if self.min_d_ever is None else min(self.min_d_ever, min_d)
         self.circ_ever = min_circ if self.circ_ever is None else min(self.circ_ever, min_circ)
 
     # ---------------- 判定 ----------------
     def tick(self):
         now = time.monotonic()
+        # 后退窗口收尾（0.5 s 内没有新的反向指令即结束）
+        if self._rev_active and now - self._rev_last_neg > 0.5:
+            dur = self._rev_last_neg - (self._rev_start or self._rev_last_neg)
+            self.stats['reverse_secs'] += dur
+            self.stats['reverse_dist'] += self._rev_dist
+            self.log({'type': 'reverse', 'phase': 'end',
+                      'dur': round(dur, 2), 'dist': round(self._rev_dist, 3),
+                      'pos': [round(v, 2) for v in (self.pose or (0, 0, 0))[:2]],
+                      'nav': self.nav_state})
+            self._rev_active = False
+            self._rev_start = None
         fresh = (now - self.scan_stamp) < 1.0
         bumper = now < self.bumper_until
         contact = bumper or (fresh and self.min_d is not None
@@ -268,7 +285,9 @@ class CollisionProbe(Node):
                     self._last_event[name] = now
                     self.stats[{'contact': 'contacts', 'graze': 'grazes',
                                 'alert': 'alerts'}[name]] += 1
-                    self.log({'type': name, 'min_d': round(self.min_d or 0.0, 3),
+                    self.log({'type': name, 'near': self.near,
+                              'n_in_body': self.n_in_body,
+                              'min_d': round(self.min_d or 0.0, 3),
                               'circ_d': round(self.circ_d or 0.0, 3),
                               'bearing_deg': round(math.degrees(self.bearing or 0.0), 1),
                               'pos': [round(v, 2) for v in (self.pose or (0, 0, 0))[:2]],
@@ -317,9 +336,10 @@ class CollisionProbe(Node):
 
     def destroy_node(self):
         try:
-            if self._rev_start is not None:
-                self.stats['reverse_secs'] += time.monotonic() - self._rev_start
+            if self._rev_active:
+                self.stats['reverse_secs'] += max(0.0, self._rev_last_neg - (self._rev_start or 0.0))
                 self.stats['reverse_dist'] += self._rev_dist
+                self._rev_active = False
             self.summary()
         except Exception:
             pass
