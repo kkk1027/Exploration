@@ -837,12 +837,16 @@ class Arbiter(Node):
                 dropped_turn += 1
                 continue
             filtered.append((x, y))
-        self.stats['rejected_turn'] = self.stats.get('rejected_turn', 0) + dropped_turn
+        if dropped_turn:
+            self.stats['turn_dropped'] = self.stats.get('turn_dropped', 0) + dropped_turn
         if not filtered:
+            # 全部在机头之外：不要让探索停摆 —— 派发最优的那个，manager 自己的 80° 门
+            # 会做最终裁决（它会先原地转再发目标，虽然慢但不至于完全卡住）。
+            self.stats['turn_fallback'] = self.stats.get('turn_fallback', 0) + 1
             self.get_logger().info(
                 f'[v3] 全部候选都在机头 {self.turn_limit_deg:.0f}° 之外（{dropped_turn} 个），'
-                f'本轮不派发（让 manager 自己转向或下一轮再看）')
-            return
+                f'回退派发最优候选')
+            filtered = list(cands)
         try:
             ranked = rank_candidates_v3(g, filtered, self.cfg3, penalty_fn=self.penalty,
                                         pose=self.pose, prefilter_n=self.prefilter_n)

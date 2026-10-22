@@ -141,6 +141,9 @@ class EscapeSupervisor(Node):
         self.return_reverse_rear_clear = abs(float(p('return_reverse_rear_clear', 0.30).value))
         self.return_reverse_min_points = int(p('return_reverse_min_points', 20).value)
         self.return_reverse_max_count = int(p('return_reverse_max_count', 8).value)
+        # 返航失败（manager 放弃等待人工）时允许连续小步倒车，每步仍 <=0.15 m、逐步雷达复核
+        self.return_reverse_streak = int(p('return_reverse_streak', 4).value)
+        self._rv_streak_left = 0
 
         # ---- 状态 ----
         self.points = []           # 车体系障碍点 [(x,y)]（最近一帧 /scan_raw）
@@ -464,12 +467,19 @@ class EscapeSupervisor(Node):
     def maybe_reverse_assist(self, now):
         if not self.return_reverse_enabled:
             return False
-        if self.nav_busy or not self.in_return_phase():
+        if not self.in_return_phase():
+            return False
+        gave_up = ('failed_waiting_manual' in self.state_name.lower()
+                   or 'manual' in self.state_name.lower())
+        if self.nav_busy and not gave_up:
             return False                     # 有活跃目标就让 Nav2 自己走
         if self._rv_count >= self.return_reverse_max_count:
             return False
-        if now - self._rv_last_end < 2.0:
+        if now - self._rv_last_end < (1.0 if gave_up else 2.0):
             return False
+        # manager 已放弃时开一串连续小步（每步仍独立复核后方净空）
+        if gave_up and self._rv_streak_left <= 0:
+            self._rv_streak_left = self.return_reverse_streak
         if now - self.points_stamp > self.scan_stale_sec:
             return False
         if now - self.last_foreign_cmd < 1.0:
@@ -494,6 +504,8 @@ class EscapeSupervisor(Node):
         self._rv_moved = 0.0
         self._rv_start = (self.pose[0], self.pose[1]) if self.pose else None
         self._rv_count += 1
+        if self._rv_streak_left > 0:
+            self._rv_streak_left -= 1
         self.assist_pub.publish(Bool(data=True))
         self.log(type='reverse_assist_start', rear_points=npts,
                  rear_clear=round(clear, 3), nav=self.nav_state,

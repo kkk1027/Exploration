@@ -16,9 +16,16 @@ import sys
 
 # 打分内核是纯函数，但模块顶部会 import rclpy（节点本身不构造）。
 # 没source ROS 时给个空壳，保证离线测试在任何 shell 里都能跑。
+_need_stub = False
+try:                                    # pragma: no cover
+    import wheeltec_rrt_msg.msg  # noqa: F401
+except Exception:                       # pragma: no cover
+    _need_stub = True
 try:                                    # pragma: no cover
     import rclpy  # noqa: F401
 except Exception:                       # pragma: no cover
+    _need_stub = True
+if _need_stub:                          # pragma: no cover
     import types
     for name in ('rclpy', 'rclpy.node', 'rclpy.qos', 'action_msgs', 'action_msgs.msg',
                  'geometry_msgs', 'geometry_msgs.msg', 'nav_msgs', 'nav_msgs.msg',
