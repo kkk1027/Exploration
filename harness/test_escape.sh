@@ -27,6 +27,14 @@ setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exp
   probe_log:=$OUT/probe.jsonl supervisor_log:=$OUT/supervisor.jsonl" \
   > "$OUT/launch.log" 2>&1 < /dev/null &
 sleep 45
+# 可选用 PARAMS="k=v k2=v2" 在运行时改监督节点参数（做降级/超时这类机制验证）
+if [ -n "${PARAMS:-}" ]; then
+  for kv in $PARAMS; do
+    k=${kv%%=*}; v=${kv#*=}
+    ros2 param set /escape_supervisor "$k" "$v" >/dev/null 2>&1 \
+      && echo "[escape-test] param $k=$v ✓" | tee -a "$OUT/harness.log"
+  done
+fi
 python3 "$BASE/harness/fake_nav_status" > "$OUT/fake.log" 2>&1 &
 FAKE=$!
 sleep "${HOLD:-35}"

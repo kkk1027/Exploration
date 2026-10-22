@@ -291,17 +291,43 @@ class EscapeSupervisor(Node):
                 best = r
         return best
 
+    def rotation_path_clear(self, offset, step=0.15):
+        """整段旋转是否安全：沿路每一小步都用"该步朝向 ±35° 扇区"的最小测距复核。
+
+        单元测试（escA）暴露过：只看全局最小测距时，车侧/车后某个方向的近物会让
+        旋转闸门永远误报；只看目标朝向又会在"扫过去的那一段"刮到东西。所以按步校验。
+        """
+        n = max(1, int(round(abs(offset) / step)))
+        for i in range(1, n + 1):
+            th = offset * i / n
+            if self.range_cone(th, half_deg=35.0, stride=4) < self.rotate_min_range:
+                return False
+        return True
+
     def pick_heading(self):
-        """返回 (offset, 最小测距)；offset 为相对当前朝向的转角（限 ±heading_limit）。"""
-        best = None
-        off = -self.heading_limit
-        while off <= self.heading_limit + 1e-6:
+        """返回 (offset, 最小测距)；offset 为相对当前朝向的转角（限 ±heading_limit）。
+
+        由小到大枚举 |offset|，第一个"目标扇区够空 + 整段旋转路径安全"的航向即选中
+        （转角越小越好）；都不满足时返回全局最空旷的那个，交给上层判 no_direction。
+        """
+        best_any = None
+        offsets = []
+        k = 0.15
+        while k <= self.heading_limit + 1e-6:
+            offsets.extend([k, -k])
+            k += 0.15
+        offsets.insert(0, 0.0)
+        order = sorted(offsets, key=abs)
+        for off in order:
             clr = self.range_cone(off, half_deg=14.0, stride=4)
-            score = min(clr, 3.0) - 0.20 * abs(off)
-            if best is None or score > best[0]:
-                best = (score, off, clr)
-            off += 0.15
-        return best[1], best[2]
+            if best_any is None or clr > best_any[1]:
+                best_any = (off, clr)
+            if clr < self.min_dir_range:
+                continue
+            if not self.rotation_path_clear(off):
+                continue
+            return off, clr
+        return best_any[0], best_any[1]
 
     def footprint_cost(self):
         """Nav2 局部代价地图上机器人所在格的代价（0..254），取不到返回 None。"""
@@ -431,7 +457,8 @@ class EscapeSupervisor(Node):
             self.end_unit(now, degraded=True)
             return
         if self.phase == 'rotate':
-            cur = self.min_range_all(stride=2)
+            # 只看"正在转进去的那一侧"（含车体半宽对应的展角），避免车后有近物就永不动
+            cur = self.range_cone(self.unit_remaining, half_deg=60.0, stride=3)
             if cur < self.rotate_min_range:
                 self.abort_unit(now, 'rotate_into_obstacle')
                 return
