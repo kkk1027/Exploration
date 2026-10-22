@@ -98,12 +98,18 @@ class Arbiter(Node):
 
     def on_nav_state(self, m):
         txt = (m.data or '').lower()
-        if any(k in txt for k in ('escape', 'blocked', 'retreat', 'recovery')):
+        # 只认真正处于 escape/blocked 的动作态；排除返航与 retry_recovery 这类常态字串
+        hit = ('escape_' in txt or 'blocked_' in txt or '"escape' in txt or '"blocked' in txt)
+        if hit and 'return' not in txt and 'retry_recovery' not in txt:
+            now = time.monotonic()
+            if now - getattr(self, '_last_zone', 0.0) < 5.0:
+                return
+            self._last_zone = now
             if self.pose is not None:
                 self.stuck_zones.append(
                     (self.pose[0], self.pose[1], time.monotonic() + self.bl_sec))
-                if len(self.stuck_zones) > 30:
-                    self.stuck_zones = self.stuck_zones[-30:]
+                if len(self.stuck_zones) > 15:
+                    self.stuck_zones = self.stuck_zones[-15:]
                 self.get_logger().warn(
                     f'受阻区记录（事件驱动 {txt[:24]}）：({self.pose[0]:.2f},{self.pose[1]:.2f})')
 
@@ -254,7 +260,7 @@ class Arbiter(Node):
             if self.blacklisted(x, y, now):
                 # 黑名单从"硬拒"改为"重罚"：避免整片区域被吃掉后陷入"全部被拒"
                 self.stats['penalized_black'] = self.stats.get('penalized_black', 0) + 1
-                u -= 600
+                u -= 250
             if u < self.min_unknown:
                 self.stats['rejected_size'] += 1
                 continue
