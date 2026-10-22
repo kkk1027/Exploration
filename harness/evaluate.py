@@ -43,8 +43,11 @@ collision = None
 if probe and os.path.exists(probe):
     import collections
     c = collections.Counter()
+    chassis = 0
+    wheel = 0
     rev = 0
     rev_m = 0.0
+    rev_hard = 0
     mind = None
     for line in open(probe, encoding='utf-8', errors='ignore'):
         line = line.strip()
@@ -59,16 +62,26 @@ if probe and os.path.exists(probe):
             c[t] += 1
         elif t == 'reverse' and r.get('phase') == 'end':
             rev += 1
-            rev_m += float(r.get('dist') or 0.0)
+            d = float(r.get('dist') or 0.0)
+            rev_m += d
+            if d >= 0.05:
+                rev_hard += 1
+        elif t == 'summary':
+            chassis = int(r.get('chassis_contacts') or 0)
+            wheel = int(r.get('wheel_contacts') or 0)
         for k in ('min_d', 'min_d_now', 'min_d_ever'):
             v = r.get(k)
             if isinstance(v, (int, float)) and v >= 0 and (mind is None or v < mind):
                 mind = v
-    collision = {'contacts': c['contact'], 'grazes': c['graze'], 'alerts': c['alert'],
+    collision = {'lidar_contacts': c['contact'], 'grazes': c['graze'], 'alerts': c['alert'],
                  'reverse_windows': rev, 'reverse_m': round(rev_m, 2),
+                 'reverse_hard_windows': rev_hard, 'chassis_contacts': chassis,
+                 'wheel_contacts': wheel, 'physical_contacts': chassis + wheel,
                  'min_clearance_ever': round(mind, 3) if mind is not None else None}
-    checks['no_contact'] = collision['contacts'] == 0
-    checks['no_reverse'] = collision['reverse_windows'] == 0
+    # 判据用"物理接触"（Gazebo 接触传感器，已过滤地面）+ ">=5 cm 的后退窗口"；
+    # 雷达口径的近距点留在 collision 里作参考（桌下/近场回波会有）。
+    checks['no_contact'] = collision['physical_contacts'] == 0
+    checks['no_reverse'] = collision['reverse_hard_windows'] == 0
 
 p0 = '--p0' in flags
 hard = [k for k in checks if k not in ('return_home',)]

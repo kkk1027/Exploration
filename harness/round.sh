@@ -116,9 +116,23 @@ for line in open(src, encoding='utf-8', errors='ignore'):
         v = r.get(k)
         if isinstance(v, (int, float)) and v >= 0 and (mind is None or v < mind):
             mind = v
+last = {}
+for line in open(src, encoding='utf-8', errors='ignore'):
+    try:
+        r = json.loads(line)
+    except Exception:
+        continue
+    if r.get('type') == 'summary':
+        last = r
+hard = [x for x in rev if (x.get('dist') or 0.0) >= 0.05]
 summary = {'contacts': c['contact'], 'grazes': c['graze'], 'alerts': c['alert'],
            'stalls': c['stall'], 'reverse_windows': len(rev),
            'reverse_m': round(sum(x.get('dist', 0.0) for x in rev), 3),
+           'reverse_hard_windows': len(hard),
+           'reverse_hard_m': round(sum((x.get('dist') or 0.0) for x in hard), 3),
+           'chassis_contacts': last.get('chassis_contacts', 0),
+           'wheel_contacts': last.get('wheel_contacts', 0),
+           'physical_contacts': last.get('chassis_contacts', 0) + last.get('wheel_contacts', 0),
            'min_clearance_ever': round(mind, 3) if mind is not None else None}
 line = '{"tag":"%s","check":"collision","%s"}' % (jout.rsplit('/', 1)[-1], '')
 with open(jout, 'a') as f:

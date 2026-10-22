@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""fake_nav_status —— 脱困监督单元测试用的"假导航状态"注入器。
+
+escape_supervisor 的武装判据里有两条外部输入：
+  * /navigate_to_pose/_action/status（有没有活跃 Nav2 目标）
+  * /stemm_cartographer/nav_state（manager 的 JSON 状态，含 mode / navigation_state）
+单元测试里不想把整套栈+Nav2 拉起来，就直接把这两条"有目标在执行"的状态喂给它，
+让它误以为"有导航任务但车停住了"，从而走真正的脱困逻辑。
+
+用法：fake_nav_status [--mode navigating] [--state executing]
+"""
+import sys
+
+import rclpy
+from action_msgs.msg import GoalStatusArray, GoalStatus
+from rclpy.node import Node
+from std_msgs.msg import String
+
+
+def arg(flag, default):
+    if flag in sys.argv:
+        i = sys.argv.index(flag)
+        if i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return default
+
+
+def main():
+    rclpy.init()
+    mode = arg('--mode', 'navigating')
+    state = arg('--state', 'executing')
+    n = Node('fake_nav_status')
+    pub_status = n.create_publisher(GoalStatusArray, '/navigate_to_pose/_action/status', 10)
+    pub_nav = n.create_publisher(String, '/stemm_cartographer/nav_state', 10)
+    n.create_timer(0.2, lambda: pub_status.publish(_status_msg()))
+    n.create_timer(0.5, lambda: pub_nav.publish(String(data=(
+        '{"mode": "%s", "navigation_state": "%s"}' % (mode, state)))))
+    n.get_logger().info(f'fake_nav_status up: mode={mode} state={state}')
+    try:
+        rclpy.spin(n)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        n.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+def _status_msg():
+    m = GoalStatusArray()
+    st = GoalStatus()
+    st.status = GoalStatus.STATUS_EXECUTING
+    m.status_list = [st]
+    return m
+
+
+if __name__ == '__main__':
+    main()

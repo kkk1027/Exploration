@@ -39,6 +39,9 @@ def generate_launch_description():
     use_sim_time = LaunchConfiguration('use_sim_time')
     map_out = LaunchConfiguration('map_out')
 
+    # stack:=false 时只起机器人层 + 取证/脱困节点（P0 单元测试用，不拉车端整套栈）
+    stack_on = IfCondition(LaunchConfiguration('stack'))
+
     robot = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(model, 'launch', '_t_classic.launch.py')),
@@ -54,14 +57,15 @@ def generate_launch_description():
                          'stemm_cartographer_auto_mapping.launch.py')),
         launch_arguments=[('auto_explore', auto_explore),
                           ('frontier_source', frontier_source),
-                          ('use_sim_time', use_sim_time)])
+                          ('use_sim_time', use_sim_time)],
+        condition=stack_on)
 
     # 与栈同时启动的运行时参数补丁（独立进程，0.5 s 重试，抢在 guard 的 30 s 判定前落地）
     patch_sim_time = ExecuteProcess(
         cmd=[os.path.join(get_package_prefix('stemm_cartographer_exploration_sim'),
                           'lib', 'stemm_cartographer_exploration_sim', 'patch_sim_time'),
              LaunchConfiguration('disable_retreat')],
-        output='screen')
+        output='screen', condition=stack_on)
 
     rviz = Node(package='rviz2', executable='rviz2', name='rviz2', output='screen',
                 condition=IfCondition(LaunchConfiguration('rviz')),
@@ -69,7 +73,7 @@ def generate_launch_description():
                 parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')}])
 
     arbiter = Node(package='stemm_cartographer_exploration_sim', executable='frontier_arbiter',
-                   name='frontier_arbiter', output='screen',
+                   name='frontier_arbiter', output='screen', condition=stack_on,
                    parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time'),
                                 'republish_sec': 1.5, 'max_candidates': 6,
                                 'blacklist_sec': 30.0, 'blacklist_radius': 0.5}])
@@ -125,6 +129,8 @@ def generate_launch_description():
             description='脱困监督 JSONL 路径（空=只打日志）'),
         DeclareLaunchArgument('escape_supervisor', default_value='true',
             description='是否启用雷达引导的旋转+前进脱困（P0）'),
+        DeclareLaunchArgument('stack', default_value='true',
+            description='是否启动车端探索栈（false=只起机器人+取证/脱困，单元测试用）'),
         DeclareLaunchArgument('disable_retreat', default_value='1',
             description='1=运行期关闭车端盲退（P0 默认）；0=保留（对照基线）'),
         DeclareLaunchArgument(
