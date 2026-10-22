@@ -28,7 +28,6 @@ import time
 
 import rclpy
 from geometry_msgs.msg import PoseStamped
-from nav2_msgs.srv import ComputePathToPose
 from nav_msgs.msg import OccupancyGrid, Odometry
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
@@ -65,13 +64,54 @@ class Arbiter(Node):
         self.create_subscription(PointArray, '/filtered_goal_points', self.on_cands, 10)
         self.create_subscription(Odometry, '/odom_combined', self.on_odom, 20)
         self.pub = self.create_publisher(PoseStamped, '/validated_frontier_goal', 10)
-        self.cli = self.create_client(ComputePathToPose, '/compute_path_to_pose')
+        self.costmap = None
+        self.create_subscription(OccupancyGrid, '/global_costmap/costmap', self.on_costmap, qmap)
         self.create_timer(1.0, self.tick)
         self.get_logger().info('frontier_arbiter 就绪：可达性预筛/黑名单/最小前沿/回拉')
 
     # ---- 回调 ----
     def on_map(self, m):
         self.map = m
+
+    def on_costmap(self, m):
+        self.costmap = m
+
+    def reachable(self, x, y):
+        """在全局代价地图上做 BFS 连通性判定（未知/致命格视为不可通行）。"""
+        cm = self.costmap
+        if cm is None or self.pose is None:
+            return True                      # 代价地图未就绪时不阻塞
+        info = cm.info
+        res = info.resolution
+        w, h = info.width, info.height
+        ox, oy = info.origin.position.x, info.origin.position.y
+        sx = int((self.pose[0] - ox) / res); sy = int((self.pose[1] - oy) / res)
+        gx = int((x - ox) / res);            gy = int((y - oy) / res)
+        if not (0 <= sx < w and 0 <= sy < h) or not (0 <= gx < w and 0 <= gy < h):
+            return False
+        data = cm.data
+        if data[gy * w + gx] < 0 or data[gy * w + gx] >= 90:
+            return False                     # 终点本身不可通行
+        from collections import deque
+        seen = bytearray(w * h)
+        q = deque([(sx, sy)])
+        seen[sy * w + sx] = 1
+        budget = 60000
+        while q and budget > 0:
+            cx, cy = q.popleft(); budget -= 1
+            if cx == gx and cy == gy:
+                return True
+            for nx, ny in ((cx+1,cy),(cx-1,cy),(cx,cy+1),(cx,cy-1)):
+                if 0 <= nx < w and 0 <= ny < h:
+                    idx = ny * w + nx
+                    if seen[idx]:
+                        continue
+                    v = data[idx]
+                    if v < 0 or v >= 90:     # 未知或致命/内切
+                        continue
+                    seen[idx] = 1
+                    q.append((nx, ny))
+        return False
 
     def on_odom(self, m):
         q = m.pose.pose.position
@@ -155,15 +195,23 @@ class Arbiter(Node):
                 continue
             scored.append((u, -math.hypot(x - self.pose[0], y - self.pose[1]), x, y))
         scored.sort(reverse=True)
-        if self.pending is not None:
-            return
         for u, negd, x, y in scored[:self.max_cand]:
             gx, gy = self.pull_back(x, y)
-            fut = self.reachable_async(gx, gy)
-            if fut is None:
+            if self.reachable(gx, gy):
+                msg = PoseStamped()
+                msg.header.frame_id = self.frame
+                msg.header.stamp = self.get_clock().now().to_msg()
+                msg.pose.position.x, msg.pose.position.y = gx, gy
+                msg.pose.orientation.w = 1.0
+                self.pub.publish(msg)
+                self.last_pub = now
+                self.last_goal = (gx, gy)
+                self.stats['published'] += 1
+                self.get_logger().info(
+                    f'仲裁通过：未知格 {u}，目标 ({gx:.2f},{gy:.2f})；统计 {self.stats}')
                 return
-            fut.add_done_callback(lambda f, gx=gx, gy=gy, u=u: self.on_path_result(f, gx, gy, u))
-            return
+            self.blacklist.append((gx, gy, now + self.bl_sec))
+            self.stats['rejected_path'] += 1
         self.get_logger().warn(f'本轮候选全部被拒：{self.stats}')
 
     def on_path_result(self, fut, gx, gy, u):
