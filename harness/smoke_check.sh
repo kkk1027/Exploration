@@ -50,7 +50,19 @@ for t in /scan_raw /odom_combined /map /collision/min_clearance; do
   if timeout 10 ros2 topic echo "$t" --once >/dev/null 2>&1; then ok "$t 有数据"; else bad "$t 无数据"; fi
 done
 
-echo "[smoke] 4) 日志无致命错误"
+echo "[smoke] 4) 探索环是否真的转起来"
+if [ -f "$LOG" ]; then
+  if grep -q "navigation goal dispatched" "$LOG"; then
+    ok "首次探索目标已派发"
+  else
+    bad "起栈后 50 s 内没有派发任何探索目标（探索环没转起来）"
+  fi
+  if grep -q "候选打分前\|仲裁通过" "$LOG"; then ok "仲裁在工作（有打分/派发记录）"; else bad "仲裁没有任何打分/派发记录"; fi
+else
+  echo "  (未提供 launch.log，跳过)"
+fi
+
+echo "[smoke] 5) 日志无致命错误"
 if [ -f "$LOG" ]; then
   if grep -q "TF health check timed out" "$LOG"; then bad "mapping_tf_guard 超时"; else ok "无 TF guard 超时"; fi
   N=$(grep -c "process has died" "$LOG" 2>/dev/null | head -1)

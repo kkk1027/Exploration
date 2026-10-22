@@ -199,6 +199,10 @@ class CollisionProbe(Node):
 
     def on_assist(self, m):
         self._assist_active = bool(m.data)
+        # 竞态兜底：/escape_assist_active 可能比首条反向指令晚到几十毫秒，
+        # 若窗口已经开着就把整段窗口标成受控（否则会误判成"非受控硬倒车"）
+        if self._assist_active and self._rev_active:
+            self._rev_had_assist = True
 
     def on_bumper(self, m):
         if not m.states:

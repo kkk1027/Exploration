@@ -56,7 +56,7 @@ SUPERVISOR="${SUPERVISOR:-true}"
 CAR_ESCAPE="${CAR_ESCAPE:-$([ "${DISABLE_CAR_ESCAPE:-1}" = "1" ] && echo false || echo true)}"
 say "P0 变体：disable_retreat=$DISABLE_RETREAT escape_supervisor=$SUPERVISOR"
 rec "\"check\":\"variant\",\"disable_retreat\":$DISABLE_RETREAT,\"supervisor\":\"$SUPERVISOR\""
-setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE spawn_x:=$SX spawn_y:=$SY spawn_yaw:=$SYAW disable_retreat:=$DISABLE_RETREAT escape_supervisor:=$SUPERVISOR car_escape:=$CAR_ESCAPE rviz:=${RVIZ:-false} stack_delay:=${STACK_DELAY:-0.0} scoring:=${SCORING:-v3} supervisor_rotate_min_range:=${SUP_ROT_MIN:-0.30} supervisor_advance_stop_range:=${SUP_ADV_STOP:-0.30} probe_log:=$OUT/probe.jsonl supervisor_log:=$OUT/supervisor.jsonl" \
+setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE spawn_x:=$SX spawn_y:=$SY spawn_yaw:=$SYAW disable_retreat:=$DISABLE_RETREAT escape_supervisor:=$SUPERVISOR car_escape:=$CAR_ESCAPE rviz:=${RVIZ:-false} stack_delay:=${STACK_DELAY:-0.0} scoring:=${SCORING:-v3} supervisor_rotate_min_range:=${SUP_ROT_MIN:-0.34} supervisor_advance_stop_range:=${SUP_ADV_STOP:-0.34} probe_log:=$OUT/probe.jsonl supervisor_log:=$OUT/supervisor.jsonl" \
   > "$OUT/launch.log" 2>&1 < /dev/null &
 sleep 3; PGID=$(cat "$OUT/pgid" 2>/dev/null || echo "")
 say "已启动：PGID=$PGID  日志 $OUT/launch.log"
@@ -73,7 +73,12 @@ if [ "${SMOKE:-0}" = "1" ]; then
     grep -q "全部阶段完成" "$OUT/launch.log" 2>/dev/null && break
     sleep 2
   done
-  sleep 6
+  # 保守口径：再等最多 50 s 等"第一个探索目标派发"，用它证明探索环真的转起来了
+  for i in $(seq 1 25); do
+    grep -q "navigation goal dispatched" "$OUT/launch.log" 2>/dev/null && break
+    sleep 2
+  done
+  sleep 3
   bash harness/smoke_check.sh "$OUT/launch.log" | tee -a "$OUT/harness.log"
   SMOKE_RC=${PIPESTATUS[0]}
   rec "\"check\":\"smoke\",\"rc\":$SMOKE_RC"
