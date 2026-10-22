@@ -129,10 +129,13 @@ for line in open(src, encoding='utf-8', errors='ignore'):
         continue
     if r.get('type') == 'summary':
         last = r
-hard = [x for x in rev if (x.get('dist') or 0.0) >= 0.05]
+hard = [x for x in rev if (x.get('dist') or 0.0) >= 0.05 and not x.get('assist')]
+assist = [x for x in rev if x.get('assist')]
 summary = {'contacts': c['contact'], 'grazes': c['graze'], 'alerts': c['alert'],
            'stalls': c['stall'], 'reverse_windows': len(rev),
            'reverse_m': round(sum(x.get('dist', 0.0) for x in rev), 3),
+           'reverse_assist_windows': len(assist),
+           'reverse_assist_m': round(sum((x.get('dist') or 0.0) for x in assist), 3),
            'reverse_hard_windows': len(hard),
            'reverse_hard_m': round(sum((x.get('dist') or 0.0) for x in hard), 3),
            'chassis_contacts': last.get('chassis_contacts', 0),

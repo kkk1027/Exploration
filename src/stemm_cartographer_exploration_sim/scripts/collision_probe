@@ -141,6 +141,9 @@ class CollisionProbe(Node):
                                      self.on_bumper, 10)
         self.pub_min = self.create_publisher(Float32, '/collision/min_clearance', 10)
         self.pub_contact = self.create_publisher(Bool, '/collision/contact', 10)
+        self._assist_active = False
+        self._rev_had_assist = False
+        self.create_subscription(Bool, '/escape_assist_active', self.on_assist, 10)
         self.pub_summary = self.create_publisher(String, '/collision/summary', 10)
         # 物理接触时把这个位置报给仲裁，让"学到的避让"生效（同一个桌子不反复撞）
         self.pub_zone = self.create_publisher(PoseStamped, '/collision_contact_zone', 10)
@@ -178,6 +181,8 @@ class CollisionProbe(Node):
         # 后退取证：用户要求"任何情况下不得后退"(linear.x >= 0)，这里逐条计数。
         if m.linear.x < -0.02:
             self.stats['reverse_msgs'] += 1
+            if self._assist_active:
+                self._rev_had_assist = True
             self._rev_last_neg = now
             if not self._rev_active:
                 self._rev_active = True
@@ -185,10 +190,15 @@ class CollisionProbe(Node):
                 self._rev_odom = (self.pose[0], self.pose[1]) if self.pose else None
                 self._rev_dist = 0.0
                 self.stats['reverse_windows'] += 1
-                self.log({'type': 'reverse', 'phase': 'begin', 'vx': m.linear.x})
+                self._rev_had_assist = self._assist_active
+                self.log({'type': 'reverse', 'phase': 'begin', 'vx': m.linear.x,
+                          'assist': self._assist_active})
 
     def on_nav(self, m):
         self.nav_state = m.data or ''
+
+    def on_assist(self, m):
+        self._assist_active = bool(m.data)
 
     def on_bumper(self, m):
         if not m.states:
@@ -302,10 +312,14 @@ class CollisionProbe(Node):
             dur = self._rev_last_neg - (self._rev_start or self._rev_last_neg)
             self.stats['reverse_secs'] += dur
             self.stats['reverse_dist'] += self._rev_dist
-            self.log({'type': 'reverse', 'phase': 'end',
+            if self._rev_had_assist:
+                self.stats['reverse_assist_windows'] = self.stats.get(
+                    'reverse_assist_windows', 0) + 1
+            self.log({'type': 'reverse', 'phase': 'end', 'assist': self._rev_had_assist,
                       'dur': round(dur, 2), 'dist': round(self._rev_dist, 3),
                       'pos': [round(v, 2) for v in (self.pose or (0, 0, 0))[:2]],
                       'nav': self.nav_state})
+            self._rev_had_assist = False
             self._rev_active = False
             self._rev_start = None
         fresh = (now - self.scan_stamp) < 1.0

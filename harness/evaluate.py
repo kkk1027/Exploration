@@ -64,7 +64,7 @@ if probe and os.path.exists(probe):
             rev += 1
             d = float(r.get('dist') or 0.0)
             rev_m += d
-            if d >= 0.05:
+            if d >= 0.05 and not r.get('assist'):
                 rev_hard += 1
         elif t == 'summary':
             chassis = int(r.get('chassis_contacts') or 0)
@@ -78,7 +78,8 @@ if probe and os.path.exists(probe):
                  'reverse_hard_windows': rev_hard, 'chassis_contacts': chassis,
                  'wheel_contacts': wheel, 'physical_contacts': chassis + wheel,
                  'min_clearance_ever': round(mind, 3) if mind is not None else None}
-    # 判据用"物理接触"（Gazebo 接触传感器，已过滤地面）+ ">=5 cm 的后退窗口"；
+    # 判据用"物理接触"（Gazebo 接触传感器，已过滤地面）+ ">=5 cm 的**非受控**后退窗口"
+    # （返航阶段由 escape_supervisor 执行的受控小步倒车 assist=True，不算违规）；
     # 雷达口径的近距点留在 collision 里作参考（桌下/近场回波会有）。
     checks['no_contact'] = collision['physical_contacts'] == 0
     checks['no_reverse'] = collision['reverse_hard_windows'] == 0
