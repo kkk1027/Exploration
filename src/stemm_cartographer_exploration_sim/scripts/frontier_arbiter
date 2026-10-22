@@ -226,6 +226,9 @@ class Arbiter(Node):
         self.verbose_rank = str(p('verbose_rank', True).value).lower() in ('true', '1', 'yes')
         # 两级打分：昂贵指标只算前 N 个（候选池可能几百个）
         self.prefilter_n = int(p('prefilter_n', 12).value)
+        # 收益函数 v2 开关：实测在 2026-10-23 的整轮里明显退化（两轮都出现 200+ 次物理接触、
+        # 返航失败），按"出现退化先回退"的约定默认关闭；内核与离线测试保留，供后续做同种子 A/B。
+        self.scoring_v2 = str(p('scoring_v2', False).value).lower() in ('true', '1', 'yes')
 
         self.map = None
         self.pose = None
@@ -608,6 +611,61 @@ class Arbiter(Node):
         return pen
 
     def tick(self):
+        if self.scoring_v2:
+            return self._tick_v2()
+        return self._tick_v1()
+
+    def _tick_v1(self):
+        now = time.monotonic()
+        self._update_stuck(now)
+        if self.map is None or self.pose is None or not self.cands:
+            return
+        if self.mgr_busy and now - self.last_pub < self.repub:
+            return
+        cands = [c for c in self.cands if now - c[2] < 30.0]
+        if not cands:
+            return
+        scored = []
+        for x, y, _ in cands:
+            u = self.unknown_cells(x, y)
+            if self.blacklisted(x, y, now):
+                self.stats['penalized_black'] = self.stats.get('penalized_black', 0) + 1
+                u -= 250
+            if u < self.min_unknown:
+                self.stats['rejected_size'] += 1
+                continue
+            u_eff = u - self._stuck_penalty(x, y, now)
+            scored.append((u_eff, -math.hypot(x - self.pose[0], y - self.pose[1]), x, y))
+        scored.sort(reverse=True)
+        fallback = None
+        for u, negd, x, y in scored[:self.max_cand]:
+            gx, gy = self.pull_back(x, y)
+            ok, narrow = self.path_and_width(gx, gy)
+            if not ok:
+                self.blacklist.append((gx, gy, now + self.bl_sec))
+                self.stats['rejected_path'] += 1
+                continue
+            if narrow is not None:
+                self.stats['rejected_narrow'] += 1
+                self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
+                if fallback is None:
+                    fallback = (gx, gy)
+                self.get_logger().info(
+                    '前向净空预检否决：走廊 < %.2fm @(%.2f,%.2f)，目标 (%.2f,%.2f)'
+                    % (self.corridor_width, narrow[0], narrow[1], gx, gy))
+                continue
+            self.publish_goal(gx, gy, None, u)
+            return
+        if fallback is not None:
+            self.stats['narrow_fallback'] += 1
+            self.get_logger().warn(
+                '候选全部需要穿窄缝，回退派发最优点 (%.2f,%.2f)；统计 %s'
+                % (fallback[0], fallback[1], self.stats))
+            self.publish_goal(fallback[0], fallback[1], None, 0)
+            return
+        self.get_logger().warn(f'本轮候选全部被拒：{self.stats}')
+
+    def _tick_v2(self):
         now = time.monotonic()
         self._update_stuck(now)
         if self.map is None or self.pose is None or not self.cands:
@@ -668,7 +726,7 @@ class Arbiter(Node):
             return
         self.get_logger().warn(f'本轮候选全部被拒：{self.stats}')
 
-    def publish_goal(self, gx, gy, r):
+    def publish_goal(self, gx, gy, r, u=None):
         now = time.monotonic()
         if (self.last_goal is not None and self.last_pub
                 and now - self.last_pub < 5.0
@@ -688,7 +746,8 @@ class Arbiter(Node):
             self.get_logger().info(
                 '仲裁通过：候选(%s) 未知=%s 块=%s 宽=%s penalty=%s → 目标 (%.2f,%.2f)；统计 %s'
                 % (('%.2f,%.2f' % (r['x'], r['y'])) if r else '?',
-                   r['unknown'] if r else '?', r['block'] if r else '?',
+                   (r['unknown'] if r else u) if (r or u is not None) else '?',
+                   r['block'] if r else '?',
                    r['width'] if r else '?',
                    ('%.0f' % r['penalty']) if r else '?',
                    gx, gy, self.stats))
