@@ -174,11 +174,53 @@ def main():
           full and two and (full[0]['x'], full[0]['y']) == (two[0]['x'], two[0]['y']),
           f"full0=({full[0]['x']},{full[0]['y']}) two0=({two[0]['x']},{two[0]['y']})" if full and two else '')
 
+    # ================= v3：朝向前方大块未知 + 站在已知边界 =================
+    CFG3 = {
+        'cone_near': 0.3, 'cone_far': 3.0, 'cone_half_deg': 60.0, 'cone_cap': 3000,
+        'near_radius': 0.6, 'near_gate': 0.15, 'buried_factor': 0.25,
+        'w_block3': 0.02, 'block_cap': 6000, 'block_radius': 6.0, 'w_dist': 0.5,
+    }
+    print('\n[7] v3：朝前未知 vs 埋在未知里')
+    # 场景：房间右侧是绝对未知（大块），另有一个候选深埋在未知中间
+    g4 = make_grid(200, 200, 0.05, fill=100)
+    fill_rect(g4, 70, 70, 130, 130, 0)          # 3x3 m 已知自由房间
+    fill_rect(g4, 130, 40, 200, 200, -1)        # 右侧一大片未知
+    pose4 = (4.0, 5.0)                          # 机器人在房间里
+    frontier_pt = (6.4, 5.0)                    # 站在已知边界、面朝大块未知
+    buried_pt = (7.6, 5.0)                      # 深埋在未知里（离边界 0.8 m 以外）
+    ranked4 = arb.rank_candidates_v3(g4, [buried_pt, frontier_pt], CFG3, pose=pose4)
+    for r in ranked4:
+        print('    (%4.2f,%4.2f) score=%8.1f ahead=%4d near_ratio=%.2f block=%4d'
+              % (r['x'], r['y'], r['score'], r['ahead'], r['near_ratio'], r['block']))
+    check('贴已知边界、朝大块未知的候选 > 深埋未知的候选',
+          (ranked4[0]['x'], ranked4[0]['y']) == frontier_pt)
+
+    print('\n[8] v3：宽前沿 vs 一缝到底')
+    g5 = make_grid(200, 200, 0.05, fill=100)
+    fill_rect(g5, 70, 70, 130, 130, 0)
+    fill_rect(g5, 130, 40, 200, 200, -1)        # 右侧大块未知（宽前沿）
+    fill_rect(g5, 80, 130, 82, 170, -1)         # 顶部 2 格宽死角缝
+    pose5 = (4.0, 5.0)
+    wide_pt = (6.4, 5.0)
+    slit_pt = (4.0, 6.4)
+    ranked5 = arb.rank_candidates_v3(g5, [slit_pt, wide_pt], CFG3, pose=pose5)
+    for r in ranked5:
+        print('    (%4.2f,%4.2f) score=%8.1f ahead=%4d near_ratio=%.2f'
+              % (r['x'], r['y'], r['score'], r['ahead'], r['near_ratio']))
+    check('宽前沿 > 一缝到底', (ranked5[0]['x'], ranked5[0]['y']) == wide_pt)
+
+    print('\n[9] v3：惩罚与距离单调')
+    a0 = arb.score_v3(g5, wide_pt[0], wide_pt[1], 2.0, (1.0, 0.0), CFG3, 0.0)
+    a1 = arb.score_v3(g5, wide_pt[0], wide_pt[1], 2.0, (1.0, 0.0), CFG3, 900.0)
+    a2 = arb.score_v3(g5, wide_pt[0], wide_pt[1], 9.0, (1.0, 0.0), CFG3, 0.0)
+    check('罚分越大分越低', a1['score'] < a0['score'], f"{a0['score']:.1f} > {a1['score']:.1f}")
+    check('距离越远分越低', a2['score'] < a0['score'], f"{a0['score']:.1f} > {a2['score']:.1f}")
+
     print()
     if fails:
         print(f'结果：FAIL（{len(fails)} 项）：' + '、'.join(fails))
         return 1
-    print('结果：PASS（6 组、11 项断言全部通过）')
+    print('结果：PASS（9 组、15 项断言全部通过）')
     return 0
 
 
