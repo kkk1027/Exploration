@@ -216,11 +216,25 @@ def main():
     check('罚分越大分越低', a1['score'] < a0['score'], f"{a0['score']:.1f} > {a1['score']:.1f}")
     check('距离越远分越低', a2['score'] < a0['score'], f"{a0['score']:.1f} > {a2['score']:.1f}")
 
+    print('\n[10] 转向门（与 manager 的 80° 门对齐）')
+    import math as _m
+    # 机头朝 +x；(6.4,5.0) 在正前方 → 转角 0；(3.0,5.0) 在正后方 → 转角 180°
+    h_fwd = (1.0, 0.0)
+    h_back = (-1.0, 0.0)
+    t_fwd = arb.turn_angle_to(h_fwd, 0.0)
+    t_back = arb.turn_angle_to(h_back, 0.0)
+    t_45 = arb.turn_angle_to((_m.cos(_m.radians(45)), _m.sin(_m.radians(45))), 0.0)
+    check('正前方转角 0°', t_fwd < 1e-6, f'{_m.degrees(t_fwd):.1f}°')
+    check('正后方转角 180°', abs(_m.degrees(t_back) - 180.0) < 1e-6, f'{_m.degrees(t_back):.1f}°')
+    check('45° 目标转角 45°', abs(_m.degrees(t_45) - 45.0) < 1e-6, f'{_m.degrees(t_45):.1f}°')
+    check('75° 门：45° 通过、180° 拒绝',
+          _m.degrees(t_45) <= 75.0 < _m.degrees(t_back))
+
     print()
     if fails:
         print(f'结果：FAIL（{len(fails)} 项）：' + '、'.join(fails))
         return 1
-    print('结果：PASS（9 组、15 项断言全部通过）')
+    print('结果：PASS（10 组、19 项断言全部通过）')
     return 0
 
 

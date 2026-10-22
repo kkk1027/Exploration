@@ -258,6 +258,13 @@ def score_v3(g, x, y, dist, heading, cfg, penalty=0.0):
             'width': 0, 'penalty': penalty, 'score': score}
 
 
+def turn_angle_to(heading_from_robot, robot_yaw):
+    """从机头朝向到"机器人→候选"方向需要转的角度（弧度，取绝对值 0..pi）。"""
+    want = math.atan2(heading_from_robot[1], heading_from_robot[0])
+    d = math.atan2(math.sin(want - robot_yaw), math.cos(want - robot_yaw))
+    return abs(d)
+
+
 def prefilter_v3(g, x, y, dist, heading, cfg, penalty=0.0):
     """v3 的便宜一级：只算近邻占比与前方锥（不做连通块 BFS）。"""
     nr, free_near, unk_near = near_ratio(g, x, y, cfg['near_radius'])
@@ -341,6 +348,8 @@ class Arbiter(Node):
         self.verbose_rank = str(p('verbose_rank', True).value).lower() in ('true', '1', 'yes')
         # 两级打分：昂贵指标只算前 N 个（候选池可能几百个）
         self.prefilter_n = int(p('prefilter_n', 12).value)
+        # 与 manager 的 80° 转向门对齐（留 5° 余量），避免"派发了但被拒 → 原地转 → 再派发"
+        self.turn_limit_deg = float(p('turn_limit_deg', 75.0).value)
         # 收益函数 v2 开关：实测在 2026-10-23 的整轮里明显退化（两轮都出现 200+ 次物理接触、
         # 返航失败），按"出现退化先回退"的约定默认关闭；内核与离线测试保留，供后续做同种子 A/B。
         self.scoring = str(p('scoring', 'v1').value).lower()
@@ -364,6 +373,7 @@ class Arbiter(Node):
 
         self.map = None
         self.pose = None
+        self.yaw = 0.0
         self.cands = []          # [(x,y)]
         self.blacklist = []      # [(x, y, expire_ts)]
         self.last_pub = 0.0
@@ -613,7 +623,10 @@ class Arbiter(Node):
 
     def on_odom(self, m):
         q = m.pose.pose.position
+        o = m.pose.pose.orientation
         self.pose = (q.x, q.y)
+        self.yaw = math.atan2(2.0 * (o.w * o.z + o.x * o.y),
+                              1.0 - 2.0 * (o.y * o.y + o.z * o.z))
 
     def on_cands(self, m):
         now = time.monotonic()
@@ -812,8 +825,26 @@ class Arbiter(Node):
         g = self.grid()
         if g is None:
             return
+        # 先按"机头朝向"过一遍：manager 自己会拒绝 >80° 的转向目标（日志实测因此空转 5~10 s），
+        # 这里提前筛掉/降权，省掉那次拒绝与随后的原地旋转。
+        turn_limit = math.radians(self.turn_limit_deg)
+        filtered = []
+        dropped_turn = 0
+        for x, y in cands:
+            dx, dy = x - self.pose[0], y - self.pose[1]
+            n = math.hypot(dx, dy) or 1.0
+            if turn_angle_to((dx / n, dy / n), self.yaw) > turn_limit:
+                dropped_turn += 1
+                continue
+            filtered.append((x, y))
+        self.stats['rejected_turn'] = self.stats.get('rejected_turn', 0) + dropped_turn
+        if not filtered:
+            self.get_logger().info(
+                f'[v3] 全部候选都在机头 {self.turn_limit_deg:.0f}° 之外（{dropped_turn} 个），'
+                f'本轮不派发（让 manager 自己转向或下一轮再看）')
+            return
         try:
-            ranked = rank_candidates_v3(g, cands, self.cfg3, penalty_fn=self.penalty,
+            ranked = rank_candidates_v3(g, filtered, self.cfg3, penalty_fn=self.penalty,
                                         pose=self.pose, prefilter_n=self.prefilter_n)
         except Exception as exc:                          # noqa: BLE001
             self.get_logger().error(f'v3 打分异常，回退 v1：{type(exc).__name__}: {exc}')

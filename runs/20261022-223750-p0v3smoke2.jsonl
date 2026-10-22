@@ -1,0 +1,6 @@
+{"ts":"2026-10-22T22:37:50+08:00","tag":"p0v3smoke2",""check":"pre_launch","nodes":9,"gzserver":0,"residue":"""}
+{"ts":"2026-10-22T22:37:50+08:00","tag":"p0v3smoke2",""check":"pose","x":0.0,"y":0.0,"yaw":0.0"}
+{"ts":"2026-10-22T22:37:50+08:00","tag":"p0v3smoke2",""check":"variant","disable_retreat":1,"supervisor":"true""}
+{"ts":"2026-10-22T22:37:53+08:00","tag":"p0v3smoke2",""check":"launch","pgid":"79279""}
+{"ts":"2026-10-22T22:39:13+08:00","tag":"p0v3smoke2",""check":"smoke","rc":0"}
+{"ts":"2026-10-22T22:39:13+08:00","tag":"p0v3smoke2",""verdict":"PASS_smoke""}
