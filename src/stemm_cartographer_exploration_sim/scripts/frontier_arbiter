@@ -317,7 +317,12 @@ class Arbiter(Node):
         self.frame = str(p('frame_id', 'map').value)
         # P0-4：前向净空预检——必须穿过窄缝才能到达的候选直接丢弃
         self.corridor_check = bool(p('corridor_check', True).value)
-        self.corridor_width = float(p('corridor_width_m', 0.90).value)
+        # 保守口径：走廊净宽下限 0.90 → 1.05 m。
+        # 理由（2026-10-23 实测）：两张 cafe_table 的"细立柱"之间在 /map 里是 0.92 m 宽，
+        # 机器人在此判据下会钻进去，而它们 0.56 m 见方的贴地底座实际只有 0.36 m 净距
+        # （雷达 0.225 m 高度看不见）→ f2 轮 690 次轮子接触全在这里。抬高净宽下限后这类
+        # "看着能过、实际过不去"的口子会被前向净空预检直接否掉。
+        self.corridor_width = float(p('corridor_width_m', 1.05).value)
         self.corridor_skip_far = float(p('corridor_skip_far_m', 1.2).value)
         self.corridor_stride = max(1, int(p('corridor_stride_cells', 2).value))
         self.narrow_penalty_sec = float(p('narrow_blacklist_sec', 45.0).value)
