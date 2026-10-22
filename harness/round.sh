@@ -10,7 +10,9 @@ source /home/kbf/stemm_sim_ws/install/setup.bash
 source /home/kbf/stemm_explore_ws/install/setup.bash
 source /home/kbf/stemm_exploration_sim_ws/install/setup.bash
 
-TAG="${1:-run}"; EXPLORE="${2:-120.0}"; HOLD="${3:-0}"
+TAG="${1:-run}"; HOLD="${3:-0}"
+# 探索秒数必须是 DOUBLE（session_driver 把 explore_sec 声明成 double，传 120 会 InvalidParameterType）
+EXPLORE=$(python3 -c "print(float('${2:-120.0}'))")
 BASE=/home/kbf/stemm_exploration_sim_ws
 TS=$(date +%Y%m%d-%H%M%S)
 OUT="$BASE/logs/round_${TS}_${TAG}"; mkdir -p "$OUT"
@@ -53,7 +55,7 @@ DISABLE_RETREAT="${DISABLE_RETREAT:-1}"
 SUPERVISOR="${SUPERVISOR:-true}"
 say "P0 变体：disable_retreat=$DISABLE_RETREAT escape_supervisor=$SUPERVISOR"
 rec "\"check\":\"variant\",\"disable_retreat\":$DISABLE_RETREAT,\"supervisor\":\"$SUPERVISOR\""
-setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE spawn_x:=$SX spawn_y:=$SY spawn_yaw:=$SYAW disable_retreat:=$DISABLE_RETREAT escape_supervisor:=$SUPERVISOR probe_log:=$OUT/probe.jsonl supervisor_log:=$OUT/supervisor.jsonl" \
+setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE spawn_x:=$SX spawn_y:=$SY spawn_yaw:=$SYAW disable_retreat:=$DISABLE_RETREAT escape_supervisor:=$SUPERVISOR rviz:=${RVIZ:-false} probe_log:=$OUT/probe.jsonl supervisor_log:=$OUT/supervisor.jsonl" \
   > "$OUT/launch.log" 2>&1 < /dev/null &
 sleep 3; PGID=$(cat "$OUT/pgid" 2>/dev/null || echo "")
 say "已启动：PGID=$PGID  日志 $OUT/launch.log"

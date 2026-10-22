@@ -235,9 +235,26 @@ class Arbiter(Node):
             if cur is None:
                 break
         path.reverse()
+        # 宽度判据换到 /map（占据栅格：>=50 才是障碍，-1 未知按可通行算）。
+        # 用 costmap 会踩膨胀层的坑：值 <90 的格已经是"离障碍 >=0.52 m"，
+        # 直接按净宽读会把 1.05 m 的通道误判成窄缝。
+        occ = self.map
+        if occ is None:
+            return True, None
+        ores = occ.info.resolution
+        ow, oh = occ.info.width, occ.info.height
+        oox, ooy = occ.info.origin.position.x, occ.info.origin.position.y
+        odata = occ.data
+
+        def map_blocked(mx, my):
+            if mx < 0 or my < 0 or mx >= ow or my >= oh:
+                return True
+            v = odata[my * ow + mx]
+            return v >= 50                     # -1(未知) 与自由都算可通行
+
         need = self.corridor_width
         skip = int(self.corridor_skip_far / res)
-        half = int(need / res / 2) + 1
+        half = int(need / ores / 2) + 1
         for i in range(0, max(0, len(path) - skip), self.corridor_stride):
             idx = path[i]
             cx, cy = idx % w, idx // w
@@ -249,30 +266,30 @@ class Arbiter(Node):
                 tx, ty = cx - par % w, cy - par // w
             n = math.hypot(tx, ty) or 1.0
             px, py = -ty / n, tx / n        # 垂直方向
-            # 以该点为中心向两侧扩展，统计连续自由格总长
+            # 路径格坐标（costmap 系）→ /map 格坐标，两者分辨率可能不同
+            wxp = cx * res + ox
+            wyp = cy * res + oy
+            mcx = int((wxp - oox) / ores)
+            mcy = int((wyp - ooy) / ores)
+            if half * ores > 2.0:              # 分辨率异常时保护
+                half = int(2.0 / ores)
             free_lo = 0
             k = 1
             while k <= half:
-                mx = int(round(cx + px * k)); my = int(round(cy + py * k))
-                if not (0 <= mx < w and 0 <= my < h):
-                    break
-                v = data[my * w + mx]
-                if v < 0 or v >= 90:
+                mx = int(round(mcx + px * k)); my = int(round(mcy + py * k))
+                if map_blocked(mx, my):
                     break
                 free_lo = k; k += 1
             free_hi = 0
             k = 1
             while k <= half:
-                mx = int(round(cx - px * k)); my = int(round(cy - py * k))
-                if not (0 <= mx < w and 0 <= my < h):
-                    break
-                v = data[my * w + mx]
-                if v < 0 or v >= 90:
+                mx = int(round(mcx - px * k)); my = int(round(mcy - py * k))
+                if map_blocked(mx, my):
                     break
                 free_hi = k; k += 1
-            width = (free_lo + free_hi + 1) * res
+            width = (free_lo + free_hi + 1) * ores
             if width < need:
-                return True, (cx * res + ox, cy * res + oy)
+                return True, (wxp, wyp)
         return True, None
 
     def on_odom(self, m):
@@ -420,6 +437,11 @@ class Arbiter(Node):
         self.get_logger().warn(f'本轮候选全部被拒：{self.stats}')
 
     def publish_goal(self, gx, gy, u):
+        now = time.monotonic()
+        if (self.last_goal is not None and self.last_pub
+                and now - self.last_pub < 5.0
+                and math.hypot(gx - self.last_goal[0], gy - self.last_goal[1]) < 0.30):
+            return                              # 5 s 内同一目标不重复发（避免目标churn）
         msg = PoseStamped()
         msg.header.frame_id = self.frame
         msg.header.stamp = self.get_clock().now().to_msg()

@@ -99,7 +99,7 @@ class EscapeSupervisor(Node):
         self.motion_eps_rad = float(p('motion_eps_rad', 0.04).value)
         # 只在"贴障碍"时才脱困：车体到最近障碍的间隙必须小于这个值，
         # 否则说明车在开阔地（正常行驶/等目标），绝不能接管（v1 误触发教训）
-        self.require_near_obstacle = float(p('require_near_obstacle_m', 0.40).value)
+        self.require_near_obstacle = float(p('require_near_obstacle_m', 0.55).value)
         self.cmd_quiet_sec = float(p('cmd_quiet_sec', 1.5).value)
         self.cooldown_sec = float(p('cooldown_sec', 4.0).value)
         self.scan_stale_sec = float(p('scan_stale_sec', 2.0).value)
@@ -111,11 +111,11 @@ class EscapeSupervisor(Node):
         self.heading_limit = float(p('heading_limit', 1.40).value)   # ±80°
         self.unit_max_sec = float(p('unit_max_sec', 8.0).value)      # 8 s 降级兜底
         self.rotate_budget_sec = float(p('rotate_budget_sec', 3.0).value)
-        # 安全
-        self.rotate_min_clearance = float(p('rotate_min_clearance', 0.03).value)
-        self.advance_stop_clearance = float(p('advance_stop_clearance', 0.10).value)
-        self.min_advance_clearance = float(p('min_advance_clearance', 0.14).value)
-        self.clearance_gain = float(p('clearance_gain', 0.15).value)
+        # 安全（全部以"雷达中心到障碍的测距"计；雷达在车体前缘后方 5 cm）
+        self.rotate_min_range = float(p('rotate_min_range', 0.26).value)
+        self.advance_stop_range = float(p('advance_stop_range', 0.32).value)
+        self.min_dir_range = float(p('min_dir_range', 0.50).value)
+        self.clearance_gain = float(p('clearance_gain', 0.20).value)
         self.cost_gain = int(p('cost_gain', 40).value)
         # 预算
         self.max_units_per_episode = int(p('max_units_per_episode', 3).value)
@@ -195,18 +195,21 @@ class EscapeSupervisor(Node):
 
     # ---------------- 输入 ----------------
     def on_scan(self, m):
-        lx = self.laser_x
+        """只保留 (range, angle) —— 安全判据统一用"雷达测距"。
+
+        为什么不用车体矩形：实测发现雷达在车体轮廓内还会有一些点（近距回波/自反射），
+        用车体矩形会把它们当成"贴障碍"，让旋转安全闸门永远误报。用测距就没有这个歧义：
+        range < X 就是"雷达中心 X 米内有东西"。
+        """
         pts = []
         a = m.angle_min
         da = m.angle_increment
         lo = max(0.0, m.range_min * 0.999 - 0.001)
         hi = 49.0
-        cos, sin = math.cos, math.sin
         for i, r in enumerate(m.ranges):
             if not (r >= lo and r <= hi):
                 continue
-            th = a + da * i
-            pts.append((lx + r * cos(th), r * sin(th)))
+            pts.append((r, a + da * i))
         if pts:
             self.points = pts
             self.points_stamp = time.monotonic()
@@ -257,44 +260,34 @@ class EscapeSupervisor(Node):
         self.costmap_stamp = time.monotonic()
 
     # ---------------- 几何 ----------------
-    def rect_dist(self, x, y):
-        """点到车体矩形（x∈[x_min,x_max], y=±y_half）的距离，箱内为 0。"""
-        dx = self.x_min - x if x < self.x_min else (x - self.x_max if x > self.x_max else 0.0)
-        dy = -self.y_half - y if y < -self.y_half else (y - self.y_half if y > self.y_half else 0.0)
-        return math.hypot(dx, dy) if (dx or dy) else 0.0
-
-    def clearance_cone(self, offset, half_deg=14.0, stride=3):
-        """把点云按 -offset 转到"假定朝向"后，取 ±half_deg 扇区内的车体最小间隙。"""
-        c = math.cos(-offset)
-        s = math.sin(-offset)
+    def range_cone(self, offset, half_deg=14.0, stride=2):
+        """假定车体朝向转到 offset 后，±half_deg 扇区内的最小测距（m）。"""
         half = math.radians(half_deg)
         best = float('inf')
         for i in range(0, len(self.points), stride):
-            x, y = self.points[i]
-            rx = c * x - s * y
-            ry = s * x + c * y
-            if abs(math.atan2(ry, rx)) > half:
+            r, th = self.points[i]
+            d = math.atan2(math.sin(th - offset), math.cos(th - offset))
+            if abs(d) > half:
                 continue
-            d = self.rect_dist(rx, ry)
-            if d < best:
-                best = d
+            if r < best:
+                best = r
         return best if best < float('inf') else 9.0
 
-    def min_body_clearance(self, stride=2):
-        best = float('inf')
+    def min_range_all(self, stride=2):
+        best = 9.0
         for i in range(0, len(self.points), stride):
-            d = self.rect_dist(*self.points[i])
-            if d < best:
-                best = d
-        return best if best < float('inf') else 9.0
+            r = self.points[i][0]
+            if r < best:
+                best = r
+        return best
 
     def pick_heading(self):
-        """返回 (offset, clearance)；offset 为相对当前朝向的转角（限 ±heading_limit）。"""
+        """返回 (offset, 最小测距)；offset 为相对当前朝向的转角（限 ±heading_limit）。"""
         best = None
         off = -self.heading_limit
         while off <= self.heading_limit + 1e-6:
-            clr = self.clearance_cone(off, half_deg=14.0, stride=4)
-            score = clr - 0.20 * abs(off)
+            clr = self.range_cone(off, half_deg=14.0, stride=4)
+            score = min(clr, 3.0) - 0.20 * abs(off)
             if best is None or score > best[0]:
                 best = (score, off, clr)
             off += 0.15
@@ -363,7 +356,7 @@ class EscapeSupervisor(Node):
         if now - self.last_motion < self.stall_sec:
             return
         if self.require_near_obstacle > 0.0:
-            clear = self.min_body_clearance(stride=2)
+            clear = self.min_range_all(stride=2)
             if clear > self.require_near_obstacle:
                 return                       # 离障碍还远：不是楔死，不接管
         if now - self._busy_since < self.busy_grace_sec:
@@ -388,9 +381,9 @@ class EscapeSupervisor(Node):
 
     def start_unit(self, now):
         offset, clr = self.pick_heading()
-        self.arm_clearance = self.clearance_cone(0.0, half_deg=14.0, stride=2)
+        self.arm_clearance = self.range_cone(0.0, half_deg=14.0, stride=2)
         self.arm_cost = self.footprint_cost()
-        if clr < self.min_advance_clearance:
+        if clr < self.min_dir_range:
             self.stats['no_dir'] += 1
             self.spot_until = now + self.degrade_backoff_sec
             self.mark_zone(now)
@@ -398,7 +391,7 @@ class EscapeSupervisor(Node):
                      best_clearance=round(clr, 3),
                      arm_clearance=round(self.arm_clearance, 3),
                      nav=self.nav_state,
-                     note='没有 >=%.2fm 的自由方向，不盲动' % self.min_advance_clearance)
+                     note='没有 >=%.2fm 的自由方向，不盲动' % self.min_dir_range)
             return
         self.stats['units'] += 1
         self.units_this_episode += 1
@@ -410,8 +403,8 @@ class EscapeSupervisor(Node):
         self.unit_anchor = self.pose[:2]
         self.unit_started_pos = self.pose[:2]
         self.log(type='unit_start', offset=round(offset, 2),
-                 clearance=round(clr, 3),
-                 arm_clearance=round(self.arm_clearance, 3),
+                 dir_range=round(clr, 3),
+                 arm_range=round(self.arm_clearance, 3),
                  cost=self.arm_cost, nav=self.nav_state,
                  units_episode=self.units_this_episode,
                  stuck_total=round(self.stuck_total, 1))
@@ -426,8 +419,8 @@ class EscapeSupervisor(Node):
             self.end_unit(now, degraded=True)
             return
         if self.phase == 'rotate':
-            cur = self.min_body_clearance(stride=2)
-            if cur < self.rotate_min_clearance:
+            cur = self.min_range_all(stride=2)
+            if cur < self.rotate_min_range:
                 self.abort_unit(now, 'rotate_into_obstacle')
                 return
             if abs(self.unit_remaining) < 0.10 or unit_dt >= self.rotate_budget_sec:
@@ -439,8 +432,8 @@ class EscapeSupervisor(Node):
             self.publish(0.0, sign * self.rotate_speed)
             return
         # advance
-        fwd = self.clearance_cone(0.0, half_deg=20.0, stride=2)
-        if fwd <= self.advance_stop_clearance:
+        fwd = self.range_cone(0.0, half_deg=20.0, stride=2)
+        if fwd <= self.advance_stop_range:
             self.end_unit(now, degraded=False)
             return
         moved = math.hypot(self.pose[0] - self.unit_started_pos[0],
@@ -461,7 +454,7 @@ class EscapeSupervisor(Node):
 
     def end_unit(self, now, degraded):
         self.publish(0.0, 0.0)
-        post_clear = self.clearance_cone(0.0, half_deg=20.0, stride=2)
+        post_clear = self.range_cone(0.0, half_deg=20.0, stride=2)
         post_cost = self.footprint_cost()
         improved = False
         if self.arm_clearance is not None and post_clear - self.arm_clearance >= self.clearance_gain:
@@ -483,8 +476,8 @@ class EscapeSupervisor(Node):
                 self.mark_zone(now)
         self.log(type='unit_end', improved=improved, degraded=degraded,
                  offset=round(self.unit_offset, 2), moved=round(moved, 3),
-                 arm_clearance=None if self.arm_clearance is None else round(self.arm_clearance, 3),
-                 post_clearance=round(post_clear, 3),
+                 arm_range=None if self.arm_clearance is None else round(self.arm_clearance, 3),
+                 post_range=round(post_clear, 3),
                  arm_cost=self.arm_cost, post_cost=post_cost,
                  dur=round(now - self.unit_t0, 1),
                  unit_dt=round(now - self.unit_t0, 1),
