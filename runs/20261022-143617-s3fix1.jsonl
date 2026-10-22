@@ -1,0 +1,5 @@
+{"ts":"2026-10-22T14:36:18+08:00","tag":"s3fix1",""check":"pre_launch","nodes":0,"gzserver":0,"residue":"""}
+{"ts":"2026-10-22T14:36:18+08:00","tag":"s3fix1",""check":"pose","x":0.3,"y":-0.4,"yaw":-1.5708"}
+{"ts":"2026-10-22T14:36:21+08:00","tag":"s3fix1",""check":"launch","pgid":"22948""}
+{"ts":"2026-10-22T14:40:12+08:00","tag":"s3fix1",""check":"post_teardown","nodes":0,"gzserver":0,"residue":"""}
+{"ts":"2026-10-22T14:40:12+08:00","tag":"s3fix1",""verdict":"PASS_clean""}
