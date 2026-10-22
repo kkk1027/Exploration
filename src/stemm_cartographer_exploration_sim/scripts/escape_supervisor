@@ -94,6 +94,12 @@ class EscapeSupervisor(Node):
         self.laser_x = float(p('laser_x', 0.24).value)
         # 触发
         self.stall_sec = float(p('stall_sec', 3.0).value)
+        # 运动锚点阈值：位移/转角超过它就算"在动"（0.01 m / 0.02 rad ≈ 噪声下限之上）
+        self.motion_eps_m = float(p('motion_eps_m', 0.02).value)
+        self.motion_eps_rad = float(p('motion_eps_rad', 0.04).value)
+        # 只在"贴障碍"时才脱困：车体到最近障碍的间隙必须小于这个值，
+        # 否则说明车在开阔地（正常行驶/等目标），绝不能接管（v1 误触发教训）
+        self.require_near_obstacle = float(p('require_near_obstacle_m', 0.40).value)
         self.cmd_quiet_sec = float(p('cmd_quiet_sec', 1.5).value)
         self.cooldown_sec = float(p('cooldown_sec', 4.0).value)
         self.scan_stale_sec = float(p('scan_stale_sec', 2.0).value)
@@ -123,9 +129,12 @@ class EscapeSupervisor(Node):
         self.points_stamp = 0.0
         self.pose = None           # (x, y, yaw)
         self.last_motion = time.monotonic()
+        self._motion_anchor = None
         self.last_foreign_cmd = 0.0
         self.own_cmd_at = 0.0
         self.nav_busy = False
+        self._busy_since = 0.0
+        self.busy_grace_sec = float(p('busy_grace_sec', 2.0).value)
         self.nav_state = ''
         self.costmap = None
         self.costmap_stamp = 0.0
@@ -207,11 +216,17 @@ class EscapeSupervisor(Node):
         q = m.pose.pose
         new = (q.position.x, q.position.y, yaw_of(q.orientation))
         if self.pose is not None:
-            d = math.hypot(new[0] - self.pose[0], new[1] - self.pose[1])
-            dyaw = abs(math.atan2(math.sin(new[2] - self.pose[2]),
-                                  math.cos(new[2] - self.pose[2])))
-            if d > 0.02 or dyaw > 0.03:
+            # 相对"运动锚点"累计位移：逐帧比较在 0.2 m/s×20 Hz = 1 cm/帧 时永远判不动，
+            # 这是 v1 误触发（把正常行驶当卡死）的根因。
+            if self._motion_anchor is None:
+                self._motion_anchor = (new[0], new[1], new[2])
+            ax, ay, ayaw = self._motion_anchor
+            d = math.hypot(new[0] - ax, new[1] - ay)
+            dyaw = abs(math.atan2(math.sin(new[2] - ayaw),
+                                  math.cos(new[2] - ayaw)))
+            if d > self.motion_eps_m or dyaw > self.motion_eps_rad:
                 self.last_motion = now
+                self._motion_anchor = (new[0], new[1], new[2])
                 if self.stuck_since is not None:
                     self.stuck_total += now - self.stuck_since
                     self.stuck_since = None
@@ -233,6 +248,8 @@ class EscapeSupervisor(Node):
             if st.status in ACTIVE_STATUS:
                 busy = True
                 break
+        if busy and not self.nav_busy:
+            self._busy_since = time.monotonic()
         self.nav_busy = busy
 
     def on_costmap(self, m):
@@ -345,6 +362,12 @@ class EscapeSupervisor(Node):
             return
         if now - self.last_motion < self.stall_sec:
             return
+        if self.require_near_obstacle > 0.0:
+            clear = self.min_body_clearance(stride=2)
+            if clear > self.require_near_obstacle:
+                return                       # 离障碍还远：不是楔死，不接管
+        if now - self._busy_since < self.busy_grace_sec:
+            return                           # 目标刚派发，给它自己走一会儿
         if self.units_this_episode >= self.max_units_per_episode:
             return
         # 受阻累计（跨导航目标持续累计，只有真正走出去 0.5 m 才清零）

@@ -98,6 +98,8 @@ class CollisionProbe(Node):
         self.bumper_last = None
         self.near = []
         self.n_in_body = 0
+        self.body_bb = None
+        self.body_world_bb = None
 
         self.stats = {'contacts': 0, 'grazes': 0, 'alerts': 0, 'bumpers': 0,
                       'reverse_msgs': 0, 'reverse_windows': 0, 'reverse_secs': 0.0,
@@ -213,6 +215,7 @@ class CollisionProbe(Node):
         min_circ = float('inf')
         min_bearing = 0.0
         near = []               # 车体附近(<0.6m)的点，事后取最近 5 个判断几何
+        in_body = []            # 落在车体矩形内的点（车体系），用于定位"到底是什么" 
         r_lo = max(0.0, m.range_min * 0.999 - 0.001)
         r_hi = min(m.range_max, 49.0) if m.range_max > 0 else 49.0
         cos, sin = math.cos, math.sin
@@ -230,6 +233,8 @@ class CollisionProbe(Node):
             if d < min_d:
                 min_d = d
                 min_bearing = math.atan2(y, x)
+            if d <= 0.0 and len(in_body) < 4000:
+                in_body.append((x, y))
             if d < 0.60:
                 near.append((round(d, 3), round(r, 3), round(math.degrees(th), 1),
                              round(x, 3), round(y, 3)))
@@ -245,7 +250,25 @@ class CollisionProbe(Node):
         if near:
             near.sort()
             self.near = near[:5]
-            self.n_in_body = sum(1 for n in near if n[0] <= 0.0)
+            self.n_in_body = len(in_body)
+            # 车体系包围盒 → 世界系（用 odom 位姿；odom 有漂移，只用于粗定位）
+            if in_body:
+                bx0 = min(p[0] for p in in_body); bx1 = max(p[0] for p in in_body)
+                by0 = min(p[1] for p in in_body); by1 = max(p[1] for p in in_body)
+                self.body_bb = (round(bx0, 3), round(bx1, 3), round(by0, 3), round(by1, 3))
+                if self.pose:
+                    import math as _m
+                    c, sn = _m.cos(self.pose[2]), _m.sin(self.pose[2])
+                    xs, ys = [], []
+                    for cx in (bx0, bx1):
+                        for cy in (by0, by1):
+                            xs.append(self.pose[0] + cx * c - cy * sn)
+                            ys.append(self.pose[1] + cx * sn + cy * c)
+                    self.body_world_bb = (round(min(xs), 2), round(max(xs), 2),
+                                          round(min(ys), 2), round(max(ys), 2))
+            else:
+                self.body_bb = None
+                self.body_world_bb = None
         self.min_d_ever = min_d if self.min_d_ever is None else min(self.min_d_ever, min_d)
         self.circ_ever = min_circ if self.circ_ever is None else min(self.circ_ever, min_circ)
 
@@ -287,6 +310,8 @@ class CollisionProbe(Node):
                                 'alert': 'alerts'}[name]] += 1
                     self.log({'type': name, 'near': self.near,
                               'n_in_body': self.n_in_body,
+                              'in_body_bb': self.body_bb,
+                              'in_body_world_bb': self.body_world_bb,
                               'min_d': round(self.min_d or 0.0, 3),
                               'circ_d': round(self.circ_d or 0.0, 3),
                               'bearing_deg': round(math.degrees(self.bearing or 0.0), 1),
