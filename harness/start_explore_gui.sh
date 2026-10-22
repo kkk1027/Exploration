@@ -14,3 +14,13 @@ echo "日志 $OUT/launch.log"
 setsid nohup ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py \
   rviz:=true explore_sec:=${1:-180.0} > "$OUT/launch.log" 2>&1 < /dev/null &
 echo "$OUT" > /tmp/live_dir
+
+# ③ 演示收尾：地图落盘后自动关 rviz2（避免 GUI 负载影响后续测试）
+(
+  for i in $(seq 1 90); do
+    sleep 5
+    if [ -f /home/kbf/stemm_sim_ws/maps/explore_latest.pgm ]; then
+      sleep 5; pkill -x rviz2 2>/dev/null && echo "[demo] rviz2 已自动关闭"; break
+    fi
+  done
+) &

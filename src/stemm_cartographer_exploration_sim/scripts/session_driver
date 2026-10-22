@@ -181,6 +181,15 @@ class SessionDriver(Node):
         if self.pose_xy is not None:
             dist = math.hypot(self.pose_xy[0], self.pose_xy[1])
         elapsed = now - self.t_done_called
+        # 备用完成判据：manager 明确完成态 60 s 未到时，用"回到原点附近"兜底
+        if (self.return_home_ok is None and dist is not None
+                and elapsed > 60.0 and dist <= 0.30):
+            self.return_home_ok = True
+            self.get_logger().info(
+                f'=== 返航完成（备用判据：距 map 原点 {dist:.3f} m ≤0.30，'
+                f'manager 未给完成态，用时 {elapsed:.1f}s）===')
+            self._finish()
+            return
         if dist is not None and dist <= HOME_RADIUS and self.return_home_ok is None:
             self.return_home_ok = True
             self.get_logger().info(

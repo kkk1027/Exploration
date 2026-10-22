@@ -32,6 +32,7 @@ from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import OccupancyGrid, Odometry
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from std_msgs.msg import String
 from wheeltec_rrt_msg.msg import PointArray
 
 
@@ -70,6 +71,9 @@ class Arbiter(Node):
         self.create_subscription(Odometry, '/odom_combined', self.on_odom, 20)
         self.create_subscription(Twist, '/cmd_vel', self.on_cmd, 20)
         # S2：当前是否有 Nav2 活动目标（无目标时立刻给下一个候选）
+        # 车端 manager 的状态流里带 escape/blocked/retreat 等事件
+        self.create_subscription(String, '/stemm_cartographer/nav_state',
+                                 self.on_nav_state, 10)
         self.create_subscription(GoalStatusArray, '/navigate_to_pose/_action/status',
                                  self.on_status, 10)
         self.pub = self.create_publisher(PoseStamped, '/validated_frontier_goal', 10)
@@ -91,6 +95,17 @@ class Arbiter(Node):
             if st.status in (1, 2, 3):      # ACCEPTED / EXECUTING / CANCELING
                 busy = True
         self.mgr_busy = busy
+
+    def on_nav_state(self, m):
+        txt = (m.data or '').lower()
+        if any(k in txt for k in ('escape', 'blocked', 'retreat', 'recovery')):
+            if self.pose is not None:
+                self.stuck_zones.append(
+                    (self.pose[0], self.pose[1], time.monotonic() + self.bl_sec))
+                if len(self.stuck_zones) > 30:
+                    self.stuck_zones = self.stuck_zones[-30:]
+                self.get_logger().warn(
+                    f'受阻区记录（事件驱动 {txt[:24]}）：({self.pose[0]:.2f},{self.pose[1]:.2f})')
 
     def on_costmap(self, m):
         self.costmap = m
