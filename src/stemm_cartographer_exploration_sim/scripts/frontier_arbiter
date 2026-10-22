@@ -355,9 +355,11 @@ class Arbiter(Node):
             'near_gate': float(p('near_gate', 0.15).value),
             'buried_factor': float(p('buried_factor', 0.25).value),
             'w_block3': float(p('w_block3', 0.02).value),
-            'block_cap': int(p('block_cap', 6000).value),
-            'block_radius': float(p('block_radius', 6.0).value),
-            'w_dist': float(p('w_dist', 0.5).value),
+            # 复用 v2 已声明的参数（同一节点里重复 declare 会抛
+            # ParameterAlreadyDeclaredException —— smoke 自检 90 s 内就抓到了）
+            'block_cap': self.cfg['block_cap'],
+            'block_radius': self.cfg['block_radius'],
+            'w_dist': self.cfg['w_dist'],
         }
 
         self.map = None
