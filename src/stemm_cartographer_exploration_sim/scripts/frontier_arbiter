@@ -152,15 +152,32 @@ def score_one(g, x, y, dist, cfg, penalty=0.0):
             'width': width, 'ratio': ratio, 'penalty': penalty, 'score': score}
 
 
-def rank_candidates(g, cands, cfg, penalty_fn=None, pose=None):
-    """给候选排序（cands: [(x, y)]；penalty_fn(x,y)->float）。"""
-    out = []
+def prefilter_one(g, x, y, dist, cfg, penalty=0.0):
+    """便宜的一级打分：只用 未知格数 / 未知占比 / 距离 / 罚分（不做 BFS）。"""
+    u, free = cell_stats(g, x, y, cfg['info_radius'])
+    ratio = u / float(u + free) if (u + free) > 0 else 0.0
+    score = (u * (cfg['ratio_floor'] + (1.0 - cfg['ratio_floor']) * ratio)
+             - cfg['w_dist'] * dist - penalty)
+    return {'x': x, 'y': y, 'unknown': u, 'free': free, 'ratio': ratio,
+            'penalty': penalty, 'score': score}
+
+
+def rank_candidates(g, cands, cfg, penalty_fn=None, pose=None, prefilter_n=None):
+    """两级排序：先便宜预筛到 prefilter_n 个，再对它们做完整打分（连通块+前沿宽度）。
+
+    候选池可能有几百个，全量做 BFS 会让 1 Hz 的 tick 卡死 —— 这是实测必须的两级结构。
+    """
+    pre = []
     for x, y in cands:
-        dist = 0.0
-        if pose is not None:
-            dist = math.hypot(x - pose[0], y - pose[1])
+        dist = math.hypot(x - pose[0], y - pose[1]) if pose is not None else 0.0
         pen = penalty_fn(x, y) if penalty_fn else 0.0
-        out.append(score_one(g, x, y, dist, cfg, pen))
+        pre.append(prefilter_one(g, x, y, dist, cfg, pen))
+    pre.sort(key=lambda r: r['score'], reverse=True)
+    top = pre[:prefilter_n] if prefilter_n else pre
+    out = []
+    for r in top:
+        dist = math.hypot(r['x'] - pose[0], r['y'] - pose[1]) if pose is not None else 0.0
+        out.append(score_one(g, r['x'], r['y'], dist, cfg, r['penalty']))
     out.sort(key=lambda r: r['score'], reverse=True)
     return out
 
@@ -207,6 +224,8 @@ class Arbiter(Node):
         self.retry_window = float(p('retry_window_sec', 300.0).value)
         self.pub_history = []        # [(x, y, ts)] 已派发过的目标（用于"反复拉锯"降权）
         self.verbose_rank = str(p('verbose_rank', True).value).lower() in ('true', '1', 'yes')
+        # 两级打分：昂贵指标只算前 N 个（候选池可能几百个）
+        self.prefilter_n = int(p('prefilter_n', 12).value)
 
         self.map = None
         self.pose = None
@@ -603,7 +622,8 @@ class Arbiter(Node):
             return
         try:
             ranked = rank_candidates(g, cands, self.cfg,
-                                     penalty_fn=self.penalty, pose=self.pose)
+                                     penalty_fn=self.penalty, pose=self.pose,
+                                     prefilter_n=self.prefilter_n)
         except Exception as exc:                          # noqa: BLE001
             self.get_logger().error(f'打分异常，回退旧逻辑：{type(exc).__name__}: {exc}')
             ranked = []

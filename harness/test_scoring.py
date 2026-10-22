@@ -165,11 +165,20 @@ def main():
     check('未知大块 > 已探完区域', unknown_area['score'] > known_area['score'],
           f"unknown={unknown_area['score']:.1f} known={known_area['score']:.1f}")
 
+    # ---- [6] 两级打分（预筛 + 完整）与全量完整打分结论一致 ----
+    many = [(6.4, 5.0), (4.0, 6.4), (3.95, 3.95), (5.0, 5.0), (6.0, 4.0), (4.5, 5.5)]
+    full = arb.rank_candidates(g, many, CFG, pose=pose)
+    two = arb.rank_candidates(g, many, CFG, pose=pose, prefilter_n=4)
+    print('\n[6] 两级打分')
+    check('预筛后的第 1 名与全量一致',
+          full and two and (full[0]['x'], full[0]['y']) == (two[0]['x'], two[0]['y']),
+          f"full0=({full[0]['x']},{full[0]['y']}) two0=({two[0]['x']},{two[0]['y']})" if full and two else '')
+
     print()
     if fails:
         print(f'结果：FAIL（{len(fails)} 项）：' + '、'.join(fails))
         return 1
-    print('结果：PASS（5 组、10 项断言全部通过）')
+    print('结果：PASS（6 组、11 项断言全部通过）')
     return 0
 
 
