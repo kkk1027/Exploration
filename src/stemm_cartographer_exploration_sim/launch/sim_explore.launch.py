@@ -57,7 +57,11 @@ def generate_launch_description():
                          'stemm_cartographer_auto_mapping.launch.py')),
         launch_arguments=[('auto_explore', auto_explore),
                           ('frontier_source', frontier_source),
-                          ('use_sim_time', use_sim_time)],
+                          ('use_sim_time', use_sim_time),
+                          # 车端 escape_controller 的 enabled 参数在 __init__ 缓存，
+                          # 运行期 ros2 param set 不生效（实测仍在转 0.40 rad/s 抢 /cmd_vel），
+                          # 必须用启动开关关掉；P0 里由 escape_supervisor（旋转+前进）取代它。
+                          ('escape_controller', LaunchConfiguration('car_escape'))],
         condition=stack_on)
 
     # 与栈同时启动的运行时参数补丁（独立进程，0.5 s 重试，抢在 guard 的 30 s 判定前落地）
@@ -129,6 +133,8 @@ def generate_launch_description():
             description='撞障取证 JSONL 路径（空=只打日志）'),
         DeclareLaunchArgument('supervisor_log', default_value='',
             description='脱困监督 JSONL 路径（空=只打日志）'),
+        DeclareLaunchArgument('car_escape', default_value='false',
+            description='是否启动车端 stemm_escape_controller（P0 默认 false，由 escape_supervisor 取代）'),
         DeclareLaunchArgument('escape_supervisor', default_value='true',
             description='是否启用雷达引导的旋转+前进脱困（P0）'),
         DeclareLaunchArgument('supervisor_unit_max_sec', default_value='8.0',

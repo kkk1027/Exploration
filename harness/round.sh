@@ -53,9 +53,10 @@ rec "\"check\":\"pose\",\"x\":$SX,\"y\":$SY,\"yaw\":$SYAW"
 # P0 变体开关（默认=改造后：关盲退 + 开脱困监督）
 DISABLE_RETREAT="${DISABLE_RETREAT:-1}"
 SUPERVISOR="${SUPERVISOR:-true}"
+CAR_ESCAPE="${CAR_ESCAPE:-$([ "${DISABLE_CAR_ESCAPE:-1}" = "1" ] && echo false || echo true)}"
 say "P0 变体：disable_retreat=$DISABLE_RETREAT escape_supervisor=$SUPERVISOR"
 rec "\"check\":\"variant\",\"disable_retreat\":$DISABLE_RETREAT,\"supervisor\":\"$SUPERVISOR\""
-setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE spawn_x:=$SX spawn_y:=$SY spawn_yaw:=$SYAW disable_retreat:=$DISABLE_RETREAT escape_supervisor:=$SUPERVISOR rviz:=${RVIZ:-false} probe_log:=$OUT/probe.jsonl supervisor_log:=$OUT/supervisor.jsonl" \
+setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE spawn_x:=$SX spawn_y:=$SY spawn_yaw:=$SYAW disable_retreat:=$DISABLE_RETREAT escape_supervisor:=$SUPERVISOR car_escape:=$CAR_ESCAPE rviz:=${RVIZ:-false} probe_log:=$OUT/probe.jsonl supervisor_log:=$OUT/supervisor.jsonl" \
   > "$OUT/launch.log" 2>&1 < /dev/null &
 sleep 3; PGID=$(cat "$OUT/pgid" 2>/dev/null || echo "")
 say "已启动：PGID=$PGID  日志 $OUT/launch.log"
