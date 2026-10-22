@@ -67,6 +67,10 @@ def generate_launch_description():
                 arguments=['-d', rviz_cfg],
                 parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')}])
 
+    arbiter = Node(package='stemm_cartographer_exploration_sim', executable='frontier_arbiter',
+                   name='frontier_arbiter', output='screen',
+                   parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')}])
+
     driver = Node(
         package='stemm_cartographer_exploration_sim',
         executable='session_driver',

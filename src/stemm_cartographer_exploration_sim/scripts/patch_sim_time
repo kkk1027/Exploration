@@ -24,6 +24,9 @@ while [ "$(date +%s)" -lt "$DEADLINE" ]; do
   [ "$n" -eq "$(echo $TARGETS | wc -w)" ] && { echo "[patch_sim_time] 全部完成"; exit 0; }
   sleep 0.5
 done
+# 前沿仲裁：manager 改订阅仲裁输出（S1，无侵入）
+ros2 param set /stemm_cartographer_nav2_manager frontier_goal_topic /validated_frontier_goal >/dev/null 2>&1 \
+  && echo "[patch_sim_time] manager frontier_goal_topic -> /validated_frontier_goal ✓"
 # Nav2 容忍度：仿真里细时钟会带来几毫秒级"未来"查询，放宽 transform_tolerance
 for N in /controller_server /planner_server /bt_navigator /behavior_server /global_costmap/global_costmap /local_costmap/local_costmap; do
   ros2 param set "$N" transform_tolerance 0.5 >/dev/null 2>&1 && echo "[patch_sim_time] ${N} transform_tolerance=0.5 ✓"

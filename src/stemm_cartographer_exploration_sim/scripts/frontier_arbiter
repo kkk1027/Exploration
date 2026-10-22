@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""frontier_arbiter —— 仿真侧前沿仲裁（S1）：可达性预筛 + 失败黑名单 + 最小前沿规模 + 目标回拉。
+
+背景：实测候选点产量充足（163 个/75 s），但派发目标成功率仅 33%（4/6 被取消），
+且 escape/blocked 恢复开销大。原因是候选点只经过"代价地图障碍判断"，
+没有做"规划器可达性"校验，也没消除已失败过的候选。
+
+做法（不改车端源码）：
+  /filtered_goal_points ──┐
+  /map (transient_local) ──┼─► 打分(未知格数) → 取前 N → 回拉 → ComputePathToPose 校验
+  /odom_combined ─────────┘                                        │
+                                                                   ▼
+                                              /validated_frontier_goal (PoseStamped)
+  manager 的 frontier_goal_topic 运行期指到本话题即可（无侵入）。
+
+参数：
+  min_unknown_cells  候选周围未知格数下限（默认 30，5cm 栅格 ≈ 0.075 m²）
+  check_radius       统计未知格与回拉用的半径（默认 1.0 m）
+  pullback_m         目标回拉距离，落到已知自由空间一侧（默认 0.6 m）
+  blacklist_sec      失败候点的黑名单时长（默认 60 s）
+  blacklist_radius   黑名单作用半径（默认 0.8 m）
+  max_candidates     每轮校验的候选数（默认 5）
+  republish_sec      最小重发间隔（默认 8 s）
+  path_timeout_sec   ComputePathToPose 超时（默认 4 s）
+"""
+import math
+import time
+
+import rclpy
+from geometry_msgs.msg import PoseStamped
+from nav2_msgs.srv import ComputePathToPose
+from nav_msgs.msg import OccupancyGrid, Odometry
+from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from wheeltec_rrt_msg.msg import PointArray
+
+
+class Arbiter(Node):
+    def __init__(self):
+        super().__init__('frontier_arbiter')
+        p = self.declare_parameter
+        self.min_unknown = int(p('min_unknown_cells', 30).value)
+        self.radius = float(p('check_radius', 1.0).value)
+        self.pullback = float(p('pullback_m', 0.6).value)
+        self.bl_sec = float(p('blacklist_sec', 60.0).value)
+        self.bl_r = float(p('blacklist_radius', 0.8).value)
+        self.max_cand = int(p('max_candidates', 5).value)
+        self.repub = float(p('republish_sec', 8.0).value)
+        self.path_timeout = float(p('path_timeout_sec', 4.0).value)
+        self.frame = str(p('frame_id', 'map').value)
+
+        self.map = None
+        self.pose = None
+        self.cands = []          # [(x,y)]
+        self.blacklist = []      # [(x, y, expire_ts)]
+        self.last_pub = 0.0
+        self.last_goal = None
+        self.stats = {'seen': 0, 'rejected_size': 0, 'rejected_path': 0,
+                      'rejected_black': 0, 'published': 0}
+
+        qmap = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                          durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.create_subscription(OccupancyGrid, '/map', self.on_map, qmap)
+        self.create_subscription(PointArray, '/filtered_goal_points', self.on_cands, 10)
+        self.create_subscription(Odometry, '/odom_combined', self.on_odom, 20)
+        self.pub = self.create_publisher(PoseStamped, '/validated_frontier_goal', 10)
+        self.cli = self.create_client(ComputePathToPose, '/compute_path_to_pose')
+        self.create_timer(1.0, self.tick)
+        self.get_logger().info('frontier_arbiter 就绪：可达性预筛/黑名单/最小前沿/回拉')
+
+    # ---- 回调 ----
+    def on_map(self, m):
+        self.map = m
+
+    def on_odom(self, m):
+        q = m.pose.pose.position
+        self.pose = (q.x, q.y)
+
+    def on_cands(self, m):
+        now = time.monotonic()
+        for pt in m.points:
+            self.cands.append((pt.x, pt.y, now))
+        self.stats['seen'] += len(m.points)
+        if len(self.cands) > 400:            # 只保留最近的候选
+            self.cands = self.cands[-400:]
+
+    # ---- 工具 ----
+    def unknown_cells(self, x, y):
+        m = self.map
+        if m is None:
+            return 0
+        info = m.info
+        r = int(self.radius / info.resolution)
+        cx = int((x - info.origin.position.x) / info.resolution)
+        cy = int((y - info.origin.position.y) / info.resolution)
+        n = 0
+        for j in range(max(0, cy - r), min(info.height, cy + r + 1)):
+            base = j * info.width
+            for i in range(max(0, cx - r), min(info.width, cx + r + 1)):
+                if m.data[base + i] < 0:
+                    n += 1
+        return n
+
+    def blacklisted(self, x, y, now):
+        self.blacklist = [b for b in self.blacklist if b[2] > now]
+        return any(math.hypot(x - b[0], y - b[1]) < self.bl_r for b in self.blacklist)
+
+    def pull_back(self, x, y):
+        if self.pose is None or self.pullback <= 0:
+            return x, y
+        dx, dy = self.pose[0] - x, self.pose[1] - y
+        d = math.hypot(dx, dy)
+        if d < 1e-6:
+            return x, y
+        k = min(self.pullback, d * 0.5) / d
+        return x + dx * k, y + dy * k
+
+    def reachable(self, x, y):
+        if not self.cli.wait_for_service(timeout_sec=1.0):
+            return True                       # 服务不可用时不阻塞探索
+        req = ComputePathToPose.Request()
+        req.goal = PoseStamped()
+        req.goal.header.frame_id = self.frame
+        req.goal.header.stamp = self.get_clock().now().to_msg()
+        req.goal.pose.position.x, req.goal.pose.position.y = x, y
+        req.goal.pose.orientation.w = 1.0
+        req.use_start = False
+        fut = self.cli.call_async(req)
+        t0 = time.monotonic()
+        while not fut.done() and time.monotonic() - t0 < self.path_timeout:
+            rclpy.spin_once(self, timeout_sec=0.05)
+        if not fut.done():
+            return True                       # 超时保守放行（避免阻塞）
+        try:
+            res = fut.result()
+            return bool(res and res.path and len(res.path.poses) > 0)
+        except Exception:
+            return False
+
+    # ---- 主循环 ----
+    def tick(self):
+        now = time.monotonic()
+        if self.map is None or self.pose is None or not self.cands:
+            return
+        if now - self.last_pub < self.repub:
+            return
+        cands = [c for c in self.cands if now - c[2] < 30.0]
+        if not cands:
+            return
+        scored = []
+        for x, y, _ in cands:
+            if self.blacklisted(x, y, now):
+                self.stats['rejected_black'] += 1
+                continue
+            u = self.unknown_cells(x, y)
+            if u < self.min_unknown:
+                self.stats['rejected_size'] += 1
+                continue
+            scored.append((u, -math.hypot(x - self.pose[0], y - self.pose[1]), x, y))
+        scored.sort(reverse=True)
+        for u, negd, x, y in scored[:self.max_cand]:
+            gx, gy = self.pull_back(x, y)
+            if self.reachable(gx, gy):
+                msg = PoseStamped()
+                msg.header.frame_id = self.frame
+                msg.header.stamp = self.get_clock().now().to_msg()
+                msg.pose.position.x, msg.pose.position.y = gx, gy
+                msg.pose.orientation.w = 1.0
+                self.pub.publish(msg)
+                self.last_pub = now
+                self.last_goal = (gx, gy)
+                self.stats['published'] += 1
+                self.get_logger().info(
+                    f'仲裁通过：未知格 {u}，目标 ({gx:.2f},{gy:.2f})；统计 {self.stats}')
+                return
+            self.blacklist.append((gx, gy, now + self.bl_sec))
+            self.stats['rejected_path'] += 1
+        self.get_logger().warn(f'本轮候选全部被拒：{self.stats}')
+
+
+def main():
+    rclpy.init()
+    node = Arbiter()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
