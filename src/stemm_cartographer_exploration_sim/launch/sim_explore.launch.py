@@ -65,12 +65,13 @@ def generate_launch_description():
     rviz = Node(package='rviz2', executable='rviz2', name='rviz2', output='screen',
                 condition=IfCondition(LaunchConfiguration('rviz')),
                 arguments=['-d', rviz_cfg],
-                parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time'),
-                                'republish_sec': 1.5, 'max_candidates': 6}])
+                parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')}])
 
     arbiter = Node(package='stemm_cartographer_exploration_sim', executable='frontier_arbiter',
                    name='frontier_arbiter', output='screen',
-                   parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')}])
+                   parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time'),
+                                'republish_sec': 1.5, 'max_candidates': 6,
+                                'blacklist_sec': 30.0, 'blacklist_radius': 0.5}])
 
     driver = Node(
         package='stemm_cartographer_exploration_sim',

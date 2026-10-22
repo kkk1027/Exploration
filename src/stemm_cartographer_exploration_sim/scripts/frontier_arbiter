@@ -163,6 +163,8 @@ class Arbiter(Node):
 
     def blacklisted(self, x, y, now):
         self.blacklist = [b for b in self.blacklist if b[2] > now]
+        if len(self.blacklist) > 40:                 # 限容量，最旧的先丢
+            self.blacklist = self.blacklist[-40:]
         return any(math.hypot(x - b[0], y - b[1]) < self.bl_r for b in self.blacklist)
 
     def pull_back(self, x, y):
@@ -233,10 +235,11 @@ class Arbiter(Node):
             return
         scored = []
         for x, y, _ in cands:
-            if self.blacklisted(x, y, now):
-                self.stats['rejected_black'] += 1
-                continue
             u = self.unknown_cells(x, y)
+            if self.blacklisted(x, y, now):
+                # 黑名单从"硬拒"改为"重罚"：避免整片区域被吃掉后陷入"全部被拒"
+                self.stats['penalized_black'] = self.stats.get('penalized_black', 0) + 1
+                u -= 600
             if u < self.min_unknown:
                 self.stats['rejected_size'] += 1
                 continue

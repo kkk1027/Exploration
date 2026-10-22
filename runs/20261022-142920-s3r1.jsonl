@@ -1,0 +1,6 @@
+{"ts":"2026-10-22T14:29:21+08:00","tag":"s3r1",""check":"pre_launch","nodes":2,"gzserver":0,"residue":"18912 ""}
+{"ts":"2026-10-22T14:29:27+08:00","tag":"s3r1",""check":"post_cleanup","nodes":2,"gzserver":0,"residue":"""}
+{"ts":"2026-10-22T14:29:27+08:00","tag":"s3r1",""check":"pose","x":-0.3,"y":0.4,"yaw":3.1416"}
+{"ts":"2026-10-22T14:29:30+08:00","tag":"s3r1",""check":"launch","pgid":"21065""}
+{"ts":"2026-10-22T14:33:25+08:00","tag":"s3r1",""check":"post_teardown","nodes":23,"gzserver":0,"residue":"""}
+{"ts":"2026-10-22T14:33:25+08:00","tag":"s3r1",""verdict":"PASS_clean""}

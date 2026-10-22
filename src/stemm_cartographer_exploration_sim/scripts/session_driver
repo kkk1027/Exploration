@@ -104,8 +104,13 @@ class SessionDriver(Node):
 
     def _on_nav_state(self, msg):
         txt = (msg.data or '').lower()
-        if self.return_home_ok is None and any(k in txt for k in
-                ('return_home_complete', 'return-home', 'finalizing', 'complete')):
+        # 严格判定：finalizing_* / returning_home 只是"准备返航"，不能算完成。
+        # 只有明确的完成态，或"位置达成"类措辞才算。
+        is_done = ('return_home_complete' in txt
+                   or 'home_reached' in txt
+                   or ('complete' in txt and 'finalizing' not in txt
+                       and 'returning' not in txt and 'pending' not in txt))
+        if self.return_home_ok is None and is_done:
             d = None
             if self.pose_xy is not None:
                 d = math.hypot(self.pose_xy[0], self.pose_xy[1])
