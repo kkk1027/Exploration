@@ -113,6 +113,9 @@ class EscapeSupervisor(Node):
         self.rotate_budget_sec = float(p('rotate_budget_sec', 3.0).value)
         # 安全（全部以"雷达中心到障碍的测距"计；雷达在车体前缘后方 5 cm）
         self.rotate_min_range = float(p('rotate_min_range', 0.26).value)
+        # 旋转安全扇区半角：选向校验与执行复核必须用同一个值，否则会出现
+        # "选出来了却一启动就判 rotate_into_obstacle" 的自相矛盾（escA2 实测）
+        self.rotate_sector_deg = float(p('rotate_sector_deg', 45.0).value)
         self.advance_stop_range = float(p('advance_stop_range', 0.32).value)
         self.min_dir_range = float(p('min_dir_range', 0.50).value)
         self.clearance_gain = float(p('clearance_gain', 0.20).value)
@@ -291,6 +294,10 @@ class EscapeSupervisor(Node):
                 best = r
         return best
 
+    def remaining_sector_anchor(self, now):
+        """旋转阶段复核用的朝向：用当前剩余转角（含已转过的部分由 step 递减体现）。"""
+        return self.unit_remaining
+
     def rotation_path_clear(self, offset, step=0.15):
         """整段旋转是否安全：沿路每一小步都用"该步朝向 ±35° 扇区"的最小测距复核。
 
@@ -300,7 +307,7 @@ class EscapeSupervisor(Node):
         n = max(1, int(round(abs(offset) / step)))
         for i in range(1, n + 1):
             th = offset * i / n
-            if self.range_cone(th, half_deg=35.0, stride=4) < self.rotate_min_range:
+            if self.range_cone(th, half_deg=self.rotate_sector_deg, stride=4) < self.rotate_min_range:
                 return False
         return True
 
@@ -323,6 +330,8 @@ class EscapeSupervisor(Node):
             if best_any is None or clr > best_any[1]:
                 best_any = (off, clr)
             if clr < self.min_dir_range:
+                continue
+            if self.range_cone(off, half_deg=self.rotate_sector_deg, stride=4) < self.rotate_min_range:
                 continue
             if not self.rotation_path_clear(off):
                 continue
@@ -458,7 +467,7 @@ class EscapeSupervisor(Node):
             return
         if self.phase == 'rotate':
             # 只看"正在转进去的那一侧"（含车体半宽对应的展角），避免车后有近物就永不动
-            cur = self.range_cone(self.unit_remaining, half_deg=60.0, stride=3)
+            cur = self.range_cone(self.remaining_sector_anchor(now), half_deg=self.rotate_sector_deg, stride=3)
             if cur < self.rotate_min_range:
                 self.abort_unit(now, 'rotate_into_obstacle')
                 return
