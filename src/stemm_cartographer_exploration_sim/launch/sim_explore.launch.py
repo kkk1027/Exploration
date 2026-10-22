@@ -66,7 +66,7 @@ def generate_launch_description():
                 condition=IfCondition(LaunchConfiguration('rviz')),
                 arguments=['-d', rviz_cfg],
                 parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time'),
-                                'republish_sec': 3.0, 'max_candidates': 6}])
+                                'republish_sec': 1.5, 'max_candidates': 6}])
 
     arbiter = Node(package='stemm_cartographer_exploration_sim', executable='frontier_arbiter',
                    name='frontier_arbiter', output='screen',

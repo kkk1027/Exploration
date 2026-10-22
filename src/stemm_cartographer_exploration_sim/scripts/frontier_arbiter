@@ -27,7 +27,8 @@ import math
 import time
 
 import rclpy
-from geometry_msgs.msg import PoseStamped
+from action_msgs.msg import GoalStatusArray
+from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import OccupancyGrid, Odometry
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
@@ -55,6 +56,10 @@ class Arbiter(Node):
         self.last_pub = 0.0
         self.last_goal = None
         self.pending = None
+        self.cmd = (0.0, 0.0)
+        self.mgr_busy = False
+        self.stuck_zones = []     # [(x, y, expire)]
+        self._stuck_ref = None    # (t, x, y)
         self.stats = {'seen': 0, 'rejected_size': 0, 'rejected_path': 0,
                       'rejected_black': 0, 'published': 0}
 
@@ -63,6 +68,10 @@ class Arbiter(Node):
         self.create_subscription(OccupancyGrid, '/map', self.on_map, qmap)
         self.create_subscription(PointArray, '/filtered_goal_points', self.on_cands, 10)
         self.create_subscription(Odometry, '/odom_combined', self.on_odom, 20)
+        self.create_subscription(Twist, '/cmd_vel', self.on_cmd, 20)
+        # S2：当前是否有 Nav2 活动目标（无目标时立刻给下一个候选）
+        self.create_subscription(GoalStatusArray, '/navigate_to_pose/_action/status',
+                                 self.on_status, 10)
         self.pub = self.create_publisher(PoseStamped, '/validated_frontier_goal', 10)
         self.costmap = None
         self.create_subscription(OccupancyGrid, '/global_costmap/costmap', self.on_costmap, qmap)
@@ -72,6 +81,16 @@ class Arbiter(Node):
     # ---- 回调 ----
     def on_map(self, m):
         self.map = m
+
+    def on_cmd(self, m):
+        self.cmd = (m.linear.x, m.angular.z)
+
+    def on_status(self, m):
+        busy = False
+        for st in m.status_list:
+            if st.status in (1, 2, 3):      # ACCEPTED / EXECUTING / CANCELING
+                busy = True
+        self.mgr_busy = busy
 
     def on_costmap(self, m):
         self.costmap = m
@@ -175,12 +194,40 @@ class Arbiter(Node):
         return fut
 
     # ---- 主循环 ----
+    def _update_stuck(self, now):
+        """S3：有速度指令但位移几乎为 0 → 记为受阻区（60 s 衰减）"""
+        if self.pose is None:
+            return
+        moving_cmd = abs(self.cmd[0]) > 0.05 or abs(self.cmd[1]) > 0.05
+        if not moving_cmd:
+            self._stuck_ref = None
+            return
+        if self._stuck_ref is None:
+            self._stuck_ref = (now, self.pose[0], self.pose[1])
+            return
+        t0, x0, y0 = self._stuck_ref
+        if now - t0 >= 2.0:
+            if math.hypot(self.pose[0] - x0, self.pose[1] - y0) < 0.01:
+                self.stuck_zones.append((self.pose[0], self.pose[1], now + self.bl_sec))
+                self.get_logger().warn(
+                    f'受阻区记录：({self.pose[0]:.2f},{self.pose[1]:.2f}) 持续 {now-t0:.1f}s 无位移')
+            self._stuck_ref = (now, self.pose[0], self.pose[1])
+        self.stuck_zones = [z for z in self.stuck_zones if z[2] > now]
+
+    def _stuck_penalty(self, x, y, now):
+        pen = 0
+        for zx, zy, _ in self.stuck_zones:
+            if math.hypot(x - zx, y - zy) < 1.5:
+                pen += 400          # 等价于扣掉 400 个未知格的收益（降权而非硬拒）
+        return pen
+
     def tick(self):
         now = time.monotonic()
+        self._update_stuck(now)
         if self.map is None or self.pose is None or not self.cands:
             return
-        if now - self.last_pub < self.repub:
-            return
+        if self.mgr_busy and now - self.last_pub < self.repub:
+            return                      # 目标执行中才限速；空闲时立刻补一个新候选（S2）
         cands = [c for c in self.cands if now - c[2] < 30.0]
         if not cands:
             return
@@ -193,7 +240,8 @@ class Arbiter(Node):
             if u < self.min_unknown:
                 self.stats['rejected_size'] += 1
                 continue
-            scored.append((u, -math.hypot(x - self.pose[0], y - self.pose[1]), x, y))
+            u_eff = u - self._stuck_penalty(x, y, now)
+            scored.append((u_eff, -math.hypot(x - self.pose[0], y - self.pose[1]), x, y))
         scored.sort(reverse=True)
         for u, negd, x, y in scored[:self.max_cand]:
             gx, gy = self.pull_back(x, y)
