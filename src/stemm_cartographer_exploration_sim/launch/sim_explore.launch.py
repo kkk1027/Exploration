@@ -107,6 +107,6 @@ def generate_launch_description():
             description='探索栈延迟启动秒数：Gazebo 里机器人 spawn + EKF 出 odom_combined '
                         '约需 30~40 s，而探索栈内的 mapping_tf_guard 只有 30 s 超时'),
         robot,
-        TimerAction(period=stack_delay, actions=[stack, patch_sim_time]),
+        TimerAction(period=stack_delay, actions=[stack, patch_sim_time, arbiter]),
         TimerAction(period=stack_delay, actions=[driver]),
         rviz])
