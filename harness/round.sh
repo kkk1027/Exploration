@@ -72,8 +72,11 @@ else
   while [ "$waited" -lt "$MAXW" ]; do
     sleep 10; waited=$((waited+10))
     if grep -q "会话结束" "$OUT/launch.log" 2>/dev/null; then say "检测到会话结束（${waited}s）"; break; fi
-    MF=/home/kbf/stemm_sim_ws/maps/explore_latest.pgm
-    if [ -f "$MF" ] && [ "$(stat -c %Y "$MF")" -ge "$T_START" ]; then say "地图已落盘（${waited}s）"; break; fi
+    # 注意：会话驱动在返航期每 2 s 滚动存图，"地图文件出现"不再是收尾信号，
+    # 必须等"会话结束"或 manager 明确返航到位（否则会在返航刚开始时就收尾）。
+    if grep -qE "return-home completed by position|返航到位" "$OUT/launch.log" 2>/dev/null; then
+      say "返航到位（${waited}s）"; sleep 8; break
+    fi
     pgrep -x gzserver >/dev/null || { say "gzserver 已退出（${waited}s）"; break; }
   done
 fi

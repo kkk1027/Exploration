@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
 # patch_sim_time —— 车端栈的"仿真运行期参数补丁"（不改车端源码，只用 ros2 param set）。
 #
-# 分三个阶段，互不阻断（早期版本在阶段 1 成功后直接 exit，导致阶段 2/3 有时根本没执行）：
-#   阶段 1  use_sim_time：车端 launch 里有 5 个节点没传，仿真里必须补，否则它们用墙钟和
-#           仿真的 TF 时间戳比较（mapping_tf_guard 会在 30 s 内必判"TF 不新鲜"）。
+# 顺序有讲究（2026-10-23 实测教训）：
+#   阶段 0  P0：关闭车端盲退 + 把 Nav2 足迹补回真实车宽 —— 必须**最先**做。
+#           原来排在 use_sim_time 重试（最长 40 s）之后，结果探索开局的前 30 s 里
+#           脱困仍走了两次 R1 盲退（p0A_fix 实测），盲退闸门形同虚设。
+#   阶段 1  use_sim_time：车端 launch 里有 5 个节点没传，仿真里必须补，否则它们用墙钟
+#           和仿真的 TF 时间戳比较（mapping_tf_guard 会在 30 s 内必判"TF 不新鲜"）。
 #   阶段 2  Nav2 容忍度/目标容差：细时钟带来毫秒级"未来"查询，放宽 transform_tolerance；
 #           controller 的目标容差放宽，避免返航末段姿态对齐拖死收尾。
-#   阶段 3  P0：关掉车端所有"盲退"（用户 2026-10-23 边界：脱困只能旋转+前进）。
-#           车端唯一的反向速度发布点是 cartographer_manager._retreat_from_occupied_cells，
-#           由 exploration_retreat_enabled / return_home_retreat_enabled 两个闸门控制，
-#           另有 blocked_retreat_max_per_session 限次数。运行期全部置 0/False 即可停止盲退，
-#           改由仿真侧 escape_supervisor（雷达引导的旋转+前进）接管。
 set +u
 source /opt/ros/humble/setup.bash
 source /home/kbf/stemm_sim_ws/install/setup.bash
@@ -19,12 +17,46 @@ export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-42}"
 
 MGR=/stemm_cartographer_nav2_manager
 DEADLINE=$(( $(date +%s) + 40 ))
-DISABLE_RETREAT="${1:-1}"   # 1=阶段3生效（P0 默认）；0=保留车端盲退（对照基线用）
-DISABLE_RETREAT="${1:-1}"   # 1=阶段3生效（P0），0=保留车端盲退（对照基线）
+DISABLE_RETREAT="${1:-1}"   # 1=P0（默认）；0=保留车端盲退，做对照基线用
 
 set_param() {   # $1=node $2=name $3=value  → 成功返回 0
   ros2 param set "$1" "$2" "$3" >/dev/null 2>&1
 }
+
+retry_until() {   # $1=seconds $2=node $3=param $4=value
+  local end=$(( $(date +%s) + $1 ))
+  while [ "$(date +%s)" -lt "$end" ]; do
+    set_param "$2" "$3" "$4" && { echo "[patch] $2 $3=$4 ✓"; return 0; }
+    sleep 0.3
+  done
+  echo "[patch] $2 $3=$4 ✗（超时）"; return 1
+}
+
+# ---------------- 阶段 0（P0）：先关盲退、再补足迹 ----------------
+if [ "$DISABLE_RETREAT" = "1" ]; then
+  retry_until 20 "$MGR" exploration_retreat_enabled false
+  retry_until 5  "$MGR" return_home_retreat_enabled false
+  retry_until 5  "$MGR" return_home_failure_retreat_enabled false
+  retry_until 5  "$MGR" blocked_retreat_max_per_session 0
+  # 车端 stemm_escape_controller 只会"原地转到底"，仿真侧 escape_supervisor 是它的超集
+  # （同样只用雷达、同样绝不后退，但会转向最空旷方向并前进一小段）。两者同时跑会互相抢
+  # /cmd_vel，故此处把车端那个置 enabled=false；想对比时用 DISABLE_CAR_ESCAPE=0。
+  if [ "${DISABLE_CAR_ESCAPE:-1}" = "1" ]; then
+    retry_until 15 /stemm_escape_controller enabled false
+  else
+    echo "[patch] 保留车端 escape_controller（DISABLE_CAR_ESCAPE=0）"
+  fi
+  echo "[patch] 阶段0 盲退关闭完成（exploration/return_home/failure + blocked_retreat_max_per_session=0）"
+
+  # Nav2 足迹：真机含轮总宽 0.46 m ⇒ 轮外沿 y=±0.23，而车端 footprint 半宽只有 0.20，
+  # 规划器以为"车心离墙 0.20 m 安全"，实测刮墙时车心离墙恰好 0.19 m（轮子插进去 3 cm）。
+  # 只把 y 补到 0.235（物理值 +0.5 cm 余量），x 方向保留车端保守值。
+  FOOTPRINT='[[-0.18,-0.235],[-0.18,0.235],[0.32,0.235],[0.32,-0.235]]'
+  retry_until 20 /local_costmap/local_costmap footprint "$FOOTPRINT"
+  retry_until 20 /global_costmap/global_costmap footprint "$FOOTPRINT"
+else
+  echo "[patch] 阶段0 跳过（DISABLE_RETREAT=$DISABLE_RETREAT，对照基线保留车端盲退与旧足迹）"
+fi
 
 # ---------------- 阶段 1：use_sim_time ----------------
 TARGETS="/stemm_cartographer_mapping_tf_guard $MGR /stemm_cartographer_odom_session_guard /stemm_cartographer_state_saver /stemm_cartographer_map_service_adapter"
@@ -41,15 +73,6 @@ done
 echo "[patch] 阶段1 use_sim_time：$n/5"
 
 # ---------------- 阶段 2：仿真适配 ----------------
-retry_until() {   # $1=seconds $2=node $3=param $4=value
-  local end=$(( $(date +%s) + $1 ))
-  while [ "$(date +%s)" -lt "$end" ]; do
-    set_param "$2" "$3" "$4" && { echo "[patch] $2 $3=$4 ✓"; return 0; }
-    sleep 0.5
-  done
-  echo "[patch] $2 $3=$4 ✗（超时）"; return 1
-}
-
 retry_until 40 "$MGR" frontier_goal_topic /validated_frontier_goal
 for N in /controller_server /planner_server /bt_navigator /behavior_server \
          /global_costmap/global_costmap /local_costmap/local_costmap; do
@@ -57,34 +80,5 @@ for N in /controller_server /planner_server /bt_navigator /behavior_server \
 done
 retry_until 10 /controller_server yaw_goal_tolerance 0.15
 retry_until 10 /controller_server xy_goal_tolerance 0.15
-
-# ---------------- 阶段 4（P0-5）：把 Nav2 足迹补回真实车宽 ----------------
-# 实测根因：真机含轮总宽 0.46 m ⇒ 轮子外沿 y=±0.23；而车端 footprint 半宽只有 0.20，
-# 于是规划/控制器认为"车心离墙 0.20 m 安全"，实际轮子已插入 3 cm —— 基线轮抓到的
-# 11 次"障碍点进入车体轮廓"全是 y≈±0.19 的车侧刮墙（底盘接触传感器不响，因为碰的是轮子）。
-# 这里只把 y 从 0.20 补到 0.235（物理 0.23 + 0.5 cm 余量），x 方向保留车端保守值。
-FOOTPRINT='[[-0.18,-0.235],[-0.18,0.235],[0.32,0.235],[0.32,-0.235]]'
-if [ "$DISABLE_RETREAT" = "1" ]; then
-  retry_until 25 /local_costmap/local_costmap footprint "$FOOTPRINT"
-  retry_until 25 /global_costmap/global_costmap footprint "$FOOTPRINT"
-fi
-
-# ---------------- 阶段 3（P0）：关闭车端所有盲退 ----------------
-if [ "$DISABLE_RETREAT" != "1" ]; then
-  echo "[patch] 阶段3 跳过（DISABLE_RETREAT=$DISABLE_RETREAT，对照基线保留车端盲退）"
-  exit 0
-fi
-retry_until 20 "$MGR" exploration_retreat_enabled false
-retry_until 5  "$MGR" return_home_retreat_enabled false
-retry_until 5  "$MGR" return_home_failure_retreat_enabled false
-retry_until 5  "$MGR" blocked_retreat_max_per_session 0
-# 车端 stemm_escape_controller 只会"原地转到底"，仿真侧 escape_supervisor 是它的超集
-# （同样只用雷达、同样绝不后退，但会转向最空旷方向并前进一小段）。两者同时跑会互相抢
-# /cmd_vel，故此处把车端那个置 enabled=false；想对比时用 disable_car_escape:=0。
-if [ "${DISABLE_CAR_ESCAPE:-1}" = "1" ]; then
-  retry_until 15 /stemm_escape_controller enabled false
-else
-  echo "[patch] 保留车端 escape_controller（DISABLE_CAR_ESCAPE=0）"
-fi
-echo "[patch] 阶段3 盲退关闭完成（exploration/return_home/failure + blocked_retreat_max_per_session=0）"
+echo "[patch] 全部阶段完成"
 exit 0

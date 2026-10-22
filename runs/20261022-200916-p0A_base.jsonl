@@ -1,0 +1,7 @@
+{"ts":"2026-10-22T20:09:17+08:00","tag":"p0A_base",""check":"pre_launch","nodes":10,"gzserver":0,"residue":"""}
+{"ts":"2026-10-22T20:09:17+08:00","tag":"p0A_base",""check":"pose","x":0.4,"y":0.3,"yaw":1.5708"}
+{"ts":"2026-10-22T20:09:17+08:00","tag":"p0A_base",""check":"variant","disable_retreat":0,"supervisor":"false""}
+{"ts":"2026-10-22T20:09:20+08:00","tag":"p0A_base",""check":"launch","pgid":"26681""}
+{"ts":"2026-10-22T20:13:23+08:00","tag":"p0A_base",""check":"post_teardown","nodes":9,"gzserver":0,"residue":"""}
+{"ts":"2026-10-22T20:13:23+08:00","tag":"p0A_base",""verdict":"PASS_clean""}
+{"check":"collision","summary":{"contacts": 6, "grazes": 6, "alerts": 6, "stalls": 1, "reverse_windows": 1, "reverse_m": 0.192, "reverse_hard_windows": 1, "reverse_hard_m": 0.192, "chassis_contacts": 0, "wheel_contacts": 0, "physical_contacts": 0, "min_clearance_ever": 0.0}}
