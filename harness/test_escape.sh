@@ -24,6 +24,7 @@ echo "[escape-test] tag=$TAG pose=($SX,$SY,$SYAW) extra=[$EXTRA]" | tee -a "$OUT
 setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py \
   auto_explore:=false stack:=false stack_delay:=0 rviz:=false \
   spawn_x:=$SX spawn_y:=$SY spawn_yaw:=$SYAW \
+  supervisor_unit_max_sec:=${UNIT_MAX_SEC:-8.0} supervisor_recovery_timeout:=${RECOVERY_TIMEOUT:-40.0} \
   probe_log:=$OUT/probe.jsonl supervisor_log:=$OUT/supervisor.jsonl" \
   > "$OUT/launch.log" 2>&1 < /dev/null &
 sleep 45

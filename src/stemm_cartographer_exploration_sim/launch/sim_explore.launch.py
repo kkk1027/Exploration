@@ -91,6 +91,8 @@ def generate_launch_description():
                       output='screen',
                       parameters=[{'use_sim_time': use_sim_time,
                                    'enabled': LaunchConfiguration('escape_supervisor'),
+                                   'unit_max_sec': LaunchConfiguration('supervisor_unit_max_sec'),
+                                   'recovery_timeout_sec': LaunchConfiguration('supervisor_recovery_timeout'),
                                    'log_path': LaunchConfiguration('supervisor_log')}])
 
     driver = Node(
@@ -129,6 +131,10 @@ def generate_launch_description():
             description='脱困监督 JSONL 路径（空=只打日志）'),
         DeclareLaunchArgument('escape_supervisor', default_value='true',
             description='是否启用雷达引导的旋转+前进脱困（P0）'),
+        DeclareLaunchArgument('supervisor_unit_max_sec', default_value='8.0',
+            description='脱困单元硬顶秒数（单元测试时调小以快速触发降级）'),
+        DeclareLaunchArgument('supervisor_recovery_timeout', default_value='40.0',
+            description='累计受阻多少秒后退出脱困（用户要求的 40 s 兜底）'),
         DeclareLaunchArgument('stack', default_value='true',
             description='是否启动车端探索栈（false=只起机器人+取证/脱困，单元测试用）'),
         DeclareLaunchArgument('disable_retreat', default_value='1',
