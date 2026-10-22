@@ -119,7 +119,7 @@ class EscapeSupervisor(Node):
         # "选出来了却一启动就判 rotate_into_obstacle" 的自相矛盾（escA2 实测）
         self.rotate_sector_deg = float(p('rotate_sector_deg', 45.0).value)
         self.rotate_pick_margin = float(p('rotate_pick_margin', 0.04).value)
-        self.advance_stop_range = float(p('advance_stop_range', 0.34).value)
+        self.advance_stop_range = float(p('advance_stop_range', 0.30).value)
         self.min_dir_range = float(p('min_dir_range', 0.50).value)
         self.clearance_gain = float(p('clearance_gain', 0.20).value)
         self.cost_gain = int(p('cost_gain', 40).value)
@@ -129,6 +129,8 @@ class EscapeSupervisor(Node):
         self.giveup_backoff_sec = float(p('giveup_backoff_sec', 90.0).value)
         self.spot_cooldown_sec = float(p('spot_cooldown_sec', 20.0).value)
         self.degrade_backoff_sec = float(p('degrade_backoff_sec', 12.0).value)
+        # 降级小步前进的最大距离（紧贴障碍、只想挪开几厘米时用）
+        self.degrade_advance_m = float(p('degrade_advance_m', 0.25).value)
 
         # ---- 状态 ----
         self.points = []           # 车体系障碍点 [(x,y)]（最近一帧 /scan_raw）
@@ -160,6 +162,7 @@ class EscapeSupervisor(Node):
         self.unit_offset = 0.0
         self.unit_remaining = 0.0
         self.unit_moved = 0.0
+        self.degrade_advance = getattr(self, 'degrade_advance', False)
         self.unit_anchor = None
         self.arm_clearance = None
         self.arm_cost = None
@@ -454,15 +457,21 @@ class EscapeSupervisor(Node):
         self.arm_clearance = self.range_cone(0.0, half_deg=14.0, stride=2)
         self.arm_cost = self.footprint_cost()
         if clr < self.min_dir_range:
-            self.stats['no_dir'] += 1
-            self.spot_until = now + self.degrade_backoff_sec
-            self.mark_zone(now)
-            self.log(type='no_direction', best_offset=round(offset, 2),
-                     best_clearance=round(clr, 3),
-                     arm_clearance=round(self.arm_clearance, 3),
-                     nav=self.nav_state,
-                     note='没有 >=%.2fm 的自由方向，不盲动' % self.min_dir_range)
-            return
+            # 降级：没有"够宽敞"的方向，但若最优方向仍有前进余量，就走一小步（不盲动、不后退）。
+            # 实测 demo5 的返航卡死正是这种情形：车被夹在墙边，需要挪开几厘米才能满足
+            # manager 的"起点离占据格 >=0.22 m"判据，却因为没到 0.50 m 而一直干等超时。
+            if clr >= self.advance_stop_range + 0.04 and self.rotation_path_clear(offset):
+                self.degrade_advance = True
+            else:
+                self.stats['no_dir'] += 1
+                self.spot_until = now + self.degrade_backoff_sec
+                self.mark_zone(now)
+                self.log(type='no_direction', best_offset=round(offset, 2),
+                         best_clearance=round(clr, 3),
+                         arm_clearance=round(self.arm_clearance, 3),
+                         nav=self.nav_state,
+                         note='没有 >=%.2fm 的自由方向，不盲动' % self.min_dir_range)
+                return
         self.stats['units'] += 1
         self.units_this_episode += 1
         self.phase = 'pick'
@@ -470,9 +479,11 @@ class EscapeSupervisor(Node):
         self.unit_offset = offset
         self.unit_remaining = offset
         self.unit_moved = 0.0
+        self.degrade_advance = getattr(self, 'degrade_advance', False)
         self.unit_anchor = self.pose[:2]
         self.unit_started_pos = self.pose[:2]
         self.log(type='unit_start', offset=round(offset, 2),
+                 degraded_dir=bool(getattr(self, 'degrade_advance', False)),
                  dir_range=round(clr, 3),
                  arm_range=round(self.arm_clearance, 3),
                  cost=self.arm_cost, nav=self.nav_state,
@@ -511,7 +522,10 @@ class EscapeSupervisor(Node):
         moved = math.hypot(self.pose[0] - self.unit_started_pos[0],
                            self.pose[1] - self.unit_started_pos[1])
         self.unit_moved = moved
-        if moved >= self.advance_max_m:
+        limit = self.advance_max_m
+        if getattr(self, 'degrade_advance', False):
+            limit = min(limit, self.degrade_advance_m)
+        if moved >= limit:
             self.end_unit(now, degraded=False)
             return
         self.publish(self.advance_speed, 0.0)
@@ -555,6 +569,7 @@ class EscapeSupervisor(Node):
                  unit_dt=round(now - self.unit_t0, 1),
                  nav=self.nav_state, stats=dict(self.stats))
         self.phase = 'idle'
+        self.degrade_advance = False
         self.unit_offset = 0.0
         self.unit_remaining = 0.0
         self.unit_anchor = None
