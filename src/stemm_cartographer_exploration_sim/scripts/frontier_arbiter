@@ -55,6 +55,10 @@ class Arbiter(Node):
         self.corridor_skip_far = float(p('corridor_skip_far_m', 1.2).value)
         self.corridor_stride = max(1, int(p('corridor_stride_cells', 2).value))
         self.narrow_penalty_sec = float(p('narrow_blacklist_sec', 45.0).value)
+        # 物理接触区（撞过的地方）：强降权 + 长记忆，避免反复撞同一张桌子
+        self.contact_zone_sec = float(p('contact_zone_sec', 180.0).value)
+        self.contact_zone_radius = float(p('contact_zone_radius_m', 1.2).value)
+        self.contact_zone_penalty = float(p('contact_zone_penalty', 800.0).value)
 
         self.map = None
         self.pose = None
@@ -66,6 +70,7 @@ class Arbiter(Node):
         self.cmd = (0.0, 0.0)
         self.mgr_busy = False
         self.stuck_zones = []     # [(x, y, expire)]
+        self.contact_zones = []   # [(x, y, expire)] 物理撞过的位置
         self._stuck_ref = None    # (t, x, y)
         self.stats = {'seen': 0, 'rejected_size': 0, 'rejected_path': 0,
                       'rejected_black': 0, 'published': 0,
@@ -89,6 +94,8 @@ class Arbiter(Node):
         self.create_subscription(OccupancyGrid, '/global_costmap/costmap', self.on_costmap, qmap)
         # P0-3 的脱困监督会把"这里脱困失败"发过来，作为受阻区降权
         self.create_subscription(PoseStamped, '/escape_blocked_zone', self.on_escape_zone, 10)
+        self.create_subscription(PoseStamped, '/collision_contact_zone',
+                                 self.on_contact_zone, 10)
         self.create_timer(1.0, self.tick)
         self.get_logger().info('frontier_arbiter 就绪：可达性预筛/黑名单/最小前沿/回拉')
 
@@ -132,6 +139,16 @@ class Arbiter(Node):
         self.get_logger().warn(
             '脱困失败受阻区（监督节点上报）：(%.2f,%.2f)'
             % (m.pose.position.x, m.pose.position.y))
+
+    def on_contact_zone(self, m):
+        self.contact_zones.append((m.pose.position.x, m.pose.position.y,
+                                   time.monotonic() + self.contact_zone_sec))
+        if len(self.contact_zones) > 20:
+            self.contact_zones = self.contact_zones[-20:]
+        self.stats['contact_zones'] = self.stats.get('contact_zones', 0) + 1
+        self.get_logger().warn(
+            '物理接触区记录：(%.2f,%.2f)；统计 %s'
+            % (m.pose.position.x, m.pose.position.y, self.stats))
 
     def on_costmap(self, m):
         self.costmap = m
@@ -381,6 +398,10 @@ class Arbiter(Node):
         for zx, zy, _ in self.stuck_zones:
             if math.hypot(x - zx, y - zy) < 1.5:
                 pen += 400          # 等价于扣掉 400 个未知格的收益（降权而非硬拒）
+        self.contact_zones = [z for z in self.contact_zones if z[2] > now]
+        for zx, zy, _ in self.contact_zones:
+            if math.hypot(x - zx, y - zy) < self.contact_zone_radius:
+                pen += self.contact_zone_penalty
         return pen
 
     def tick(self):

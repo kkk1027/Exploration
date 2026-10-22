@@ -40,7 +40,7 @@ import math
 import time
 
 import rclpy
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
@@ -142,6 +142,8 @@ class CollisionProbe(Node):
         self.pub_min = self.create_publisher(Float32, '/collision/min_clearance', 10)
         self.pub_contact = self.create_publisher(Bool, '/collision/contact', 10)
         self.pub_summary = self.create_publisher(String, '/collision/summary', 10)
+        # 物理接触时把这个位置报给仲裁，让"学到的避让"生效（同一个桌子不反复撞）
+        self.pub_zone = self.create_publisher(PoseStamped, '/collision_contact_zone', 10)
         self.create_timer(0.2, self.tick)
         self.create_timer(self.summary_period, self.summary)
 
@@ -203,6 +205,14 @@ class CollisionProbe(Node):
         if self.bumper_last != name or now - self._last_event['contact'] > self.event_min_interval:
             self.bumper_last = name
             self.stats['bumpers'] += 1
+            if now - getattr(self, '_zone_at', 0.0) > 2.0 and self.pose is not None:
+                self._zone_at = now
+                z = PoseStamped()
+                z.header.frame_id = 'map'
+                z.header.stamp = self.get_clock().now().to_msg()
+                z.pose.position.x, z.pose.position.y = float(self.pose[0]), float(self.pose[1])
+                z.pose.orientation.w = 1.0
+                self.pub_zone.publish(z)
             if 'wheel_link' in name:
                 self.stats['wheel_contacts'] += 1
             else:
