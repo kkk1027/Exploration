@@ -36,6 +36,135 @@ from std_msgs.msg import String
 from wheeltec_rrt_msg.msg import PointArray
 
 
+
+# =====================================================================
+# 纯函数打分内核（不依赖 ROS，便于 harness/test_scoring.py 离线秒级验证）
+# grid = {'res','w','h','ox','oy','data'}；data: -1=未知, 0..24=自由, >=50=占据
+# =====================================================================
+FREE_MAX = 25
+OCC_MIN = 50
+
+
+def to_cell(g, x, y):
+    return int((x - g['ox']) / g['res']), int((y - g['oy']) / g['res'])
+
+
+def cell_stats(g, x, y, radius_m):
+    """半径内 未知格数 / 自由格数。"""
+    r = max(1, int(radius_m / g['res']))
+    cx, cy = to_cell(g, x, y)
+    unknown = free = 0
+    for j in range(max(0, cy - r), min(g['h'], cy + r + 1)):
+        base = j * g['w']
+        for i in range(max(0, cx - r), min(g['w'], cx + r + 1)):
+            v = g['data'][base + i]
+            if v < 0:
+                unknown += 1
+            elif v < FREE_MAX:
+                free += 1
+    return unknown, free
+
+
+def unknown_component_size(g, x, y, cap=2000, radius_m=3.0):
+    """候选点所在"未知连通块"的大小（BFS，半径内、上限 cap）。
+
+    这是"S3+S2 收益函数"的核心：大块未知（还没探过的大区域）值得优先，
+    而已经探得七零八落只剩碎角的地方，块大小很小 → 自然被压后。
+    """
+    res = g['res']
+    rmax = max(2, int(radius_m / res))
+    cx, cy = to_cell(g, x, y)
+    # 先找一个未知格做种子（候选点本身可能落在自由格/占据边上）
+    seed = None
+    for rad in range(0, rmax + 1):
+        for j in range(cy - rad, cy + rad + 1):
+            for i in (cx - rad, cx + rad) if rad else (cx,):
+                if 0 <= i < g['w'] and 0 <= j < g['h']:
+                    if g['data'][j * g['w'] + i] < 0:
+                        seed = (i, j)
+                        break
+            if seed:
+                break
+        if seed:
+            break
+    if seed is None:
+        return 0
+    seen = {(seed[0], seed[1])}
+    q = [seed]
+    n = 0
+    data = g['data']
+    w, h = g['w'], g['h']
+    while q and n < cap:
+        i, j = q.pop()
+        n += 1
+        for ni, nj in ((i + 1, j), (i - 1, j), (i, j + 1), (i, j - 1)):
+            if not (0 <= ni < w and 0 <= nj < h):
+                continue
+            if abs(ni - cx) > rmax or abs(nj - cy) > rmax:
+                continue
+            if (ni, nj) in seen:
+                continue
+            if data[nj * w + ni] < 0:
+                seen.add((ni, nj))
+                q.append((ni, nj))
+    return n
+
+
+def frontier_width(g, x, y, radius_m=1.5):
+    """前沿"宽度"代理：半径内与未知格相邻的自由格数。
+
+    用来替代"前沿段长度"（RRT 只给点，没有段）：碎角/单格突起会得到很小的值。
+    """
+    r = max(1, int(radius_m / g['res']))
+    cx, cy = to_cell(g, x, y)
+    w, h, data = g['w'], g['h'], g['data']
+    n = 0
+    for j in range(max(0, cy - r), min(h, cy + r + 1)):
+        base = j * w
+        for i in range(max(0, cx - r), min(w, cx + r + 1)):
+            if data[base + i] < 0 or data[base + i] >= FREE_MAX:
+                continue
+            adj_unknown = False
+            for ni, nj in ((i + 1, j), (i - 1, j), (i, j + 1), (i, j - 1)):
+                if 0 <= ni < w and 0 <= nj < h and data[nj * w + ni] < 0:
+                    adj_unknown = True
+                    break
+            if adj_unknown:
+                n += 1
+    return n
+
+
+def score_one(g, x, y, dist, cfg, penalty=0.0):
+    """单个候选的收益分（越大越好）。返回 dict 便于日志取证。"""
+    info_r = cfg['info_radius']
+    u, free = cell_stats(g, x, y, info_r)
+    blk = unknown_component_size(g, x, y, cap=cfg['block_cap'], radius_m=cfg['block_radius'])
+    width = frontier_width(g, x, y, radius_m=cfg['width_radius'])
+    ratio = u / float(u + free) if (u + free) > 0 else 0.0
+    info = u * (1.0 + cfg['w_block'] * min(blk, cfg['block_cap']) / float(cfg['block_cap']))
+    score = (info * (cfg['ratio_floor'] + (1.0 - cfg['ratio_floor']) * ratio)
+             + cfg['w_width'] * min(width, cfg['width_cap'])
+             - cfg['w_dist'] * dist
+             - penalty)
+    if width < cfg['min_width']:
+        score *= cfg['small_frontier_factor']     # 碎角：降权不硬拒（留到最后细化）
+    return {'x': x, 'y': y, 'unknown': u, 'free': free, 'block': blk,
+            'width': width, 'ratio': ratio, 'penalty': penalty, 'score': score}
+
+
+def rank_candidates(g, cands, cfg, penalty_fn=None, pose=None):
+    """给候选排序（cands: [(x, y)]；penalty_fn(x,y)->float）。"""
+    out = []
+    for x, y in cands:
+        dist = 0.0
+        if pose is not None:
+            dist = math.hypot(x - pose[0], y - pose[1])
+        pen = penalty_fn(x, y) if penalty_fn else 0.0
+        out.append(score_one(g, x, y, dist, cfg, pen))
+    out.sort(key=lambda r: r['score'], reverse=True)
+    return out
+
+
 class Arbiter(Node):
     def __init__(self):
         super().__init__('frontier_arbiter')
@@ -59,6 +188,25 @@ class Arbiter(Node):
         self.contact_zone_sec = float(p('contact_zone_sec', 180.0).value)
         self.contact_zone_radius = float(p('contact_zone_radius_m', 1.2).value)
         self.contact_zone_penalty = float(p('contact_zone_penalty', 800.0).value)
+        # 收益函数 v2（S3+S2）：大块未知优先、碎角降权、已探完区域降权
+        self.cfg = {
+            'info_radius': float(p('info_radius', 1.0).value),
+            'block_cap': int(p('block_cap', 6000).value),
+            'block_radius': float(p('block_radius', 6.0).value),
+            'width_radius': float(p('width_radius', 1.5).value),
+            'min_width': int(p('min_frontier_width', 6).value),
+            'width_cap': int(p('width_cap', 8).value),
+            'w_block': float(p('w_block', 1.5).value),
+            'w_width': float(p('w_width', 40.0).value),
+            'w_dist': float(p('w_dist', 0.5).value),
+            'ratio_floor': float(p('ratio_floor', 0.35).value),
+            'small_frontier_factor': float(p('small_frontier_factor', 0.4).value),
+        }
+        self.retry_penalty = float(p('retry_penalty', 60.0).value)
+        self.retry_radius = float(p('retry_radius_m', 1.2).value)
+        self.retry_window = float(p('retry_window_sec', 300.0).value)
+        self.pub_history = []        # [(x, y, ts)] 已派发过的目标（用于"反复拉锯"降权）
+        self.verbose_rank = str(p('verbose_rank', True).value).lower() in ('true', '1', 'yes')
 
         self.map = None
         self.pose = None
@@ -404,6 +552,42 @@ class Arbiter(Node):
                 pen += self.contact_zone_penalty
         return pen
 
+    def grid(self):
+        """把 /map 转成打分内核要的 dict（只做一次浅转换，避免每候选重复取属性）。"""
+        m = self.map
+        if m is None:
+            return None
+        info = m.info
+        return {'res': info.resolution, 'w': info.width, 'h': info.height,
+                'ox': info.origin.position.x, 'oy': info.origin.position.y,
+                'data': m.data}
+
+    def penalty(self, x, y):
+        """所有"别去那儿"的来源合并成一个罚分（罚分制，不硬拒，避免整片被吃）。"""
+        now = time.monotonic()
+        pen = 0.0
+        self.blacklist = [b for b in self.blacklist if b[2] > now]
+        for bx, by, _ in self.blacklist:
+            if math.hypot(x - bx, y - by) < self.bl_r:
+                pen += 250.0
+                self.stats['penalized_black'] = self.stats.get('penalized_black', 0) + 1
+                break
+        for zx, zy, _ in self.stuck_zones:
+            if math.hypot(x - zx, y - zy) < 1.5:
+                pen += 400.0
+                break
+        self.contact_zones = [z for z in self.contact_zones if z[2] > now]
+        for zx, zy, _ in self.contact_zones:
+            if math.hypot(x - zx, y - zy) < self.contact_zone_radius:
+                pen += self.contact_zone_penalty
+                break
+        # 反复拉锯：同一个位置附近被派发过很多次却没推进 → 降权
+        self.pub_history = [h for h in self.pub_history if now - h[2] < self.retry_window]
+        n = sum(1 for hx, hy, _ in self.pub_history
+                if math.hypot(x - hx, y - hy) < self.retry_radius)
+        pen += self.retry_penalty * n
+        return pen
+
     def tick(self):
         now = time.monotonic()
         self._update_stuck(now)
@@ -411,53 +595,60 @@ class Arbiter(Node):
             return
         if self.mgr_busy and now - self.last_pub < self.repub:
             return                      # 目标执行中才限速；空闲时立刻补一个新候选（S2）
-        cands = [c for c in self.cands if now - c[2] < 30.0]
+        cands = [(x, y) for x, y, t in self.cands if now - t < 30.0]
         if not cands:
             return
-        scored = []
-        for x, y, _ in cands:
-            u = self.unknown_cells(x, y)
-            if self.blacklisted(x, y, now):
-                # 黑名单从"硬拒"改为"重罚"：避免整片区域被吃掉后陷入"全部被拒"
-                self.stats['penalized_black'] = self.stats.get('penalized_black', 0) + 1
-                u -= 250
-            if u < self.min_unknown:
-                self.stats['rejected_size'] += 1
-                continue
-            u_eff = u - self._stuck_penalty(x, y, now)
-            scored.append((u_eff, -math.hypot(x - self.pose[0], y - self.pose[1]), x, y))
-        scored.sort(reverse=True)
+        g = self.grid()
+        if g is None:
+            return
+        try:
+            ranked = rank_candidates(g, cands, self.cfg,
+                                     penalty_fn=self.penalty, pose=self.pose)
+        except Exception as exc:                          # noqa: BLE001
+            self.get_logger().error(f'打分异常，回退旧逻辑：{type(exc).__name__}: {exc}')
+            ranked = []
+        # 规模门槛：未知格太少（碎角/坑）直接不要
+        keep = [r for r in ranked if r['unknown'] >= self.min_unknown]
+        self.stats['rejected_size'] += len(ranked) - len(keep)
+        if not keep:
+            self.get_logger().warn(
+                f'无候选过规模门槛（min_unknown={self.min_unknown}）；统计 {self.stats}')
+            return
+        if self.verbose_rank:
+            top = keep[:3]
+            self.get_logger().info('候选打分前 3：' + ' | '.join(
+                '(%.2f,%.2f) score=%.1f u=%d blk=%d w=%d pen=%.0f'
+                % (r['x'], r['y'], r['score'], r['unknown'], r['block'],
+                   r['width'], r['penalty']) for r in top))
         fallback = None
-        for u, negd, x, y in scored[:self.max_cand]:
-            gx, gy = self.pull_back(x, y)
+        for r in keep[:self.max_cand]:
+            gx, gy = self.pull_back(r['x'], r['y'])
             ok, narrow = self.path_and_width(gx, gy)
             if not ok:
                 self.blacklist.append((gx, gy, now + self.bl_sec))
                 self.stats['rejected_path'] += 1
                 continue
             if narrow is not None:
-                # P0-4：必须挤过窄缝才能到的目标直接丢弃（这是楔死的来源）
                 self.stats['rejected_narrow'] += 1
                 self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
                 if fallback is None:
-                    fallback = (gx, gy)
+                    fallback = (gx, gy, r)
                 self.get_logger().info(
                     '前向净空预检否决：走廊 < %.2fm @(%.2f,%.2f)，目标 (%.2f,%.2f)'
                     % (self.corridor_width, narrow[0], narrow[1], gx, gy))
                 continue
-            self.publish_goal(gx, gy, u)
+            self.publish_goal(gx, gy, r)
             return
         if fallback is not None:
-            # 全部需要穿窄缝：宁可走一次也不让探索停摆（liveness 兜底，有统计可查）
             self.stats['narrow_fallback'] += 1
             self.get_logger().warn(
                 '候选全部需要穿窄缝，回退派发最优点 (%.2f,%.2f)；统计 %s'
                 % (fallback[0], fallback[1], self.stats))
-            self.publish_goal(fallback[0], fallback[1], 0)
+            self.publish_goal(fallback[0], fallback[1], fallback[2])
             return
         self.get_logger().warn(f'本轮候选全部被拒：{self.stats}')
 
-    def publish_goal(self, gx, gy, u):
+    def publish_goal(self, gx, gy, r):
         now = time.monotonic()
         if (self.last_goal is not None and self.last_pub
                 and now - self.last_pub < 5.0
@@ -471,9 +662,18 @@ class Arbiter(Node):
         self.pub.publish(msg)
         self.last_pub = time.monotonic()
         self.last_goal = (gx, gy)
+        self.pub_history.append((gx, gy, self.last_pub))
         self.stats['published'] += 1
-        self.get_logger().info(
-            f'仲裁通过：未知格 {u}，目标 ({gx:.2f},{gy:.2f})；统计 {self.stats}')
+        try:
+            self.get_logger().info(
+                '仲裁通过：候选(%s) 未知=%s 块=%s 宽=%s penalty=%s → 目标 (%.2f,%.2f)；统计 %s'
+                % (('%.2f,%.2f' % (r['x'], r['y'])) if r else '?',
+                   r['unknown'] if r else '?', r['block'] if r else '?',
+                   r['width'] if r else '?',
+                   ('%.0f' % r['penalty']) if r else '?',
+                   gx, gy, self.stats))
+        except Exception:
+            pass
 
     def on_path_result(self, fut, gx, gy, u):
         self.pending = None
