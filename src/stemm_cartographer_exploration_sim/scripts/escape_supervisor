@@ -1,0 +1,529 @@
+#!/usr/bin/env python3
+"""escape_supervisor —— 只用雷达信息的"旋转 + 前进"脱困（P0-3）。
+
+为什么不是原来的做法
+--------------------
+实机现场（2026-10-22 仿真复现，s3r3 轮）楔死时的完整链条是：
+
+  Nav2 footprint 判楔死 -> 车端 escape_controller 原地转满 2.10 rad（120°）
+  -> 代价 253 一点没变（转圈不改变离障碍的距离）-> 交还控制
+  -> 车端 manager 做 R1 "盲退" 0.30 m（只看 /map，未知格当自由）
+  -> 退到墙里/退完还是楔死 -> 再转 -> 再退 …… 7 次盲退、11 次无效旋转
+
+两个根因：① 只转不走，几何没变，代价自然不变；② 后退完全不看传感器。
+用户 2026-10-23 定的边界：**脱困只允许"旋转 + 前进"，任何情况下不得后退**。
+所以本节点做人类会做的事：看着雷达，转到最空旷的方向（每 0.1 s 用雷达复核，绝不转进
+障碍），然后沿那个方向前进一小段，让车真正离开楔死点。
+
+它只管一件事，且随时让路
+------------------------
+* 只有在"有导航目标 + 连续停住 >= stall_sec + 1.5 s 内没有任何别的节点在发速度"时才接管；
+* 一接管就先算方向：把 /scan_raw 的 360° 点变换到车体系，对每个候选航向（±80°，绝不选
+  背后方向）算"车体矩形到最近障碍点的间隙"，取 `间隙 - 0.20*|转角|` 最大者；
+* 旋转阶段每个 tick 复核当前朝向间隙，一旦有点进到车体 5 mm 内立刻停转并放弃本单元；
+* 前进阶段每个 tick 复核前向 ±20° 间隙，低于 advance_stop_clearance 立刻停；
+* 任何时候只要有别的节点发速度（Nav2 / 车端 escape / manager 的 R1），立刻交还控制。
+
+三个兜底（用户 2026-10-23 明确要求）
+-----------------------------------
+1) 单元 8 s：一个"旋转+前进"单元最多 8 s（rotation 3 s + advance 5 s 的硬顶）。
+2) 8 s 降级：单元到 8 s 仍未改善（前向间隙或 footprint 代价没变好）→ 判降级：
+   立刻停车、把该点记为受阻区（发给仲裁）、本点冷却 20 s，不再纠缠。
+3) 40 s 超时退出：同一段受阻累计 40 s 仍无改善 → 整段停止脱困（停 90 s 长退避），
+   记 giveup，交由 Nav2/manager 换目标。
+
+安全边界（全部是"宁可不动"式）
+------------------------------
+* 绝不发 linear.x < 0（本节点只有三处发布：0、+advance_speed、纯角速度）。
+* 旋转只在"当前朝向的车体间隙 > rotate_min_clearance"时进行。
+* 前进只在"前向 ±20° 最小间隙 > advance_stop_clearance(0.10 m)"时进行。
+* 车体几何与 Nav2 footprint 同源（URDF：x∈[-0.16,0.29]，y=±0.23）。
+"""
+import json
+import math
+import time
+
+import rclpy
+from action_msgs.msg import GoalStatusArray
+from geometry_msgs.msg import PoseStamped, Twist, Vector3
+from nav_msgs.msg import Odometry
+from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
+from sensor_msgs.msg import LaserScan
+from std_msgs.msg import String
+
+try:
+    from nav2_msgs.msg import Costmap
+except Exception:                       # pragma: no cover
+    Costmap = None
+
+
+ACTIVE_STATUS = (1, 2, 3)               # ACCEPTED / EXECUTING / CANCELING
+BLOCKED_TOKENS = ('blocked_', 'escape_', 'wedge', 'stuck_')
+IDLE_NAV_STATES = ('waiting_for_frontier', 'waiting_for_rrt_frontier',
+                   'waiting_for_nav2', 'idle')
+
+
+def yaw_of(q):
+    return math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                      1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+
+class EscapeSupervisor(Node):
+    def __init__(self):
+        super().__init__('escape_supervisor')
+        p = self.declare_parameter
+        self.enabled = bool(p('enabled', True).value)
+        self.scan_topic = str(p('scan_topic', '/scan_raw').value)
+        self.odom_topic = str(p('odom_topic', '/odom_combined').value)
+        self.cmd_topic = str(p('cmd_topic', '/cmd_vel').value)
+        self.nav_state_topic = str(p('nav_state_topic',
+                                     '/stemm_cartographer/nav_state').value)
+        self.status_topic = str(p('status_topic',
+                                  '/navigate_to_pose/_action/status').value)
+        self.costmap_topic = str(p('costmap_topic',
+                                   '/local_costmap/costmap_raw').value)
+        self.zone_topic = str(p('zone_topic', '/escape_blocked_zone').value)
+        self.log_path = str(p('log_path', '').value)
+        # 车体几何
+        self.x_min = float(p('body_x_min', -0.16).value)
+        self.x_max = float(p('body_x_max', 0.29).value)
+        self.y_half = float(p('body_half_width', 0.23).value)
+        self.laser_x = float(p('laser_x', 0.24).value)
+        # 触发
+        self.stall_sec = float(p('stall_sec', 3.0).value)
+        self.cmd_quiet_sec = float(p('cmd_quiet_sec', 1.5).value)
+        self.cooldown_sec = float(p('cooldown_sec', 4.0).value)
+        self.scan_stale_sec = float(p('scan_stale_sec', 2.0).value)
+        # 运动包络
+        self.rotate_speed = float(p('rotate_speed', 0.35).value)
+        self.advance_speed = float(p('advance_speed', 0.08).value)
+        self.advance_max_m = float(p('advance_max_m', 0.60).value)
+        self.rotate_max_rad = float(p('rotate_max_rad', 1.05).value)
+        self.heading_limit = float(p('heading_limit', 1.40).value)   # ±80°
+        self.unit_max_sec = float(p('unit_max_sec', 8.0).value)      # 8 s 降级兜底
+        self.rotate_budget_sec = float(p('rotate_budget_sec', 3.0).value)
+        # 安全
+        self.rotate_min_clearance = float(p('rotate_min_clearance', 0.03).value)
+        self.advance_stop_clearance = float(p('advance_stop_clearance', 0.10).value)
+        self.min_advance_clearance = float(p('min_advance_clearance', 0.14).value)
+        self.clearance_gain = float(p('clearance_gain', 0.15).value)
+        self.cost_gain = int(p('cost_gain', 40).value)
+        # 预算
+        self.max_units_per_episode = int(p('max_units_per_episode', 3).value)
+        self.recovery_timeout_sec = float(p('recovery_timeout_sec', 40.0).value)
+        self.giveup_backoff_sec = float(p('giveup_backoff_sec', 90.0).value)
+        self.spot_cooldown_sec = float(p('spot_cooldown_sec', 20.0).value)
+        self.degrade_backoff_sec = float(p('degrade_backoff_sec', 12.0).value)
+
+        # ---- 状态 ----
+        self.points = []           # 车体系障碍点 [(x,y)]（最近一帧 /scan_raw）
+        self.points_stamp = 0.0
+        self.pose = None           # (x, y, yaw)
+        self.last_motion = time.monotonic()
+        self.last_foreign_cmd = 0.0
+        self.own_cmd_at = 0.0
+        self.nav_busy = False
+        self.nav_state = ''
+        self.costmap = None
+        self.costmap_stamp = 0.0
+        # 受阻计时
+        self.stuck_since = None
+        self.stuck_total = 0.0
+        self.stuck_anchor = None      # 进入受阻时的位置；位移 >= 0.5 m 才复位计时
+        self.units_this_episode = 0
+        self.disabled_until = 0.0
+        self.spot_until = 0.0
+        self.spot_pose = None
+        # 单元状态机
+        self.phase = 'idle'        # idle/pick/rotate/advance/end
+        self.unit_t0 = 0.0
+        self.unit_offset = 0.0
+        self.unit_remaining = 0.0
+        self.unit_moved = 0.0
+        self.unit_anchor = None
+        self.arm_clearance = None
+        self.arm_cost = None
+        self.unit_started_pos = None
+        self.stats = {'units': 0, 'ok': 0, 'failed': 0, 'degraded': 0,
+                      'giveups': 0, 'aborts': 0, 'no_dir': 0}
+
+        self._fh = open(self.log_path, 'a', buffering=1) if self.log_path else None
+        self.get_logger().info(
+            'escape_supervisor up: enabled=%s stall=%.1fs quiet=%.1fs unit<=%.0fs '
+            'adv<=%.2fm@%.2fm/s rot=%.2frad/s timeout=%.0fs units/episode=%d'
+            % (self.enabled, self.stall_sec, self.cmd_quiet_sec, self.unit_max_sec,
+               self.advance_max_m, self.advance_speed, self.rotate_speed,
+               self.recovery_timeout_sec, self.max_units_per_episode))
+
+        qos_sensor = QoSProfile(depth=1, reliability=ReliabilityPolicy.BEST_EFFORT,
+                                history=HistoryPolicy.KEEP_LAST)
+        self.create_subscription(LaserScan, self.scan_topic, self.on_scan, qos_sensor)
+        self.create_subscription(Odometry, self.odom_topic, self.on_odom, 20)
+        self.create_subscription(Twist, self.cmd_topic, self.on_cmd, 20)
+        self.create_subscription(String, self.nav_state_topic, self.on_nav_state, 10)
+        self.create_subscription(GoalStatusArray, self.status_topic, self.on_status, 10)
+        if Costmap is not None:
+            costmap_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                                     durability=DurabilityPolicy.VOLATILE,
+                                     history=HistoryPolicy.KEEP_LAST)
+            self.create_subscription(Costmap, self.costmap_topic, self.on_costmap,
+                                     costmap_qos)
+        self.cmd_pub = self.create_publisher(Twist, self.cmd_topic, 10)
+        self.zone_pub = self.create_publisher(PoseStamped, self.zone_topic, 10)
+        self.create_timer(0.1, self.tick)
+
+    # ---------------- 日志 ----------------
+    def log(self, **rec):
+        rec.setdefault('t', round(time.monotonic(), 2))
+        rec.setdefault('pos', [round(v, 2) for v in (self.pose or (0, 0, 0))[:2]])
+        if self._fh is not None:
+            self._fh.write(json.dumps(rec, ensure_ascii=False) + '\n')
+        else:
+            self.get_logger().info(json.dumps(rec, ensure_ascii=False))
+
+    # ---------------- 输入 ----------------
+    def on_scan(self, m):
+        lx = self.laser_x
+        pts = []
+        a = m.angle_min
+        da = m.angle_increment
+        lo = max(0.0, m.range_min * 0.999 - 0.001)
+        hi = 49.0
+        cos, sin = math.cos, math.sin
+        for i, r in enumerate(m.ranges):
+            if not (r >= lo and r <= hi):
+                continue
+            th = a + da * i
+            pts.append((lx + r * cos(th), r * sin(th)))
+        if pts:
+            self.points = pts
+            self.points_stamp = time.monotonic()
+
+    def on_odom(self, m):
+        now = time.monotonic()
+        q = m.pose.pose
+        new = (q.position.x, q.position.y, yaw_of(q.orientation))
+        if self.pose is not None:
+            d = math.hypot(new[0] - self.pose[0], new[1] - self.pose[1])
+            dyaw = abs(math.atan2(math.sin(new[2] - self.pose[2]),
+                                  math.cos(new[2] - self.pose[2])))
+            if d > 0.02 or dyaw > 0.03:
+                self.last_motion = now
+                if self.stuck_since is not None:
+                    self.stuck_total += now - self.stuck_since
+                    self.stuck_since = None
+        self.pose = new
+
+    def on_cmd(self, m):
+        now = time.monotonic()
+        if now - self.own_cmd_at < 0.05:
+            return                          # 自己发的，忽略
+        if abs(m.linear.x) > 0.02 or abs(m.angular.z) > 0.02:
+            self.last_foreign_cmd = now
+
+    def on_nav_state(self, m):
+        self.nav_state = (m.data or '').strip()
+
+    def on_status(self, m):
+        busy = False
+        for st in m.status_list:
+            if st.status in ACTIVE_STATUS:
+                busy = True
+                break
+        self.nav_busy = busy
+
+    def on_costmap(self, m):
+        self.costmap = m
+        self.costmap_stamp = time.monotonic()
+
+    # ---------------- 几何 ----------------
+    def rect_dist(self, x, y):
+        """点到车体矩形（x∈[x_min,x_max], y=±y_half）的距离，箱内为 0。"""
+        dx = self.x_min - x if x < self.x_min else (x - self.x_max if x > self.x_max else 0.0)
+        dy = -self.y_half - y if y < -self.y_half else (y - self.y_half if y > self.y_half else 0.0)
+        return math.hypot(dx, dy) if (dx or dy) else 0.0
+
+    def clearance_cone(self, offset, half_deg=14.0, stride=3):
+        """把点云按 -offset 转到"假定朝向"后，取 ±half_deg 扇区内的车体最小间隙。"""
+        c = math.cos(-offset)
+        s = math.sin(-offset)
+        half = math.radians(half_deg)
+        best = float('inf')
+        for i in range(0, len(self.points), stride):
+            x, y = self.points[i]
+            rx = c * x - s * y
+            ry = s * x + c * y
+            if abs(math.atan2(ry, rx)) > half:
+                continue
+            d = self.rect_dist(rx, ry)
+            if d < best:
+                best = d
+        return best if best < float('inf') else 9.0
+
+    def min_body_clearance(self, stride=2):
+        best = float('inf')
+        for i in range(0, len(self.points), stride):
+            d = self.rect_dist(*self.points[i])
+            if d < best:
+                best = d
+        return best if best < float('inf') else 9.0
+
+    def pick_heading(self):
+        """返回 (offset, clearance)；offset 为相对当前朝向的转角（限 ±heading_limit）。"""
+        best = None
+        off = -self.heading_limit
+        while off <= self.heading_limit + 1e-6:
+            clr = self.clearance_cone(off, half_deg=14.0, stride=4)
+            score = clr - 0.20 * abs(off)
+            if best is None or score > best[0]:
+                best = (score, off, clr)
+            off += 0.15
+        return best[1], best[2]
+
+    def footprint_cost(self):
+        """Nav2 局部代价地图上机器人所在格的代价（0..254），取不到返回 None。"""
+        cm = self.costmap
+        if cm is None or self.pose is None or time.monotonic() - self.costmap_stamp > 2.0:
+            return None
+        info = cm.metadata
+        res = info.resolution
+        if res <= 0:
+            return None
+        mx = int((self.pose[0] - info.origin.position.x) / res)
+        my = int((self.pose[1] - info.origin.position.y) / res)
+        if not (0 <= mx < info.size_x and 0 <= my < info.size_y):
+            return None
+        idx = my * info.size_x + mx
+        if idx >= len(cm.data):
+            return None
+        return int(cm.data[idx])
+
+    # ---------------- 主循环 ----------------
+    def check_progress_reset(self, now):
+        """真正走出去 0.5 m 才算脱困成功：清零受阻累计与单元预算。"""
+        if self.stuck_anchor is None or self.pose is None:
+            return
+        if now - self.last_motion < self.stall_sec:
+            return
+        if math.hypot(self.pose[0] - self.stuck_anchor[0],
+                      self.pose[1] - self.stuck_anchor[1]) >= 0.5:
+            self.stuck_total = 0.0
+            self.stuck_since = None
+            self.stuck_anchor = None
+            self.units_this_episode = 0
+
+    def tick(self):
+        now = time.monotonic()
+        self.check_progress_reset(now)
+        if self.phase in ('rotate', 'advance'):
+            self.drive_tick(now)
+            return
+        if self.phase == 'end':
+            self.finish_unit(now)
+            return
+        self.maybe_arm(now)
+
+    def maybe_arm(self, now):
+        if not self.enabled:
+            return
+        if now < self.disabled_until or now < self.spot_until:
+            return
+        if now - self.points_stamp > self.scan_stale_sec:
+            return
+        if self.pose is None:
+            return
+        blocked_state = any(t in self.nav_state.lower() for t in BLOCKED_TOKENS) \
+            and not any(t in self.nav_state.lower() for t in ('return',))
+        if not (self.nav_busy or blocked_state):
+            return
+        if self.nav_state.lower() in IDLE_NAV_STATES:
+            return
+        if now - self.last_foreign_cmd < self.cmd_quiet_sec:
+            return
+        if now - self.last_motion < self.stall_sec:
+            return
+        if self.units_this_episode >= self.max_units_per_episode:
+            return
+        # 受阻累计（跨导航目标持续累计，只有真正走出去 0.5 m 才清零）
+        if self.stuck_since is None:
+            self.stuck_since = now
+            if self.stuck_anchor is None:
+                self.stuck_anchor = self.pose[:2]
+        total = self.stuck_total + (now - self.stuck_since)
+        if total >= self.recovery_timeout_sec:
+            self.stats['giveups'] += 1
+            self.disabled_until = now + self.giveup_backoff_sec
+            self.mark_zone(now)
+            self.log(type='giveup_40s', total=round(total, 1),
+                     stuck_total=round(self.stuck_total, 1), nav=self.nav_state,
+                     note='恢复失败超时退出：停 %.0fs' % self.giveup_backoff_sec)
+            return
+        self.start_unit(now)
+
+    def start_unit(self, now):
+        offset, clr = self.pick_heading()
+        self.arm_clearance = self.clearance_cone(0.0, half_deg=14.0, stride=2)
+        self.arm_cost = self.footprint_cost()
+        if clr < self.min_advance_clearance:
+            self.stats['no_dir'] += 1
+            self.spot_until = now + self.degrade_backoff_sec
+            self.mark_zone(now)
+            self.log(type='no_direction', best_offset=round(offset, 2),
+                     best_clearance=round(clr, 3),
+                     arm_clearance=round(self.arm_clearance, 3),
+                     nav=self.nav_state,
+                     note='没有 >=%.2fm 的自由方向，不盲动' % self.min_advance_clearance)
+            return
+        self.stats['units'] += 1
+        self.units_this_episode += 1
+        self.phase = 'pick'
+        self.unit_t0 = now
+        self.unit_offset = offset
+        self.unit_remaining = offset
+        self.unit_moved = 0.0
+        self.unit_anchor = self.pose[:2]
+        self.unit_started_pos = self.pose[:2]
+        self.log(type='unit_start', offset=round(offset, 2),
+                 clearance=round(clr, 3),
+                 arm_clearance=round(self.arm_clearance, 3),
+                 cost=self.arm_cost, nav=self.nav_state,
+                 units_episode=self.units_this_episode,
+                 stuck_total=round(self.stuck_total, 1))
+        self.phase = 'rotate'
+
+    def drive_tick(self, now):
+        unit_dt = now - self.unit_t0
+        if now - self.last_foreign_cmd < 0.3 and now - self.own_cmd_at > 0.2:
+            self.abort_unit(now, 'foreign_cmd')
+            return
+        if unit_dt >= self.unit_max_sec:
+            self.end_unit(now, degraded=True)
+            return
+        if self.phase == 'rotate':
+            cur = self.min_body_clearance(stride=2)
+            if cur < self.rotate_min_clearance:
+                self.abort_unit(now, 'rotate_into_obstacle')
+                return
+            if abs(self.unit_remaining) < 0.10 or unit_dt >= self.rotate_budget_sec:
+                self.unit_remaining = 0.0
+                self.phase = 'advance'
+                return
+            sign = 1.0 if self.unit_remaining > 0.0 else -1.0
+            self.unit_remaining -= sign * self.rotate_speed * 0.1
+            self.publish(0.0, sign * self.rotate_speed)
+            return
+        # advance
+        fwd = self.clearance_cone(0.0, half_deg=20.0, stride=2)
+        if fwd <= self.advance_stop_clearance:
+            self.end_unit(now, degraded=False)
+            return
+        moved = math.hypot(self.pose[0] - self.unit_started_pos[0],
+                           self.pose[1] - self.unit_started_pos[1])
+        self.unit_moved = moved
+        if moved >= self.advance_max_m:
+            self.end_unit(now, degraded=False)
+            return
+        self.publish(self.advance_speed, 0.0)
+
+    def publish(self, vx, wz):
+        # 唯一的速度出口：只允许 vx >= 0（用户边界：脱困只能旋转+前进，不得后退）
+        if vx < 0.0:
+            vx = 0.0
+        self.cmd_pub.publish(Twist(linear=Vector3(x=float(vx), y=0.0, z=0.0),
+                                   angular=Vector3(x=0.0, y=0.0, z=float(wz))))
+        self.own_cmd_at = time.monotonic()
+
+    def end_unit(self, now, degraded):
+        self.publish(0.0, 0.0)
+        post_clear = self.clearance_cone(0.0, half_deg=20.0, stride=2)
+        post_cost = self.footprint_cost()
+        improved = False
+        if self.arm_clearance is not None and post_clear - self.arm_clearance >= self.clearance_gain:
+            improved = True
+        if (self.arm_cost is not None and post_cost is not None
+                and self.arm_cost - post_cost >= self.cost_gain):
+            improved = True
+        moved = 0.0
+        if self.unit_anchor is not None and self.pose is not None:
+            moved = math.hypot(self.pose[0] - self.unit_anchor[0],
+                               self.pose[1] - self.unit_anchor[1])
+        if improved:
+            self.stats['ok'] += 1
+        else:
+            self.stats['failed'] += 1
+            if degraded or moved < 0.02:
+                self.stats['degraded'] += 1
+                self.spot_until = now + self.degrade_backoff_sec
+                self.mark_zone(now)
+        self.log(type='unit_end', improved=improved, degraded=degraded,
+                 offset=round(self.unit_offset, 2), moved=round(moved, 3),
+                 arm_clearance=None if self.arm_clearance is None else round(self.arm_clearance, 3),
+                 post_clearance=round(post_clear, 3),
+                 arm_cost=self.arm_cost, post_cost=post_cost,
+                 dur=round(now - self.unit_t0, 1),
+                 unit_dt=round(now - self.unit_t0, 1),
+                 nav=self.nav_state, stats=dict(self.stats))
+        self.phase = 'idle'
+        self.unit_offset = 0.0
+        self.unit_remaining = 0.0
+        self.unit_anchor = None
+        self.arm_clearance = None
+        self.arm_cost = None
+        self.disabled_until = now + self.cooldown_sec
+
+    def abort_unit(self, now, why):
+        self.publish(0.0, 0.0)
+        self.stats['aborts'] += 1
+        self.log(type='unit_abort', why=why, dur=round(now - self.unit_t0, 2),
+                 nav=self.nav_state, stats=dict(self.stats))
+        self.phase = 'idle'
+        self.unit_offset = 0.0
+        self.unit_remaining = 0.0
+        self.arm_clearance = None
+        self.arm_cost = None
+        self.unit_anchor = None
+        self.disabled_until = now + self.cooldown_sec
+
+    def mark_zone(self, now):
+        if self.pose is None:
+            return
+        msg = PoseStamped()
+        msg.header.frame_id = 'map'
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.pose.position.x = float(self.pose[0])
+        msg.pose.position.y = float(self.pose[1])
+        msg.pose.orientation.w = 1.0
+        self.zone_pub.publish(msg)
+        # 让仲裁知道"这里别再来"
+        self.get_logger().warn(
+            '受阻区上报（脱困失败）：(%.2f, %.2f)' % (self.pose[0], self.pose[1]))
+
+    def destroy_node(self):
+        try:
+            self.publish(0.0, 0.0)
+        except Exception:
+            pass
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            except Exception:
+                pass
+        super().destroy_node()
+
+
+def main():
+    rclpy.init()
+    node = EscapeSupervisor()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

@@ -1,39 +1,79 @@
 #!/usr/bin/env bash
-# patch_sim_time —— 给车端未传 use_sim_time 的节点补运行时参数（仿真专用）。
-# 已确认：stemm_cartographer_mapping_tf_guard 在 launch 里没有 use_sim_time 参数，
-# 仿真里它会用墙钟 now() 与仿真的 TF 时间戳比较 → 30 s 内必判"TF 不新鲜"。
-# 这里以 0.5 s 间隔重试，直到参数设置成功或超时（默认 30 s）。
+# patch_sim_time —— 车端栈的"仿真运行期参数补丁"（不改车端源码，只用 ros2 param set）。
+#
+# 分三个阶段，互不阻断（早期版本在阶段 1 成功后直接 exit，导致阶段 2/3 有时根本没执行）：
+#   阶段 1  use_sim_time：车端 launch 里有 5 个节点没传，仿真里必须补，否则它们用墙钟和
+#           仿真的 TF 时间戳比较（mapping_tf_guard 会在 30 s 内必判"TF 不新鲜"）。
+#   阶段 2  Nav2 容忍度/目标容差：细时钟带来毫秒级"未来"查询，放宽 transform_tolerance；
+#           controller 的目标容差放宽，避免返航末段姿态对齐拖死收尾。
+#   阶段 3  P0：关掉车端所有"盲退"（用户 2026-10-23 边界：脱困只能旋转+前进）。
+#           车端唯一的反向速度发布点是 cartographer_manager._retreat_from_occupied_cells，
+#           由 exploration_retreat_enabled / return_home_retreat_enabled 两个闸门控制，
+#           另有 blocked_retreat_max_per_session 限次数。运行期全部置 0/False 即可停止盲退，
+#           改由仿真侧 escape_supervisor（雷达引导的旋转+前进）接管。
 set +u
 source /opt/ros/humble/setup.bash
 source /home/kbf/stemm_sim_ws/install/setup.bash
 source /home/kbf/stemm_explore_ws/install/setup.bash
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-42}"
-# 车端 launch 里有若干节点没传 use_sim_time；仿真里必须补，否则它们用墙钟与仿真的 TF/时间戳比较
-TARGETS="${1:-/stemm_cartographer_mapping_tf_guard /stemm_cartographer_nav2_manager /stemm_cartographer_odom_session_guard /stemm_cartographer_state_saver /stemm_cartographer_map_service_adapter}"
-DEADLINE=$(( $(date +%s) + ${2:-30} ))
+
+MGR=/stemm_cartographer_nav2_manager
+DEADLINE=$(( $(date +%s) + 40 ))
+DISABLE_RETREAT="${1:-1}"   # 1=阶段3生效（P0 默认）；0=保留车端盲退（对照基线用）
+DISABLE_RETREAT="${1:-1}"   # 1=阶段3生效（P0），0=保留车端盲退（对照基线）
+
+set_param() {   # $1=node $2=name $3=value  → 成功返回 0
+  ros2 param set "$1" "$2" "$3" >/dev/null 2>&1
+}
+
+# ---------------- 阶段 1：use_sim_time ----------------
+TARGETS="/stemm_cartographer_mapping_tf_guard $MGR /stemm_cartographer_odom_session_guard /stemm_cartographer_state_saver /stemm_cartographer_map_service_adapter"
 DONE=""
 while [ "$(date +%s)" -lt "$DEADLINE" ]; do
-  for TARGET in $TARGETS; do
-    case " $DONE " in *" $TARGET "*) continue ;; esac
-    OUT=$(ros2 param set "$TARGET" use_sim_time true 2>&1)
-    case "$OUT" in
-      *"True"*) DONE="$DONE $TARGET"; echo "[patch_sim_time] ${TARGET} ✓" ;;
-    esac
+  for T in $TARGETS; do
+    case " $DONE " in *" $T "*) continue ;; esac
+    set_param "$T" use_sim_time true && { DONE="$DONE $T"; echo "[patch] $T use_sim_time=true ✓"; }
   done
   n=0; for t in $TARGETS; do case " $DONE " in *" $t "*) n=$((n+1));; esac; done
-  [ "$n" -eq "$(echo $TARGETS | wc -w)" ] && { echo "[patch_sim_time] 全部完成"; exit 0; }
+  [ "$n" -eq 5 ] && break
   sleep 0.5
 done
-# 前沿仲裁：manager 改订阅仲裁输出（S1，无侵入）
-ros2 param set /stemm_cartographer_nav2_manager frontier_goal_topic /validated_frontier_goal >/dev/null 2>&1 \
-  && echo "[patch_sim_time] manager frontier_goal_topic -> /validated_frontier_goal ✓"
-# Nav2 容忍度：仿真里细时钟会带来几毫秒级"未来"查询，放宽 transform_tolerance
-for N in /controller_server /planner_server /bt_navigator /behavior_server /global_costmap/global_costmap /local_costmap/local_costmap; do
-  ros2 param set "$N" transform_tolerance 0.5 >/dev/null 2>&1 && echo "[patch_sim_time] ${N} transform_tolerance=0.5 ✓"
+echo "[patch] 阶段1 use_sim_time：$n/5"
+
+# ---------------- 阶段 2：仿真适配 ----------------
+retry_until() {   # $1=seconds $2=node $3=param $4=value
+  local end=$(( $(date +%s) + $1 ))
+  while [ "$(date +%s)" -lt "$end" ]; do
+    set_param "$2" "$3" "$4" && { echo "[patch] $2 $3=$4 ✓"; return 0; }
+    sleep 0.5
+  done
+  echo "[patch] $2 $3=$4 ✗（超时）"; return 1
+}
+
+retry_until 40 "$MGR" frontier_goal_topic /validated_frontier_goal
+for N in /controller_server /planner_server /bt_navigator /behavior_server \
+         /global_costmap/global_costmap /local_costmap/local_costmap; do
+  retry_until 10 "$N" transform_tolerance 0.5
 done
-# 车端 return_home 的末段姿态对齐有 25 s 上限；仿真控制器末端易小幅摆动，
-# 放宽 Nav2 的目标容差让 BT 能更早宣告成功（仅仿真侧运行时参数）
-ros2 param set /controller_server yaw_goal_tolerance 0.15   >/dev/null 2>&1 && echo "[patch_sim_time] controller_server yaw_goal_tolerance=0.15 ✓"
-ros2 param set /controller_server xy_goal_tolerance 0.15    >/dev/null 2>&1 && echo "[patch_sim_time] controller_server xy_goal_tolerance=0.15 ✓"
-ros2 param set /controller_server xy_goal_tolerance 0.15    >/dev/null 2>&1
-echo "[patch_sim_time] 部分未成功：$DONE"; exit 0
+retry_until 10 /controller_server yaw_goal_tolerance 0.15
+retry_until 10 /controller_server xy_goal_tolerance 0.15
+
+# ---------------- 阶段 3（P0）：关闭车端所有盲退 ----------------
+if [ "$DISABLE_RETREAT" != "1" ]; then
+  echo "[patch] 阶段3 跳过（DISABLE_RETREAT=$DISABLE_RETREAT，对照基线保留车端盲退）"
+  exit 0
+fi
+retry_until 20 "$MGR" exploration_retreat_enabled false
+retry_until 5  "$MGR" return_home_retreat_enabled false
+retry_until 5  "$MGR" return_home_failure_retreat_enabled false
+retry_until 5  "$MGR" blocked_retreat_max_per_session 0
+# 车端 stemm_escape_controller 只会"原地转到底"，仿真侧 escape_supervisor 是它的超集
+# （同样只用雷达、同样绝不后退，但会转向最空旷方向并前进一小段）。两者同时跑会互相抢
+# /cmd_vel，故此处把车端那个置 enabled=false；想对比时用 disable_car_escape:=0。
+if [ "${DISABLE_CAR_ESCAPE:-1}" = "1" ]; then
+  retry_until 15 /stemm_escape_controller enabled false
+else
+  echo "[patch] 保留车端 escape_controller（DISABLE_CAR_ESCAPE=0）"
+fi
+echo "[patch] 阶段3 盲退关闭完成（exploration/return_home/failure + blocked_retreat_max_per_session=0）"
+exit 0

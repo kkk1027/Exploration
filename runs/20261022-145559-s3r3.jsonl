@@ -1,0 +1,6 @@
+{"ts":"2026-10-22T14:55:59+08:00","tag":"s3r3",""check":"pre_launch","nodes":38,"gzserver":0,"residue":"27505 27509 27511 27513 27515 ""}
+{"ts":"2026-10-22T14:56:05+08:00","tag":"s3r3",""check":"post_cleanup","nodes":38,"gzserver":0,"residue":"""}
+{"ts":"2026-10-22T14:56:05+08:00","tag":"s3r3",""check":"pose","x":-0.4,"y":-0.3,"yaw":0.7854"}
+{"ts":"2026-10-22T14:56:08+08:00","tag":"s3r3",""check":"launch","pgid":"28729""}
+{"ts":"2026-10-22T15:03:42+08:00","tag":"s3r3",""check":"post_teardown","nodes":6,"gzserver":0,"residue":"""}
+{"ts":"2026-10-22T15:03:42+08:00","tag":"s3r3",""verdict":"PASS_clean""}

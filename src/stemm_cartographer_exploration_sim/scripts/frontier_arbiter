@@ -49,6 +49,12 @@ class Arbiter(Node):
         self.repub = float(p('republish_sec', 8.0).value)
         self.path_timeout = float(p('path_timeout_sec', 4.0).value)
         self.frame = str(p('frame_id', 'map').value)
+        # P0-4：前向净空预检——必须穿过窄缝才能到达的候选直接丢弃
+        self.corridor_check = bool(p('corridor_check', True).value)
+        self.corridor_width = float(p('corridor_width_m', 0.90).value)
+        self.corridor_skip_far = float(p('corridor_skip_far_m', 1.2).value)
+        self.corridor_stride = max(1, int(p('corridor_stride_cells', 2).value))
+        self.narrow_penalty_sec = float(p('narrow_blacklist_sec', 45.0).value)
 
         self.map = None
         self.pose = None
@@ -62,7 +68,9 @@ class Arbiter(Node):
         self.stuck_zones = []     # [(x, y, expire)]
         self._stuck_ref = None    # (t, x, y)
         self.stats = {'seen': 0, 'rejected_size': 0, 'rejected_path': 0,
-                      'rejected_black': 0, 'published': 0}
+                      'rejected_black': 0, 'published': 0,
+                      'rejected_narrow': 0, 'narrow_fallback': 0,
+                      'escape_zones': 0}
 
         qmap = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                           durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -79,6 +87,8 @@ class Arbiter(Node):
         self.pub = self.create_publisher(PoseStamped, '/validated_frontier_goal', 10)
         self.costmap = None
         self.create_subscription(OccupancyGrid, '/global_costmap/costmap', self.on_costmap, qmap)
+        # P0-3 的脱困监督会把"这里脱困失败"发过来，作为受阻区降权
+        self.create_subscription(PoseStamped, '/escape_blocked_zone', self.on_escape_zone, 10)
         self.create_timer(1.0, self.tick)
         self.get_logger().info('frontier_arbiter 就绪：可达性预筛/黑名单/最小前沿/回拉')
 
@@ -112,6 +122,16 @@ class Arbiter(Node):
                     self.stuck_zones = self.stuck_zones[-15:]
                 self.get_logger().warn(
                     f'受阻区记录（事件驱动 {txt[:24]}）：({self.pose[0]:.2f},{self.pose[1]:.2f})')
+
+    def on_escape_zone(self, m):
+        now = time.monotonic()
+        self.stuck_zones.append((m.pose.position.x, m.pose.position.y, now + self.bl_sec))
+        if len(self.stuck_zones) > 15:
+            self.stuck_zones = self.stuck_zones[-15:]
+        self.stats['escape_zones'] = self.stats.get('escape_zones', 0) + 1
+        self.get_logger().warn(
+            '脱困失败受阻区（监督节点上报）：(%.2f,%.2f)'
+            % (m.pose.position.x, m.pose.position.y))
 
     def on_costmap(self, m):
         self.costmap = m
@@ -152,6 +172,108 @@ class Arbiter(Node):
                     seen[idx] = 1
                     q.append((nx, ny))
         return False
+
+    def path_and_width(self, x, y):
+        """BFS 出整条路径，再沿路径查"垂直于路径的连续自由宽度"。
+
+        返回 (reachable, narrow_at)。narrow_at 为第一处走廊宽度不足的格子坐标。
+        判据：路径上任一点，垂直方向上连续自由格（<90 且已知）的总长必须 >= corridor_width，
+        以免把目标派到"必须挤过窄缝"的地方 —— 这正是反复楔死的来源。
+        """
+        cm = self.costmap
+        if cm is None or self.pose is None:
+            return True, None
+        info = cm.info
+        res = info.resolution
+        if res <= 0:
+            return True, None
+        w, h = info.width, info.height
+        ox, oy = info.origin.position.x, info.origin.position.y
+        data = cm.data
+        sx = int((self.pose[0] - ox) / res)
+        sy = int((self.pose[1] - oy) / res)
+        gx = int((x - ox) / res)
+        gy = int((y - oy) / res)
+        if not (0 <= sx < w and 0 <= sy < h) or not (0 <= gx < w and 0 <= gy < h):
+            return False, None
+        if data[gy * w + gx] < 0 or data[gy * w + gx] >= 90:
+            return False, None
+        from collections import deque
+        parent = {}
+        seen = bytearray(w * h)
+        start = sy * w + sx
+        seen[start] = 1
+        q = deque([(sx, sy)])
+        budget = 80000
+        found = False
+        while q and budget > 0:
+            cx, cy = q.popleft(); budget -= 1
+            if cx == gx and cy == gy:
+                found = True
+                break
+            for nx, ny in ((cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1)):
+                if 0 <= nx < w and 0 <= ny < h:
+                    idx = ny * w + nx
+                    if seen[idx]:
+                        continue
+                    v = data[idx]
+                    if v < 0 or v >= 90:
+                        continue
+                    seen[idx] = 1
+                    parent[idx] = cy * w + cx
+                    q.append((nx, ny))
+        if not found:
+            return False, None
+        if not self.corridor_check:
+            return True, None
+        # 回溯路径
+        path = []
+        cur = gy * w + gx
+        while cur != start:
+            path.append(cur)
+            cur = parent.get(cur)
+            if cur is None:
+                break
+        path.reverse()
+        need = self.corridor_width
+        skip = int(self.corridor_skip_far / res)
+        half = int(need / res / 2) + 1
+        for i in range(0, max(0, len(path) - skip), self.corridor_stride):
+            idx = path[i]
+            cx, cy = idx % w, idx // w
+            # 用父节点方向求切向，再取垂直方向
+            par = parent.get(idx)
+            if par is None:
+                tx, ty = 1, 0
+            else:
+                tx, ty = cx - par % w, cy - par // w
+            n = math.hypot(tx, ty) or 1.0
+            px, py = -ty / n, tx / n        # 垂直方向
+            # 以该点为中心向两侧扩展，统计连续自由格总长
+            free_lo = 0
+            k = 1
+            while k <= half:
+                mx = int(round(cx + px * k)); my = int(round(cy + py * k))
+                if not (0 <= mx < w and 0 <= my < h):
+                    break
+                v = data[my * w + mx]
+                if v < 0 or v >= 90:
+                    break
+                free_lo = k; k += 1
+            free_hi = 0
+            k = 1
+            while k <= half:
+                mx = int(round(cx - px * k)); my = int(round(cy - py * k))
+                if not (0 <= mx < w and 0 <= my < h):
+                    break
+                v = data[my * w + mx]
+                if v < 0 or v >= 90:
+                    break
+                free_hi = k; k += 1
+            width = (free_lo + free_hi + 1) * res
+            if width < need:
+                return True, (cx * res + ox, cy * res + oy)
+        return True, None
 
     def on_odom(self, m):
         q = m.pose.pose.position
@@ -267,24 +389,48 @@ class Arbiter(Node):
             u_eff = u - self._stuck_penalty(x, y, now)
             scored.append((u_eff, -math.hypot(x - self.pose[0], y - self.pose[1]), x, y))
         scored.sort(reverse=True)
+        fallback = None
         for u, negd, x, y in scored[:self.max_cand]:
             gx, gy = self.pull_back(x, y)
-            if self.reachable(gx, gy):
-                msg = PoseStamped()
-                msg.header.frame_id = self.frame
-                msg.header.stamp = self.get_clock().now().to_msg()
-                msg.pose.position.x, msg.pose.position.y = gx, gy
-                msg.pose.orientation.w = 1.0
-                self.pub.publish(msg)
-                self.last_pub = now
-                self.last_goal = (gx, gy)
-                self.stats['published'] += 1
+            ok, narrow = self.path_and_width(gx, gy)
+            if not ok:
+                self.blacklist.append((gx, gy, now + self.bl_sec))
+                self.stats['rejected_path'] += 1
+                continue
+            if narrow is not None:
+                # P0-4：必须挤过窄缝才能到的目标直接丢弃（这是楔死的来源）
+                self.stats['rejected_narrow'] += 1
+                self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
+                if fallback is None:
+                    fallback = (gx, gy)
                 self.get_logger().info(
-                    f'仲裁通过：未知格 {u}，目标 ({gx:.2f},{gy:.2f})；统计 {self.stats}')
-                return
-            self.blacklist.append((gx, gy, now + self.bl_sec))
-            self.stats['rejected_path'] += 1
+                    '前向净空预检否决：走廊 < %.2fm @(%.2f,%.2f)，目标 (%.2f,%.2f)'
+                    % (self.corridor_width, narrow[0], narrow[1], gx, gy))
+                continue
+            self.publish_goal(gx, gy, u)
+            return
+        if fallback is not None:
+            # 全部需要穿窄缝：宁可走一次也不让探索停摆（liveness 兜底，有统计可查）
+            self.stats['narrow_fallback'] += 1
+            self.get_logger().warn(
+                '候选全部需要穿窄缝，回退派发最优点 (%.2f,%.2f)；统计 %s'
+                % (fallback[0], fallback[1], self.stats))
+            self.publish_goal(fallback[0], fallback[1], 0)
+            return
         self.get_logger().warn(f'本轮候选全部被拒：{self.stats}')
+
+    def publish_goal(self, gx, gy, u):
+        msg = PoseStamped()
+        msg.header.frame_id = self.frame
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.pose.position.x, msg.pose.position.y = gx, gy
+        msg.pose.orientation.w = 1.0
+        self.pub.publish(msg)
+        self.last_pub = time.monotonic()
+        self.last_goal = (gx, gy)
+        self.stats['published'] += 1
+        self.get_logger().info(
+            f'仲裁通过：未知格 {u}，目标 ({gx:.2f},{gy:.2f})；统计 {self.stats}')
 
     def on_path_result(self, fut, gx, gy, u):
         self.pending = None

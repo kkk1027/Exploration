@@ -59,7 +59,8 @@ def generate_launch_description():
     # 与栈同时启动的运行时参数补丁（独立进程，0.5 s 重试，抢在 guard 的 30 s 判定前落地）
     patch_sim_time = ExecuteProcess(
         cmd=[os.path.join(get_package_prefix('stemm_cartographer_exploration_sim'),
-                          'lib', 'stemm_cartographer_exploration_sim', 'patch_sim_time')],
+                          'lib', 'stemm_cartographer_exploration_sim', 'patch_sim_time'),
+             LaunchConfiguration('disable_retreat')],
         output='screen')
 
     rviz = Node(package='rviz2', executable='rviz2', name='rviz2', output='screen',
@@ -72,6 +73,21 @@ def generate_launch_description():
                    parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time'),
                                 'republish_sec': 1.5, 'max_candidates': 6,
                                 'blacklist_sec': 30.0, 'blacklist_radius': 0.5}])
+
+    # P0-1：撞障取证（只读）。与机器人层同时启动，覆盖整轮（含启动期）。
+    probe = Node(package='stemm_cartographer_exploration_sim',
+                 executable='collision_probe', name='collision_probe',
+                 output='screen',
+                 parameters=[{'use_sim_time': use_sim_time,
+                              'log_path': LaunchConfiguration('probe_log')}])
+
+    # P0-3：雷达引导的"旋转 + 前进"脱困（与栈同时起，等车端节点就绪后自行等待触发）
+    supervisor = Node(package='stemm_cartographer_exploration_sim',
+                      executable='escape_supervisor', name='escape_supervisor',
+                      output='screen',
+                      parameters=[{'use_sim_time': use_sim_time,
+                                   'enabled': LaunchConfiguration('escape_supervisor'),
+                                   'log_path': LaunchConfiguration('supervisor_log')}])
 
     driver = Node(
         package='stemm_cartographer_exploration_sim',
@@ -103,11 +119,20 @@ def generate_launch_description():
         DeclareLaunchArgument('use_sim_time', default_value='true'),
         DeclareLaunchArgument('map_out', default_value=os.path.expanduser(
             '~/stemm_sim_ws/maps/explore_latest')),
+        DeclareLaunchArgument('probe_log', default_value='',
+            description='撞障取证 JSONL 路径（空=只打日志）'),
+        DeclareLaunchArgument('supervisor_log', default_value='',
+            description='脱困监督 JSONL 路径（空=只打日志）'),
+        DeclareLaunchArgument('escape_supervisor', default_value='true',
+            description='是否启用雷达引导的旋转+前进脱困（P0）'),
+        DeclareLaunchArgument('disable_retreat', default_value='1',
+            description='1=运行期关闭车端盲退（P0 默认）；0=保留（对照基线）'),
         DeclareLaunchArgument(
             'stack_delay', default_value='65.0',
             description='探索栈延迟启动秒数：Gazebo 里机器人 spawn + EKF 出 odom_combined '
                         '约需 30~40 s，而探索栈内的 mapping_tf_guard 只有 30 s 超时'),
         robot,
-        TimerAction(period=stack_delay, actions=[stack, patch_sim_time, arbiter]),
+        probe,
+        TimerAction(period=stack_delay, actions=[stack, patch_sim_time, arbiter, supervisor]),
         TimerAction(period=stack_delay, actions=[driver]),
         rviz])

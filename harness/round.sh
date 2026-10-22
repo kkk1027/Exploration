@@ -48,7 +48,12 @@ say "本轮随机起点：x=$SX y=$SY yaw=$SYAW"
 rec "\"check\":\"pose\",\"x\":$SX,\"y\":$SY,\"yaw\":$SYAW"
 
 # ---- 2) 启动（记录真实 PGID） ----
-setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE spawn_x:=$SX spawn_y:=$SY spawn_yaw:=$SYAW" \
+# P0 变体开关（默认=改造后：关盲退 + 开脱困监督）
+DISABLE_RETREAT="${DISABLE_RETREAT:-1}"
+SUPERVISOR="${SUPERVISOR:-true}"
+say "P0 变体：disable_retreat=$DISABLE_RETREAT escape_supervisor=$SUPERVISOR"
+rec "\"check\":\"variant\",\"disable_retreat\":$DISABLE_RETREAT,\"supervisor\":\"$SUPERVISOR\""
+setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE spawn_x:=$SX spawn_y:=$SY spawn_yaw:=$SYAW disable_retreat:=$DISABLE_RETREAT escape_supervisor:=$SUPERVISOR probe_log:=$OUT/probe.jsonl supervisor_log:=$OUT/supervisor.jsonl" \
   > "$OUT/launch.log" 2>&1 < /dev/null &
 sleep 3; PGID=$(cat "$OUT/pgid" 2>/dev/null || echo "")
 say "已启动：PGID=$PGID  日志 $OUT/launch.log"
@@ -84,4 +89,43 @@ RES=$(pgrep -af "cartographer_node|sim_session_driver|controller_server|planner_
 say "收尾后：ROS 节点数=$NODES  gzserver=$GZ  残留=[${RES}]"
 rec "\"check\":\"post_teardown\",\"nodes\":$NODES,\"gzserver\":$GZ,\"residue\":\"${RES}\""
 [ "$GZ" = "0" ] && [ -z "$RES" ] && rec '"verdict":"PASS_clean"' || rec '"verdict":"FAIL_residue"'
+
+# ---- 4) 撞障取证汇总（P0）----
+if [ -f "$OUT/probe.jsonl" ]; then
+  python3 - "$OUT/probe.jsonl" "$J" <<'PYEOF'
+import json, sys, collections
+src, jout = sys.argv[1], sys.argv[2]
+c = collections.Counter(); mind = None; rev = []
+for line in open(src, encoding='utf-8', errors='ignore'):
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        r = json.loads(line)
+    except Exception:
+        continue
+    t = r.get('type')
+    if t in ('contact', 'graze', 'alert', 'stall', 'giveup', 'no_direction'):
+        c[t] += 1
+    if t == 'reverse':
+        if r.get('phase') == 'end':
+            rev.append(r)
+    for k in ('min_d', 'min_d_now', 'min_d_ever'):
+        v = r.get(k)
+        if isinstance(v, (int, float)) and v >= 0 and (mind is None or v < mind):
+            mind = v
+summary = {'contacts': c['contact'], 'grazes': c['graze'], 'alerts': c['alert'],
+           'stalls': c['stall'], 'reverse_windows': len(rev),
+           'reverse_m': round(sum(x.get('dist', 0.0) for x in rev), 3),
+           'min_clearance_ever': round(mind, 3) if mind is not None else None}
+line = '{"tag":"%s","check":"collision","%s"}' % (jout.rsplit('/', 1)[-1], '')
+with open(jout, 'a') as f:
+    f.write('{"check":"collision","summary":%s}\n' % json.dumps(summary, ensure_ascii=False))
+print('[collision] ' + json.dumps(summary, ensure_ascii=False))
+PYEOF
+fi
+if [ -f "$OUT/supervisor.jsonl" ]; then
+  echo "[supervisor] 事件汇总：" 
+  grep -o '"type": "[a-z_0-9]*"' "$OUT/supervisor.jsonl" | sort | uniq -c || true
+fi
 echo "JSONL: $J"

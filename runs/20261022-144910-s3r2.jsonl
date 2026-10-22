@@ -1,3 +1,5 @@
 {"ts":"2026-10-22T14:49:10+08:00","tag":"s3r2",""check":"pre_launch","nodes":0,"gzserver":0,"residue":"""}
 {"ts":"2026-10-22T14:49:10+08:00","tag":"s3r2",""check":"pose","x":-0.4,"y":-0.3,"yaw":0.7854"}
 {"ts":"2026-10-22T14:49:13+08:00","tag":"s3r2",""check":"launch","pgid":"26784""}
+{"ts":"2026-10-22T14:56:17+08:00","tag":"s3r2",""check":"post_teardown","nodes":22,"gzserver":1,"residue":"28741 28743 ""}
+{"ts":"2026-10-22T14:56:17+08:00","tag":"s3r2",""verdict":"FAIL_residue""}

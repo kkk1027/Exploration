@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+"""collision_probe —— 撞障取证（P0-1）。
+
+为什么要它
+----------
+用户反馈"近两次探索都出现明显撞障"，但整套栈里没有任何一处能回答"到底撞了没有、撞在哪"：
+Nav2 的 footprint 判定是基于代价地图的（膨胀层），车端 escape controller 用的是同一份代价，
+二者在"已经贴上去"时都只能给出 253/254 这种饱和值，无法区分"靠近"与"顶上"。
+所以先做测量：一条独立、只读的取证节点。
+
+三条口径（同时输出，互不替代）
+------------------------------
+1) contact     物理真值：Gazebo 底盘接触传感器（/chassis_contacts）有接触 → 一定撞了。
+               另外把"雷达观测到的车体最小间隙 <= 1 cm"也算 contact（雷达口径，弥补无接触
+               传感器时的兜底）。
+2) graze       近失：车体（含轮子外沿）到最近障碍点的间隙 <= 5 cm。撞障前必然先经过这一档。
+3) circ_alert  用户口径：最近障碍点距车体原点 <= 外接圆半径 + 1 cm（0.370+0.01 = 0.380 m）。
+               这一条最保守，用于确认"车体已进入外接圆"这类危险姿态。
+
+车体几何（与 URDF 一致，base_footprint 原点在轮轴中心）
+------------------------------------------------------
+  底盘盒 0.45 x 0.36，中心 x=+0.065  →  x ∈ [-0.16, +0.29]
+  驱动轮外沿 y=±0.23，前万向轮 x=+0.25
+  雷达安装 (x=+0.24, z=0.225)，frame=laser，/scan_raw 是 360° 全向（真机 /scan 才裁盲区）
+  ⇒ 车体外接圆半径 = hypot(0.29, 0.23) = 0.370 m
+
+注意雷达的近距盲区：min_range=0.15 m，盲盘是以雷达为心半径 0.15 m 的圆，正前方覆盖到
+x≈0.39，所以"正面顶墙"在雷达数据里可能根本不可见。这正是必须同时上接触传感器的原因。
+
+输出
+----
+  /collision/min_clearance   (std_msgs/Float32)  车体到最近障碍点的间隙（m，负数=已进入车体）
+  /collision/contact         (std_msgs/Bool)     当前是否处于接触
+  /collision/summary         (std_msgs/String)   JSON 计数摘要（10 Hz）
+  输入 /bumper_states        (gazebo_msgs/ContactsState) 底盘接触传感器（物理真值）
+  JSONL 事件（log_path 非空时）：contact / graze / circ_alert / reverse / stall / summary
+"""
+import json
+import math
+import time
+
+import rclpy
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+from rclpy.node import Node
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import LaserScan
+from std_msgs.msg import Bool, Float32, String
+
+try:                                    # 只有仿真里才有 Gazebo 接触传感器
+    from gazebo_msgs.msg import ContactsState
+except Exception:                       # pragma: no cover
+    ContactsState = None
+
+
+def clamp(v, lo, hi):
+    return lo if v < lo else hi if v > hi else v
+
+
+def yaw_of(q):
+    return math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                      1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+
+
+class CollisionProbe(Node):
+    def __init__(self):
+        super().__init__('collision_probe')
+        p = self.declare_parameter
+        self.scan_topic = str(p('scan_topic', '/scan_raw').value)
+        self.odom_topic = str(p('odom_topic', '/odom_combined').value)
+        self.cmd_topic = str(p('cmd_topic', '/cmd_vel').value)
+        # Gazebo 的 gazebo_ros_bumper 在命名空间 / 下用相对名 bumper_states 发布，
+        # 实测 <bumper_topic_name>/<remapping> 都不生效，故直接订阅 /bumper_states。
+        self.contact_topic = str(p('contact_topic', '/bumper_states').value)
+        self.nav_state_topic = str(p('nav_state_topic',
+                                     '/stemm_cartographer/nav_state').value)
+        # 车体几何（base_footprint 坐标系）
+        self.x_min = float(p('body_x_min', -0.16).value)
+        self.x_max = float(p('body_x_max', 0.29).value)
+        self.y_half = float(p('body_half_width', 0.23).value)
+        self.laser_x = float(p('laser_x', 0.24).value)
+        self.contact_margin = float(p('contact_margin', 0.01).value)
+        self.graze_margin = float(p('graze_margin', 0.05).value)
+        self.circ_radius = math.hypot(self.x_max, self.y_half)
+        self.circ_margin = float(p('circ_margin', 0.01).value)
+        self.log_path = str(p('log_path', '').value)
+        self.summary_period = float(p('summary_period', 10.0).value)
+        self.event_min_interval = float(p('event_min_interval', 1.0).value)
+
+        self.pose = None            # (x, y, yaw) odom
+        self.cmd = (0.0, 0.0)
+        self.nav_state = ''
+        self.min_d = None
+        self.circ_d = None
+        self.bearing = None
+        self.scan_stamp = 0.0
+        self.bumper_until = 0.0
+        self.bumper_last = None
+
+        self.stats = {'contacts': 0, 'grazes': 0, 'alerts': 0, 'bumpers': 0,
+                      'reverse_windows': 0, 'reverse_secs': 0.0,
+                      'reverse_dist': 0.0, 'forward_secs': 0.0,
+                      'stalls': 0}
+        self.min_d_ever = None
+        self.circ_ever = None
+        # 事件状态机
+        self._in_contact = False
+        self._in_graze = False
+        self._in_alert = False
+        self._last_event = {'contact': 0.0, 'graze': 0.0, 'alert': 0.0}
+        # 后退窗口
+        self._rev_start = None
+        self._rev_odom = None
+        self._rev_dist = 0.0
+        # 停滞（有前进指令但不动）
+        self._stall_from = None
+        self._stall_pose = None
+
+        self._fh = open(self.log_path, 'a', buffering=1) if self.log_path else None
+        self.get_logger().info(
+            'collision_probe up: body x[%.2f,%.2f] y±%.2f laser_x=%.2f '
+            'circ_r=%.3f contact<=%.3f graze<=%.3f log=%s'
+            % (self.x_min, self.x_max, self.y_half, self.laser_x,
+               self.circ_radius, self.contact_margin, self.graze_margin,
+               self.log_path or '(none)'))
+
+        self.create_subscription(LaserScan, self.scan_topic, self.on_scan,
+                                 qos_profile_sensor_data)
+        self.create_subscription(Odometry, self.odom_topic, self.on_odom, 20)
+        self.create_subscription(Twist, self.cmd_topic, self.on_cmd, 20)
+        self.create_subscription(String, self.nav_state_topic, self.on_nav, 10)
+        if ContactsState is not None:
+            self.create_subscription(ContactsState, self.contact_topic,
+                                     self.on_bumper, 10)
+        self.pub_min = self.create_publisher(Float32, '/collision/min_clearance', 10)
+        self.pub_contact = self.create_publisher(Bool, '/collision/contact', 10)
+        self.pub_summary = self.create_publisher(String, '/collision/summary', 10)
+        self.create_timer(0.2, self.tick)
+        self.create_timer(self.summary_period, self.summary)
+
+    # ---------------- 日志 ----------------
+    def log(self, rec):
+        rec.setdefault('t', round(time.monotonic(), 3))
+        rec.setdefault('sim', round(self.now_stamp(), 3))
+        if self._fh is not None:
+            self._fh.write(json.dumps(rec, ensure_ascii=False) + '\n')
+        else:
+            self.get_logger().info(json.dumps(rec, ensure_ascii=False))
+
+    def now_stamp(self):
+        try:
+            return self.get_clock().now().nanoseconds / 1e9
+        except Exception:
+            return 0.0
+
+    # ---------------- 输入 ----------------
+    def on_odom(self, m):
+        q = m.pose.pose
+        self.pose = (q.position.x, q.position.y, yaw_of(q.orientation))
+        if self._rev_start is not None and self._rev_odom is not None:
+            self._rev_dist += math.hypot(self.pose[0] - self._rev_odom[0],
+                                         self.pose[1] - self._rev_odom[1])
+        self._rev_odom = (self.pose[0], self.pose[1])
+
+    def on_cmd(self, m):
+        self.cmd = (m.linear.x, m.angular.z)
+        now = time.monotonic()
+        # 后退窗口：linear.x < -0.02 —— 用户要求"任何情况下不得后退"，这里做取证
+        if m.linear.x < -0.02:
+            if self._rev_start is None:
+                self._rev_start = now
+                self._rev_odom = (self.pose[0], self.pose[1]) if self.pose else None
+                self._rev_dist = 0.0
+                self.stats['reverse_windows'] += 1
+                self.log({'type': 'reverse', 'phase': 'begin', 'vx': m.linear.x})
+        else:
+            if self._rev_start is not None:
+                dur = now - self._rev_start
+                self.stats['reverse_secs'] += dur
+                self.stats['reverse_dist'] += self._rev_dist
+                self.log({'type': 'reverse', 'phase': 'end',
+                          'dur': round(dur, 2), 'dist': round(self._rev_dist, 3),
+                          'pos': [round(v, 2) for v in (self.pose or (0, 0, 0))[:2]],
+                          'nav': self.nav_state})
+                self._rev_start = None
+
+    def on_nav(self, m):
+        self.nav_state = m.data or ''
+
+    def on_bumper(self, m):
+        if not m.states:
+            return
+        now = time.monotonic()
+        self.bumper_until = now + 0.3
+        name = m.states[0].collision1_name + '|' + m.states[0].collision2_name
+        if self.bumper_last != name or now - self._last_event['contact'] > self.event_min_interval:
+            self.bumper_last = name
+            self.stats['bumpers'] += 1
+            self._last_event['contact'] = now
+            self.log({'type': 'contact', 'src': 'bumper', 'pair': name,
+                      'n': len(m.states),
+                      'pos': [round(v, 2) for v in (self.pose or (0, 0, 0))[:2]],
+                      'yaw': round(self.pose[2], 2) if self.pose else None,
+                      'nav': self.nav_state,
+                      'cmd': [round(self.cmd[0], 3), round(self.cmd[1], 3)]})
+
+    def on_scan(self, m):
+        if not m.ranges:
+            return
+        xmin, xmax, yh = self.x_min, self.x_max, self.y_half
+        lx = self.laser_x
+        a = m.angle_min
+        da = m.angle_increment
+        min_d = float('inf')
+        min_circ = float('inf')
+        min_bearing = 0.0
+        r_lo = max(0.0, m.range_min * 0.999 - 0.001)
+        r_hi = min(m.range_max, 49.0) if m.range_max > 0 else 49.0
+        cos, sin = math.cos, math.sin
+        for i in range(len(m.ranges)):
+            r = m.ranges[i]
+            if not (r >= r_lo and r <= r_hi):
+                continue
+            th = a + da * i
+            x = lx + r * cos(th)
+            y = r * sin(th)
+            # 车体矩形（AABB）外的距离
+            dx = xmin - x if x < xmin else (x - xmax if x > xmax else 0.0)
+            dy = -yh - y if y < -yh else (y - yh if y > yh else 0.0)
+            d = math.hypot(dx, dy) if (dx or dy) else 0.0
+            if d < min_d:
+                min_d = d
+                min_bearing = math.atan2(y, x)
+            c = math.hypot(x, y)
+            if c < min_circ:
+                min_circ = c
+        if min_d == float('inf'):
+            return
+        self.min_d = min_d
+        self.circ_d = min_circ
+        self.bearing = min_bearing
+        self.scan_stamp = time.monotonic()
+        self.min_d_ever = min_d if self.min_d_ever is None else min(self.min_d_ever, min_d)
+        self.circ_ever = min_circ if self.circ_ever is None else min(self.circ_ever, min_circ)
+
+    # ---------------- 判定 ----------------
+    def tick(self):
+        now = time.monotonic()
+        fresh = (now - self.scan_stamp) < 1.0
+        bumper = now < self.bumper_until
+        contact = bumper or (fresh and self.min_d is not None
+                             and self.min_d <= self.contact_margin)
+        graze = fresh and self.min_d is not None and self.min_d <= self.graze_margin
+        alert = fresh and self.circ_d is not None and \
+            self.circ_d <= self.circ_radius + self.circ_margin
+
+        self.pub_min.publish(Float32(data=float(self.min_d if self.min_d is not None else -1.0)))
+        self.pub_contact.publish(Bool(data=bool(contact)))
+
+        # 上升沿事件（同一类事件最小间隔 event_min_interval，避免刷屏）
+        for name, state, gate in (('contact', self._in_contact, contact),
+                                  ('graze', self._in_graze, graze),
+                                  ('alert', self._in_alert, alert)):
+            if gate and not state:
+                if name == 'contact' and bumper:
+                    pass                       # 接触传感器已单独记录
+                elif now - self._last_event[name] >= self.event_min_interval:
+                    self._last_event[name] = now
+                    self.stats[{'contact': 'contacts', 'graze': 'grazes',
+                                'alert': 'alerts'}[name]] += 1
+                    self.log({'type': name, 'min_d': round(self.min_d or 0.0, 3),
+                              'circ_d': round(self.circ_d or 0.0, 3),
+                              'bearing_deg': round(math.degrees(self.bearing or 0.0), 1),
+                              'pos': [round(v, 2) for v in (self.pose or (0, 0, 0))[:2]],
+                              'yaw': round(self.pose[2], 2) if self.pose else None,
+                              'nav': self.nav_state,
+                              'cmd': [round(self.cmd[0], 3), round(self.cmd[1], 3)]})
+        self._in_contact, self._in_graze, self._in_alert = contact, graze, alert
+
+        # 停滞取证：有前进意图但 2 s 不动
+        if abs(self.cmd[0]) > 0.02 and self.pose is not None:
+            if self._stall_from is None:
+                self._stall_from = now
+                self._stall_pose = self.pose[:2]
+            elif now - self._stall_from >= 2.0:
+                moved = math.hypot(self.pose[0] - self._stall_pose[0],
+                                   self.pose[1] - self._stall_pose[1])
+                if moved < 0.02:
+                    self.stats['stalls'] += 1
+                    self.log({'type': 'stall', 'dur': round(now - self._stall_from, 1),
+                              'moved': round(moved, 3),
+                              'min_d': round(self.min_d or 0.0, 3),
+                              'pos': [round(v, 2) for v in (self.pose or (0, 0, 0))[:2]],
+                              'nav': self.nav_state})
+                    self._stall_from = now
+                    self._stall_pose = self.pose[:2]
+        else:
+            self._stall_from = None
+            self._stall_pose = None
+
+        if abs(self.cmd[0]) > 0.02:
+            self.stats['forward_secs'] += 0.2
+
+        s = dict(self.stats)
+        s.update({'min_d_ever': round(self.min_d_ever, 3) if self.min_d_ever is not None else None,
+                  'circ_ever': round(self.circ_ever, 3) if self.circ_ever is not None else None,
+                  'min_d_now': round(self.min_d, 3) if self.min_d is not None else None})
+        self.pub_summary.publish(String(data=json.dumps(s, ensure_ascii=False)))
+
+    def summary(self):
+        s = dict(self.stats)
+        s.update({'min_d_ever': round(self.min_d_ever, 3) if self.min_d_ever is not None else None,
+                  'circ_ever': round(self.circ_ever, 3) if self.circ_ever is not None else None,
+                  'pos': [round(v, 2) for v in (self.pose or (0, 0, 0))[:2]],
+                  'nav': self.nav_state})
+        self.log({'type': 'summary', **s})
+
+    def destroy_node(self):
+        try:
+            if self._rev_start is not None:
+                self.stats['reverse_secs'] += time.monotonic() - self._rev_start
+                self.stats['reverse_dist'] += self._rev_dist
+            self.summary()
+        except Exception:
+            pass
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            except Exception:
+                pass
+        super().destroy_node()
+
+
+def main():
+    rclpy.init()
+    node = CollisionProbe()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
