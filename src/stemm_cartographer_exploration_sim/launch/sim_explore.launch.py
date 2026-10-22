@@ -146,7 +146,7 @@ def generate_launch_description():
             description='是否启动车端 stemm_escape_controller（P0 默认 false，由 escape_supervisor 取代）'),
         DeclareLaunchArgument('escape_supervisor', default_value='true',
             description='是否启用雷达引导的旋转+前进脱困（P0）'),
-        DeclareLaunchArgument('scoring', default_value='v1',
+        DeclareLaunchArgument('scoring', default_value='v3',
             description='前沿收益函数版本：v1=旧未知格数/就近，v2=邻域未知占比，v3=朝前未知+贴已知边界'),
         DeclareLaunchArgument('supervisor_unit_max_sec', default_value='8.0',
             description='脱困单元硬顶秒数（单元测试时调小以快速触发降级）'),

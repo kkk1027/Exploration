@@ -65,7 +65,8 @@ def launch_events(path):
             ev.append((t, 'cancel', line.strip()))
         elif is_mgr and 'mapping done acknowledged' in line:
             ev.append((t, 'done', line.strip()))
-        elif is_mgr and 'return-home completed' in line:
+        elif is_mgr and ('return-home completed' in line
+                         or 'return-home goal reached' in line):
             ev.append((t, 'home', line.strip()))
         elif is_mgr and 'front blocked' in low:
             ev.append((t, 'frontblocked', line.strip()))
@@ -86,33 +87,34 @@ def first_log_ts(path):
 
 
 def time_breakdown(ev, log_first=None):
-    """严格配对 + 区间并集：每个 dispatch 只与它之后的第一个终态配对，重叠区间合并，
-    保证"导航中 + 选点等待 <= 探索总时长"（第一版按总和计，出现过 112.7% 的荒唐值）。
+    """严格配对 + 区间并集 + 区间裁剪。
+
+    * 每个 dispatch 只与它之后的第一个终态配对（第一版按总和计，出现过 112.7% 的荒唐值）；
+    * 重叠区间合并；
+    * 区间裁到 [首派发, 结束建图/返航完成]，保证 导航中 + 选点等待 == 探索总时长。
     """
+    done = next((t for t, k, _l in ev if k == 'done'), None)
+    home_t = next((t for t, k, _l in ev if k == 'home'), None)
+    ready = next((t for t, k, _l in ev if k == 'ready'), None)
+
     disp = [i for i, (_t, k, _l) in enumerate(ev) if k == 'dispatch']
     used = set()
     intervals = []
-    last_term_t = None
     first_disp_t = None
     for i in disp:
         t0 = ev[i][0]
         if first_disp_t is None:
             first_disp_t = t0
-        end = None
         for j in range(i + 1, len(ev)):
             if ev[j][1] in ('succ', 'fail', 'cancel') and j not in used:
-                end = ev[j]
                 used.add(j)
+                intervals.append((t0, ev[j][0]))
                 break
-        if end is not None:
-            intervals.append((t0, end[0]))
-            last_term_t = end[0]
-    # 区间并集
-    nav = 0.0
-    for a, b in sorted(intervals):
-        if b <= a:
-            continue
-        nav += (b - a) - max(0.0, min(b, (nav and 0) or b) and 0)  # placeholder
+
+    end_cap = done if done is not None else home_t
+    if end_cap is not None:
+        intervals = [(a, min(b, end_cap)) for a, b in intervals if a < end_cap and b > a]
+
     nav = 0.0
     cur_a = cur_b = None
     for a, b in sorted(intervals):
@@ -125,18 +127,15 @@ def time_breakdown(ev, log_first=None):
             cur_a, cur_b = a, b
     if cur_a is not None:
         nav += cur_b - cur_a
-    done = next((t for t, k, _l in ev if k == 'done'), None)
-    home = next((t for t, k, _l in ev if k == 'home'), None)
-    ready = next((t for t, k, _l in ev if k == 'ready'), None)
-    launched = log_first
+
     span = (done - first_disp_t) if (done and first_disp_t) else None
     wait = max(0.0, span - nav) if (span is not None) else None
     return {
-        'startup_s': (ready - launched) if (ready and launched) else None,
+        'startup_s': (ready - log_first) if (ready and log_first) else None,
         'explore_s': span,
         'nav_s': nav,
         'select_wait_s': wait,
-        'return_s': (home - done) if (done and home) else None,
+        'return_s': (home_t - done) if (done and home_t) else None,
         'dispatch_n': len(disp),
         'paired_n': len(intervals),
         'succ_n': sum(1 for _t, k, _l in ev if k == 'succ'),
