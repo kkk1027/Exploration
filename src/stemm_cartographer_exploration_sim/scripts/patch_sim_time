@@ -58,6 +58,17 @@ done
 retry_until 10 /controller_server yaw_goal_tolerance 0.15
 retry_until 10 /controller_server xy_goal_tolerance 0.15
 
+# ---------------- 阶段 4（P0-5）：把 Nav2 足迹补回真实车宽 ----------------
+# 实测根因：真机含轮总宽 0.46 m ⇒ 轮子外沿 y=±0.23；而车端 footprint 半宽只有 0.20，
+# 于是规划/控制器认为"车心离墙 0.20 m 安全"，实际轮子已插入 3 cm —— 基线轮抓到的
+# 11 次"障碍点进入车体轮廓"全是 y≈±0.19 的车侧刮墙（底盘接触传感器不响，因为碰的是轮子）。
+# 这里只把 y 从 0.20 补到 0.235（物理 0.23 + 0.5 cm 余量），x 方向保留车端保守值。
+FOOTPRINT='[[-0.18,-0.235],[-0.18,0.235],[0.32,0.235],[0.32,-0.235]]'
+if [ "$DISABLE_RETREAT" = "1" ]; then
+  retry_until 25 /local_costmap/local_costmap footprint "$FOOTPRINT"
+  retry_until 25 /global_costmap/global_costmap footprint "$FOOTPRINT"
+fi
+
 # ---------------- 阶段 3（P0）：关闭车端所有盲退 ----------------
 if [ "$DISABLE_RETREAT" != "1" ]; then
   echo "[patch] 阶段3 跳过（DISABLE_RETREAT=$DISABLE_RETREAT，对照基线保留车端盲退）"

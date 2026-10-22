@@ -126,6 +126,27 @@ with open(jout, 'a') as f:
 print('[collision] ' + json.dumps(summary, ensure_ascii=False))
 PYEOF
 fi
+# 地图快照（下一轮开头会删 explore_latest.*，不快照就再也评不到本轮的地图了）
+MF=/home/kbf/stemm_sim_ws/maps/explore_latest.pgm
+if [ -f "$MF" ] && [ "$(stat -c %Y "$MF")" -ge "$T_START" ]; then
+  cp -f "$MF" "$OUT/map.pgm"
+  cp -f "/home/kbf/stemm_sim_ws/maps/explore_latest.yaml" "$OUT/map.yaml" 2>/dev/null
+  say "地图快照：$OUT/map.pgm（$(stat -c %s "$MF") B）"
+fi
+# 本轮验收（七项 + P0 两项）
+if [ -f "$OUT/launch.log" ]; then
+  python3 harness/evaluate.py "$OUT/launch.log" "$TAG" "$OUT/probe.jsonl" --p0 \
+    > "$OUT/evaluate.json" 2>&1 || true
+  python3 - "$OUT/evaluate.json" <<'PYEOF'
+import json,sys
+try:
+    d=json.load(open(sys.argv[1]))
+    print('[evaluate] verdict=%s checks=%s' % (d['verdict'],
+          {k:v for k,v in d['checks'].items() if not v} or 'all true'))
+except Exception as e:
+    print('[evaluate] 解析失败:', e)
+PYEOF
+fi
 if [ -f "$OUT/supervisor.jsonl" ]; then
   echo "[supervisor] 事件汇总：" 
   grep -o '"type": "[a-z_0-9]*"' "$OUT/supervisor.jsonl" | sort | uniq -c || true

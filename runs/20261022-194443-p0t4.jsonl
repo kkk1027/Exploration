@@ -1,0 +1,7 @@
+{"ts":"2026-10-22T19:44:43+08:00","tag":"p0t4",""check":"pre_launch","nodes":0,"gzserver":0,"residue":"""}
+{"ts":"2026-10-22T19:44:43+08:00","tag":"p0t4",""check":"pose","x":-0.4,"y":-0.3,"yaw":0.7854"}
+{"ts":"2026-10-22T19:44:43+08:00","tag":"p0t4",""check":"variant","disable_retreat":1,"supervisor":"true""}
+{"ts":"2026-10-22T19:44:46+08:00","tag":"p0t4",""check":"launch","pgid":"19496""}
+{"ts":"2026-10-22T19:52:21+08:00","tag":"p0t4",""check":"post_teardown","nodes":7,"gzserver":0,"residue":"""}
+{"ts":"2026-10-22T19:52:21+08:00","tag":"p0t4",""verdict":"PASS_clean""}
+{"check":"collision","summary":{"contacts": 4, "grazes": 4, "alerts": 4, "stalls": 22, "reverse_windows": 7, "reverse_m": 0.037, "min_clearance_ever": 0.0}}

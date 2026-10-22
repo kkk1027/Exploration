@@ -1,0 +1,7 @@
+{"ts":"2026-10-22T19:40:19+08:00","tag":"p0t3",""check":"pre_launch","nodes":0,"gzserver":0,"residue":"""}
+{"ts":"2026-10-22T19:40:19+08:00","tag":"p0t3",""check":"pose","x":0.4,"y":0.3,"yaw":1.5708"}
+{"ts":"2026-10-22T19:40:19+08:00","tag":"p0t3",""check":"variant","disable_retreat":1,"supervisor":"true""}
+{"ts":"2026-10-22T19:40:22+08:00","tag":"p0t3",""check":"launch","pgid":"18097""}
+{"ts":"2026-10-22T19:44:43+08:00","tag":"p0t3",""check":"post_teardown","nodes":0,"gzserver":0,"residue":"""}
+{"ts":"2026-10-22T19:44:43+08:00","tag":"p0t3",""verdict":"PASS_clean""}
+{"check":"collision","summary":{"contacts": 4, "grazes": 4, "alerts": 4, "stalls": 0, "reverse_windows": 1, "reverse_m": 0.3, "min_clearance_ever": 0.0}}

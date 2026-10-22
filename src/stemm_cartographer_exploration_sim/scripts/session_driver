@@ -163,7 +163,16 @@ class SessionDriver(Node):
                 self._call_done()
             return
 
-        # 阶段3：跟踪返航；若卡在"等活跃目标取消"，每 6 s 重发一次 set_mapping_done
+        # 阶段3：跟踪返航。返航一开始就滚动存图（每 2 s 一次），
+        # 因为 manager 判定到位后会立刻 SIGINT 整个进程组，末次存图有机会抢不到。
+        if (self.map_msg is not None
+                and now - getattr(self, '_last_roll_save', 0.0) > 2.0):
+            self._last_roll_save = now
+            try:
+                self._write_map_files()
+            except Exception as exc:                 # noqa: BLE001
+                self.get_logger().warn(f'滚动存图失败（忽略）：{exc}')
+        # 若卡在"等活跃目标取消"，每 6 s 重发一次 set_mapping_done
         # （重发在目标结束后会命中 _dispatch_pending_home_goal 分支）
         if (self.return_home_ok is None and self.t_done_called is not None
                 and now - self.t_done_called > 3.0

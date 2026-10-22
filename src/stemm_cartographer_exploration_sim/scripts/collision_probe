@@ -102,6 +102,7 @@ class CollisionProbe(Node):
         self.body_world_bb = None
 
         self.stats = {'contacts': 0, 'grazes': 0, 'alerts': 0, 'bumpers': 0,
+                      'ground_contacts': 0, 'chassis_contacts': 0, 'wheel_contacts': 0,
                       'reverse_msgs': 0, 'reverse_windows': 0, 'reverse_secs': 0.0,
                       'reverse_dist': 0.0, 'forward_secs': 0.0,
                       'stalls': 0}
@@ -191,14 +192,25 @@ class CollisionProbe(Node):
         if not m.states:
             return
         now = time.monotonic()
+        # 车轮始终与地面接触：地面相关的接触必须过滤，只把"碰到墙/家具"算撞障
+        pairs = [st.collision1_name + '|' + st.collision2_name for st in m.states]
+        real = [p for p in pairs if 'ground_plane' not in p]
+        if not real:
+            self.stats['ground_contacts'] = self.stats.get('ground_contacts', 0) + 1
+            return
         self.bumper_until = now + 0.3
-        name = m.states[0].collision1_name + '|' + m.states[0].collision2_name
+        name = real[0]
         if self.bumper_last != name or now - self._last_event['contact'] > self.event_min_interval:
             self.bumper_last = name
             self.stats['bumpers'] += 1
+            if 'wheel_link' in name:
+                self.stats['wheel_contacts'] += 1
+            else:
+                self.stats['chassis_contacts'] += 1
             self._last_event['contact'] = now
-            self.log({'type': 'contact', 'src': 'bumper', 'pair': name,
-                      'n': len(m.states),
+            src = 'wheel' if 'wheel_link' in name else 'chassis'
+            self.log({'type': 'contact', 'src': src, 'pair': name,
+                      'n': len(real),
                       'pos': [round(v, 2) for v in (self.pose or (0, 0, 0))[:2]],
                       'yaw': round(self.pose[2], 2) if self.pose else None,
                       'nav': self.nav_state,

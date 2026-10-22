@@ -133,6 +133,8 @@ class EscapeSupervisor(Node):
         self.last_foreign_cmd = 0.0
         self.own_cmd_at = 0.0
         self.nav_busy = False
+        self.mode = ''
+        self.state_name = ''
         self._busy_since = 0.0
         self.busy_grace_sec = float(p('busy_grace_sec', 2.0).value)
         self.nav_state = ''
@@ -244,6 +246,14 @@ class EscapeSupervisor(Node):
 
     def on_nav_state(self, m):
         self.nav_state = (m.data or '').strip()
+        # nav_state 是 JSON（含 mode / navigation_state），解析出来才好判断阶段
+        try:
+            d = json.loads(self.nav_state)
+            self.mode = str(d.get('mode', ''))
+            self.state_name = str(d.get('navigation_state', ''))
+        except Exception:
+            self.mode = ''
+            self.state_name = self.nav_state.lower()
 
     def on_status(self, m):
         busy = False
@@ -345,11 +355,13 @@ class EscapeSupervisor(Node):
             return
         if self.pose is None:
             return
-        blocked_state = any(t in self.nav_state.lower() for t in BLOCKED_TOKENS) \
-            and not any(t in self.nav_state.lower() for t in ('return',))
+        # 楔死状：mode/state 里出现 blocked/escape/wedge/stuck。
+        # 注意返航阶段同样要允许脱困（车端返航的"盲退"已关，返航被夹住只能靠旋转+前进出来）。
+        blob = (self.mode + ' ' + self.state_name).lower()
+        blocked_state = any(t in blob for t in BLOCKED_TOKENS)
         if not (self.nav_busy or blocked_state):
             return
-        if self.nav_state.lower() in IDLE_NAV_STATES:
+        if self.state_name.lower() in IDLE_NAV_STATES:
             return
         if now - self.last_foreign_cmd < self.cmd_quiet_sec:
             return
