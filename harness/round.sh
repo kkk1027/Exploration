@@ -17,6 +17,27 @@ BASE=/home/kbf/stemm_exploration_sim_ws
 TS=$(date +%Y%m%d-%H%M%S)
 OUT="$BASE/logs/round_${TS}_${TAG}"; mkdir -p "$OUT"
 J="$BASE/runs/${TS}-${TAG}.jsonl"
+# 方案A 视觉层开关（VISION=1 时注入 nav2 视觉图层 + 起视觉障碍源；0=纯雷达基线）
+VISION="${VISION:-0}"
+MEMLOG="$OUT/mem.jsonl"
+
+# 内存采样：本机 15 GiB 且 **无 swap**，视觉链路必须证明"加得起"
+mem_sample() {
+  local avail total=0 pid r
+  avail=$(awk '/MemAvailable/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null)
+  rss_of() {
+    local sum=0 pp rr
+    for pp in $(pgrep -f "$1" 2>/dev/null); do
+      rr=$(awk '/VmRSS/{print $2}' /proc/$pp/status 2>/dev/null)
+      [ -n "$rr" ] && sum=$((sum + rr/1024))
+    done
+    echo "$sum"
+  }
+  printf '{"t":%s,"avail_mb":%s,"gz_mb":%s,"vision_mb":%s,"nav2_mb":%s,"carto_mb":%s}\n' \
+    "$(date +%s)" "${avail:-0}" "$(rss_of 'gzserver')" "$(rss_of 'vision_obstacle_grid')" \
+    "$(rss_of 'controller_server|planner_server|bt_navigator|behavior_server|smoother_server|waypoint_follower')" \
+    "$(rss_of 'cartographer_node')" >> "$MEMLOG"
+}
 say() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$OUT/harness.log"; }
 rec() { printf '{"ts":"%s","tag":"%s","%s"}\n' "$(date -Iseconds)" "$TAG" "$1" >> "$J"; }
 
@@ -56,7 +77,22 @@ SUPERVISOR="${SUPERVISOR:-true}"
 CAR_ESCAPE="${CAR_ESCAPE:-$([ "${DISABLE_CAR_ESCAPE:-1}" = "1" ] && echo false || echo true)}"
 say "P0 变体：disable_retreat=$DISABLE_RETREAT escape_supervisor=$SUPERVISOR"
 rec "\"check\":\"variant\",\"disable_retreat\":$DISABLE_RETREAT,\"supervisor\":\"$SUPERVISOR\""
-setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE spawn_x:=$SX spawn_y:=$SY spawn_yaw:=$SYAW disable_retreat:=$DISABLE_RETREAT escape_supervisor:=$SUPERVISOR car_escape:=$CAR_ESCAPE rviz:=${RVIZ:-false} stack_delay:=${STACK_DELAY:-0.0} scoring:=${SCORING:-v3} corridor_width:=${CORRIDOR_W:-1.05} supervisor_rotate_min_range:=${SUP_ROT_MIN:-0.34} supervisor_advance_stop_range:=${SUP_ADV_STOP:-0.34} probe_log:=$OUT/probe.jsonl supervisor_log:=$OUT/supervisor.jsonl" \
+
+# ---- 方案A：nav2 视觉图层注入（幂等、可回退；teardown 后自动撤销）----
+say "视觉层 VISION=$VISION"
+rec "\"check\":\"vision\",\"enabled\":$VISION"
+trap 'python3 /home/kbf/stemm_exploration_sim_ws/harness/vision_nav_params.py --restore >/dev/null 2>&1' EXIT INT TERM
+if [ "$VISION" = "1" ]; then
+  python3 harness/vision_nav_params.py --apply 2>&1 | tee -a "$OUT/harness.log"
+  if [ "${PIPESTATUS[0]}" != "0" ]; then
+    say "✗ 视觉图层注入失败，放弃本轮（参数文件未被改动）"
+    rec '"verdict":"FAIL_vision_params"'
+    exit 11
+  fi
+else
+  python3 harness/vision_nav_params.py --restore 2>&1 | tee -a "$OUT/harness.log" || true
+fi
+setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE spawn_x:=$SX spawn_y:=$SY spawn_yaw:=$SYAW disable_retreat:=$DISABLE_RETREAT escape_supervisor:=$SUPERVISOR car_escape:=$CAR_ESCAPE rviz:=${RVIZ:-false} stack_delay:=${STACK_DELAY:-0.0} scoring:=${SCORING:-v3} corridor_width:=${CORRIDOR_W:-1.05} supervisor_rotate_min_range:=${SUP_ROT_MIN:-0.34} supervisor_advance_stop_range:=${SUP_ADV_STOP:-0.34} probe_log:=$OUT/probe.jsonl supervisor_log:=$OUT/supervisor.jsonl vision:=$VISION" \
   > "$OUT/launch.log" 2>&1 < /dev/null &
 sleep 3; PGID=$(cat "$OUT/pgid" 2>/dev/null || echo "")
 say "已启动：PGID=$PGID  日志 $OUT/launch.log"
@@ -103,7 +139,7 @@ else
   say "全流程模式：最多等待 ${MAXW}s（探索 ${EXPLORE}s + 返航/存图余量）"
   waited=0
   while [ "$waited" -lt "$MAXW" ]; do
-    sleep 10; waited=$((waited+10))
+    sleep 10; waited=$((waited+10)); mem_sample
     if grep -q "会话结束" "$OUT/launch.log" 2>/dev/null; then say "检测到会话结束（${waited}s）"; break; fi
     # 注意：会话驱动在返航期每 2 s 滚动存图，"地图文件出现"不再是收尾信号，
     # 必须等"会话结束"或 manager 明确返航到位（否则会在返航刚开始时就收尾）。
@@ -128,6 +164,24 @@ RES=$(pgrep -af "cartographer_node|sim_session_driver|controller_server|planner_
 say "收尾后：ROS 节点数=$NODES  gzserver=$GZ  残留=[${RES}]"
 rec "\"check\":\"post_teardown\",\"nodes\":$NODES,\"gzserver\":$GZ,\"residue\":\"${RES}\""
 [ "$GZ" = "0" ] && [ -z "$RES" ] && rec '"verdict":"PASS_clean"' || rec '"verdict":"FAIL_residue"'
+
+# ---- 方案A：撤销视觉图层注入 + 内存峰值汇总 ----
+python3 harness/vision_nav_params.py --restore 2>&1 | tee -a "$OUT/harness.log" || true
+if [ -s "$MEMLOG" ]; then
+  python3 - "$MEMLOG" "$J" <<'PYEOF'
+import json, sys
+rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+peak = {k: max((r.get(k) or 0) for r in rows) for k in
+        ('gz_mb', 'vision_mb', 'nav2_mb', 'carto_mb')}
+low = min((r.get('avail_mb') or 0) for r in rows)
+summary = {'samples': len(rows), 'peak_gz_mb': peak['gz_mb'], 'peak_vision_mb': peak['vision_mb'],
+           'peak_nav2_mb': peak['nav2_mb'], 'peak_carto_mb': peak['carto_mb'],
+           'min_avail_mb': low}
+with open(sys.argv[2], 'a') as f:
+    f.write('{"check":"memory",' + json.dumps(summary, ensure_ascii=False)[1:] + '\n')
+print('[memory] ' + json.dumps(summary, ensure_ascii=False))
+PYEOF
+fi
 
 # ---- 4) 撞障取证汇总（P0）----
 if [ -f "$OUT/probe.jsonl" ]; then

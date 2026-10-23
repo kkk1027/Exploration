@@ -84,6 +84,28 @@ if probe and os.path.exists(probe):
     checks['no_contact'] = collision['physical_contacts'] == 0
     checks['no_reverse'] = collision['reverse_hard_windows'] == 0
 
+# ---- 方案A：视觉层（只在 vision:=true 的轮次要求）----
+vision_line = has('vision_obstacle_grid', '累积使能')
+vision = None
+if vision_line or 'vision_obstacle_grid' in txt:
+    cells = 0
+    for line in txt.splitlines():
+        m = re.search(r'累积使能 (\d+) 格', line)
+        if m:
+            cells = max(cells, int(m.group(1)))
+    layer_err = has('Failed to create', 'voxel') or has('Could not find plugin') \
+        or has('Unconfigured', 'vision_') or has('vision_voxel_layer', 'error') \
+        or has('vision_obstacle_layer', 'error')
+    vision = {'cells': cells,
+              'node_seen': bool(vision_line),
+              'layer_error': bool(layer_err),
+              'layer_error_line': layer_err}
+if vision is not None:
+    # 只有"这一轮本来就是要跑视觉"时才纳入硬判据（VISION 开关由 round.sh 传进日志）
+    if 'vision:=true' in txt or '视觉障碍：' in txt:
+        checks['vision_cells'] = vision['cells'] > 0
+        checks['vision_layer_ok'] = not vision['layer_error']
+
 p0 = '--p0' in flags
 hard = [k for k in checks if k not in ('return_home',)]
 if not p0:
@@ -95,5 +117,7 @@ out = {'tag': tag, 'verdict': verdict,
        'evidence': {k: v for k, v in checks.items() if v}}
 if collision is not None:
     out['collision'] = collision
+if vision is not None:
+    out['vision'] = vision
 print(json.dumps(out, ensure_ascii=False, indent=1))
 sys.exit(0 if verdict == 'PASS' else 1)

@@ -90,6 +90,20 @@ def generate_launch_description():
                  parameters=[{'use_sim_time': use_sim_time,
                               'log_path': LaunchConfiguration('probe_log')}])
 
+    # 方案A：深度相机 → 视觉障碍（补 2D 雷达的结构性盲区，见 P0_验收记录 §3b）
+    #   节点本身只发话题；nav2 侧的图层注入由 harness/vision_nav_params.py 在启动前完成
+    #   （nav2 的 plugins 列表只能在启动时生效），两侧都用 vision:= 开关，一键回退。
+    vision = Node(package='stemm_cartographer_exploration_sim',
+                  executable='vision_obstacle_grid', name='vision_obstacle_grid',
+                  output='screen',
+                  condition=IfCondition(LaunchConfiguration('vision')),
+                  parameters=[{'use_sim_time': use_sim_time,
+                               'cloud_topic': '/camera/depth/points',
+                               'global_frame': 'map',
+                               'self_filter_radius': LaunchConfiguration('vision_self_radius'),
+                               'z_max': 1.80,
+                               'low_z_max': 0.35}])
+
     # P0-3：雷达引导的"旋转 + 前进"脱困（与栈同时起，等车端节点就绪后自行等待触发）
     supervisor = Node(package='stemm_cartographer_exploration_sim',
                       executable='escape_supervisor', name='escape_supervisor',
@@ -101,6 +115,7 @@ def generate_launch_description():
                                    'rotate_min_range': LaunchConfiguration('supervisor_rotate_min_range'),
                                    'advance_stop_range': LaunchConfiguration('supervisor_advance_stop_range'),
                                    'log_path': LaunchConfiguration('supervisor_log')}])
+
 
     driver = Node(
         package='stemm_cartographer_exploration_sim',
@@ -160,6 +175,10 @@ def generate_launch_description():
             description='脱困前进时前向 ±45° 的最小测距门槛'),
         DeclareLaunchArgument('supervisor_recovery_timeout', default_value='40.0',
             description='累计受阻多少秒后退出脱困（用户要求的 40 s 兜底）'),
+        DeclareLaunchArgument('vision', default_value='false',
+            description='是否启动视觉障碍源（方案A）。nav2 图层注入需同时 apply 参数补丁'),
+        DeclareLaunchArgument('vision_self_radius', default_value='0.38',
+            description='视觉障碍的自身过滤半径（m，以机器人原点为圆心）'),
         DeclareLaunchArgument('stack', default_value='true',
             description='是否启动车端探索栈（false=只起机器人+取证/脱困，单元测试用）'),
         DeclareLaunchArgument('disable_retreat', default_value='1',
@@ -171,6 +190,7 @@ def generate_launch_description():
                         '（ready_guard 90 s 内未激活、整轮被打断），故恢复固定延迟。'),
         robot,
         probe,
+        vision,
         TimerAction(period=stack_delay, actions=[stack, patch_sim_time, arbiter, supervisor]),
         TimerAction(period=stack_delay, actions=[driver]),
         rviz])

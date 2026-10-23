@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""vision_obstacle_grid —— 深度相机 → 视觉障碍（方案A 的感知源）。
+
+为什么需要它（来自 P0 验收记录 §3b）：
+  2D 雷达扫描面在 z=0.225 m，cafe_table 只有 4.2 cm 细立柱能进图，
+  4 cm 厚、56 cm 见方的贴地底板完全不可见 → 规划器绕开立柱、车身从底板上碾过去。
+  深度相机（光心 0.26 m，俯视下缘 22.85°，地面可视起点 ≈ 0.62 m）正好覆盖这一层。
+
+输出（全部沿用实机 stemm_vision_mapping 的话题契约，仿真/实机同一套参数）：
+  /vision/live_cloud      PointCloud2  map 帧，当前帧滤波后的点（去掉自身+超界）→ local_costmap 体素层
+  /vision/obstacle_cloud  PointCloud2  map 帧，累积障碍点（只增不减）→ global_costmap 障碍层
+  /vision/obstacle_grid   OccupancyGrid map 帧，累积障碍 2D 栅格（0.05 m）→ RViz/存盘/StaticLayer
+  /vision/low_cloud       PointCloud2  map 帧，低矮带（0.05~0.35 m）子集 → 取证/可视化
+
+设计原则：
+  * 只增不减（累积），与"激光盲区障碍"的语义一致；
+  * 单格最少点数滤波（min_points_per_cell），避免孤立噪点把栅格撑大；
+  * 自身过滤用 self_filter_radius（以机器人原点为圆心的 XY 半径），防止把车体自己标成障碍；
+  * 任何 TF/数据异常只告警不崩，nav2 侧层失效时退化为纯雷达（可回退）。
+"""
+import math
+
+import numpy as np
+import rclpy
+import tf2_ros
+from nav_msgs.msg import OccupancyGrid
+from rclpy.node import Node
+from rclpy.qos import (DurabilityPolicy, QoSProfile, ReliabilityPolicy)
+from rclpy.time import Time
+from sensor_msgs.msg import PointCloud2, PointField
+
+
+def quat_to_matrix(q):
+    x, y, z, w = q.x, q.y, q.z, q.w
+    n = math.sqrt(x * x + y * y + z * z + w * w) or 1.0
+    x, y, z, w = x / n, y / n, z / n, w / n
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ])
+
+
+def cloud_msg(pts, frame_id, stamp):
+    msg = PointCloud2()
+    msg.header.stamp = stamp
+    msg.header.frame_id = frame_id
+    msg.height = 1
+    msg.width = int(pts.shape[0])
+    msg.fields = [
+        PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+        PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+        PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+    ]
+    msg.is_bigendian = False
+    msg.point_step = 12
+    msg.row_step = 12 * int(pts.shape[0])
+    msg.is_dense = True
+    msg.data = np.ascontiguousarray(pts, dtype=np.float32).tobytes()
+    return msg
+
+
+class VisionObstacleGrid(Node):
+    def __init__(self):
+        super().__init__('vision_obstacle_grid')
+        d = self.declare_parameter
+        d('cloud_topic', '/camera/depth/points')
+        d('global_frame', 'map')
+        d('live_topic', '/vision/live_cloud')
+        d('cloud_topic_out', '/vision/obstacle_cloud')
+        d('grid_topic', '/vision/obstacle_grid')
+        d('low_topic', '/vision/low_cloud')
+        d('resolution', 0.05)
+        d('z_min', 0.05)
+        d('z_max', 1.80)
+        d('low_z_min', 0.05)
+        d('low_z_max', 0.35)
+        d('range_max', 5.0)
+        d('range_min', 0.25)
+        d('self_filter_radius', 0.38)
+        d('min_points_per_cell', 2)
+        d('max_points', 120000)
+        d('live_hz', 5.0)
+        d('accum_hz', 1.0)
+        d('max_side_cells', 6000)
+        d('obstacle_z', 0.15)
+        d('live_voxel', 0.05)
+
+        g = self.get_parameter
+        self.cloud_topic = g('cloud_topic').value
+        self.global_frame = g('global_frame').value
+        self.res = float(g('resolution').value)
+        self.z_min = float(g('z_min').value)
+        self.z_max = float(g('z_max').value)
+        self.low_z = (float(g('low_z_min').value), float(g('low_z_max').value))
+        self.range_max = float(g('range_max').value)
+        self.range_min = float(g('range_min').value)
+        self.self_r = float(g('self_filter_radius').value)
+        self.min_pts = max(1, int(g('min_points_per_cell').value))
+        self.max_points = int(g('max_points').value)
+        self.max_side = int(g('max_side_cells').value)
+        self.obstacle_z = float(g('obstacle_z').value)
+        self.live_voxel = max(0.01, float(g('live_voxel').value))
+
+        self.cells = set()
+        self.last_live = np.zeros((0, 3), dtype=np.float64)
+        self.last_vox = np.zeros((0, 3), dtype=np.float64)
+        self.last_low = np.zeros((0, 3), dtype=np.float64)
+        self.stats = {'frames': 0, 'tf_fail': 0, 'bad': 0, 'filtered': 0,
+                      'last_pts': 0, 'last_kept': 0, 'pub_grid': 0}
+        self._warned_tf = False
+
+        qos_cloud_in = QoSProfile(depth=2, reliability=ReliabilityPolicy.BEST_EFFORT,
+                                  durability=DurabilityPolicy.VOLATILE)
+        self.create_subscription(PointCloud2, self.cloud_topic, self.on_cloud, qos_cloud_in)
+
+        # 发布侧一律 RELIABLE：可靠发布者兼容 best-effort 订阅者，反之会静默收不到
+        qos_vis = QoSProfile(depth=2, reliability=ReliabilityPolicy.RELIABLE,
+                             durability=DurabilityPolicy.VOLATILE)
+        qos_map = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                             durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.pub_live = self.create_publisher(PointCloud2, g('live_topic').value, qos_vis)
+        self.pub_cloud = self.create_publisher(PointCloud2, g('cloud_topic_out').value, qos_vis)
+        self.pub_low = self.create_publisher(PointCloud2, g('low_topic').value, qos_vis)
+        self.pub_grid = self.create_publisher(OccupancyGrid, g('grid_topic').value, qos_map)
+
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
+
+        self.create_timer(1.0 / max(0.2, float(g('live_hz').value)), self.publish_live)
+        self.create_timer(1.0 / max(0.2, float(g('accum_hz').value)), self.publish_accum)
+        self.create_timer(5.0, self.report)
+        self.get_logger().info(
+            f'vision_obstacle_grid: {self.cloud_topic} -> live={g("live_topic").value} '
+            f'accum_cloud={g("cloud_topic_out").value} grid={g("grid_topic").value} '
+            f'(frame={self.global_frame} res={self.res} z=[{self.z_min},{self.z_max}] '
+            f'range=[{self.range_min},{self.range_max}] self_r={self.self_r})')
+
+    # ---------------- 输入 ----------------
+    def on_cloud(self, msg):
+        self.stats['frames'] += 1
+        names = {f.name: f.offset for f in msg.fields}
+        if not all(k in names for k in ('x', 'y', 'z')):
+            self.stats['bad'] += 1
+            return
+        n = msg.width * msg.height
+        if n == 0 or msg.point_step == 0:
+            return
+        if n > self.max_points:
+            # 超大点云（例如有人把分辨率开到 640x480x30）先抽稀，保护内存/CPU
+            n = self.max_points
+        raw = np.frombuffer(msg.data, dtype=np.uint8)
+        if raw.size < n * msg.point_step:
+            self.stats['bad'] += 1
+            return
+        buf = raw[:n * msg.point_step].reshape(n, msg.point_step)
+
+        def col(name):
+            off = names[name]
+            return buf[:, off:off + 4].copy().view(np.float32).reshape(-1)
+
+        x, y, z = col('x'), col('y'), col('z')
+        ok = np.isfinite(x) & np.isfinite(y) & np.isfinite(z) & (z > 0.0)
+        if not ok.any():
+            return
+
+        try:
+            tr = self.tf_buffer.lookup_transform(self.global_frame, msg.header.frame_id, Time())
+        except Exception:
+            self.stats['tf_fail'] += 1
+            if not self._warned_tf:
+                self._warned_tf = True
+                self.get_logger().warn(
+                    f'TF {self.global_frame}<-{msg.header.frame_id} 暂不可用（等待 SLAM 起图），先丢弃点云')
+            return
+        self._warned_tf = False
+        t = tr.transform.translation
+        R = quat_to_matrix(tr.transform.rotation)
+        P = np.stack([x[ok], y[ok], z[ok]], axis=1)
+        Pw = P @ R.T + np.array([t.x, t.y, t.z])
+
+        dx = Pw[:, 0] - t.x
+        dy = Pw[:, 1] - t.y
+        dist = np.hypot(dx, dy)
+        keep = ((dist > self.self_r) & (dist < self.range_max) &
+                (Pw[:, 2] > self.z_min) & (Pw[:, 2] < self.z_max))
+        n_bad = int(z.size - (np.isfinite(x) & np.isfinite(y) & np.isfinite(z)).sum())
+        self.stats['bad'] += n_bad
+        self.stats['last_pts'] = int(z.size)
+        self.stats['last_kept'] = int(keep.sum())
+        self.last_live = Pw[keep]
+
+        # 体素抽稀：同一 5 cm 体素只保留一个点，喂 local_costmap 体素层时省 TF/CPU
+        if self.last_live.shape[0]:
+            key3 = np.floor(self.last_live / self.live_voxel).astype(np.int64)
+            _, idx = np.unique(key3, axis=0, return_index=True)
+            self.last_vox = self.last_live[np.sort(idx)]
+        else:
+            self.last_vox = np.zeros((0, 3), dtype=np.float64)
+        # 低矮带（贴地底板/台阶/低矮箱子）——取证与可视化
+        lo, hi = self.low_z
+        if self.last_live.shape[0]:
+            zz = self.last_live[:, 2]
+            self.last_low = self.last_live[(zz >= lo) & (zz <= hi)]
+        else:
+            self.last_low = np.zeros((0, 3), dtype=np.float64)
+
+        keep2 = keep & (dist >= self.range_min)
+        if not keep2.any():
+            return
+        ix = np.floor(Pw[keep2, 0] / self.res).astype(np.int64)
+        iy = np.floor(Pw[keep2, 1] / self.res).astype(np.int64)
+        OFF = 1 << 20
+        base = 2 * OFF
+        key = (ix + OFF) * base + (iy + OFF)
+        uniq, counts = np.unique(key, return_counts=True)
+        good = uniq[counts >= self.min_pts]
+        if good.size:
+            gx = good // base - OFF
+            gy = good % base - OFF
+            self.cells.update(zip(gx.tolist(), gy.tolist()))
+        self.stats['filtered'] = int(uniq.size - good.size)
+
+    # ---------------- 输出 ----------------
+    def publish_live(self):
+        if self.last_live.shape[0] == 0:
+            return
+        stamp = self.get_clock().now().to_msg()
+        src = self.last_vox if self.last_vox.shape[0] else self.last_live
+        self.pub_live.publish(cloud_msg(src, self.global_frame, stamp))
+        if self.last_low.shape[0]:
+            self.pub_low.publish(cloud_msg(self.last_low, self.global_frame, stamp))
+
+    def publish_accum(self):
+        if not self.cells:
+            return
+        stamp = self.get_clock().now().to_msg()
+        arr = np.fromiter((v for c in self.cells for v in c), dtype=np.int64,
+                          count=2 * len(self.cells)).reshape(-1, 2)
+        pts = np.empty((arr.shape[0], 3), dtype=np.float32)
+        pts[:, 0] = (arr[:, 0] + 0.5) * self.res
+        pts[:, 1] = (arr[:, 1] + 0.5) * self.res
+        pts[:, 2] = self.obstacle_z
+        self.pub_cloud.publish(cloud_msg(pts, self.global_frame, stamp))
+        self.stats['pub_grid'] += 1
+        self.publish_grid(arr, stamp)
+
+    def publish_grid(self, arr, stamp):
+        minx, miny = int(arr[:, 0].min()), int(arr[:, 1].min())
+        maxx, maxy = int(arr[:, 0].max()), int(arr[:, 1].max())
+        w = maxx - minx + 1
+        h = maxy - miny + 1
+        if w > self.max_side or h > self.max_side:
+            self.get_logger().warn(f'视觉栅格 {w}x{h} 超过上限 {self.max_side}，本轮不发布')
+            return
+        data = np.full((h, w), -1, dtype=np.int8)
+        data[arr[:, 1] - miny, arr[:, 0] - minx] = 100
+        msg = OccupancyGrid()
+        msg.header.stamp = stamp
+        msg.header.frame_id = self.global_frame
+        msg.info.resolution = float(self.res)
+        msg.info.width = int(w)
+        msg.info.height = int(h)
+        msg.info.origin.position.x = float(minx * self.res)
+        msg.info.origin.position.y = float(miny * self.res)
+        msg.info.origin.orientation.w = 1.0
+        msg.data = data.reshape(-1).tolist()
+        self.pub_grid.publish(msg)
+
+    def report(self):
+        s = self.stats
+        self.get_logger().info(
+            f'视觉障碍：累积使能 {len(self.cells)} 格；帧 {s["frames"]}，'
+            f'TF 失败 {s["tf_fail"]}，本帧点 {s["last_pts"]} 有效 {s["last_kept"]}，'
+            f'单点噪点滤除 {s["filtered"]}，异常帧 {s["bad"]}')
+
+
+def main():
+    rclpy.init()
+    node = VisionObstacleGrid()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, Exception):
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
