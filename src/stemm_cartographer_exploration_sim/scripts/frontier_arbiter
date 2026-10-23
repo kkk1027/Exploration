@@ -327,7 +327,14 @@ class Arbiter(Node):
         # 取 0.92 留 2 cm 余地）；未知占比过高说明"这块还没探"，同样不派。
         self.corridor_hard = float(p('corridor_hard_m', 0.92).value)
         self.corridor_unknown_max = float(p('corridor_unknown_max', 0.35).value)
-        self.corridor_skip_far = float(p('corridor_skip_far_m', 1.2).value)
+        # D1：末端也查（原来 skip=1.2 m 会整段跳过目标点附近）；保留参数名做兼容，
+        # 但语义改为"末端额外加密采样距离"，不再"跳过"。
+        self.corridor_tail_dense = float(p('corridor_tail_dense_m', 0.8).value)
+        # D2/D3：用"到最近障碍的距离"代替轴向法向扫线（斜通道不再被高估 1.41 倍），
+        # 障碍集合 = /map 占据 ∪ 视觉障碍栅格占据
+        self.clearance_mode = str(p('clearance_mode', 'distance').value).lower()
+        self.use_vision_obstacles = bool(p('corridor_use_vision', True).value)
+        self.vision_grid_topic = str(p('vision_grid_topic', '/vision/obstacle_grid').value)
         self.corridor_stride = max(1, int(p('corridor_stride_cells', 2).value))
         self.narrow_penalty_sec = float(p('narrow_blacklist_sec', 45.0).value)
         # 物理接触区（撞过的地方）：强降权 + 长记忆，避免反复撞同一张桌子
@@ -417,12 +424,25 @@ class Arbiter(Node):
         self.create_subscription(PoseStamped, '/escape_blocked_zone', self.on_escape_zone, 10)
         self.create_subscription(PoseStamped, '/collision_contact_zone',
                                  self.on_contact_zone, 10)
+        # D3：视觉障碍也参与"净空/宽窄"判定（此前只用于代价地图）
+        self.vision_grid = None
+        self._vg_seq = 0
+        self._map_seq = 0
+        self._clear_key = None
+        self._clear_field = None
+        self.create_subscription(OccupancyGrid, self.vision_grid_topic,
+                                 self.on_vision_grid, qmap)
         self.create_timer(1.0, self.tick)
         self.get_logger().info('frontier_arbiter 就绪：可达性预筛/黑名单/最小前沿/回拉')
 
     # ---- 回调 ----
     def on_map(self, m):
         self.map = m
+        self._map_seq += 1
+
+    def on_vision_grid(self, m):
+        self.vision_grid = m
+        self._vg_seq += 1
 
     def on_cmd(self, m):
         self.cmd = (m.linear.x, m.angular.z)
@@ -511,6 +531,78 @@ class Arbiter(Node):
                     q.append((nx, ny))
         return False
 
+
+    # ---- D1/D2/D3：净空场 ----
+    def clearance_field(self):
+        """返回 (dist_m, ox, oy, res, w, h, unknown) 或 None。
+
+        dist_m[i,j] = 该格到最近**障碍**的距离（米）。障碍集合 = `/map` 占据(>=50)
+        ∪ 视觉障碍栅格占据(==100)。用 scipy 的精确距离变换：
+          * D2：不再沿轴向扫法向，斜通道不会被高估（原来 ≈1.41 倍）；
+          * D3：视觉障碍（桌底座等雷达盲区）也计入；
+          * D1：配合调用方"整条路径到末端都采样"，不再跳过目标附近。
+        `unknown` 是 /map 的未知掩码，仅用于算"未知占比"。
+        缓存按 (/map 序号, 视觉栅格序号) 失效，1 Hz tick 下每轮最多重建一次。
+        """
+        m = self.map
+        if m is None:
+            return None
+        info = m.info
+        res = info.resolution
+        if res <= 0:
+            return None
+        w, h = info.width, info.height
+        ox, oy = info.origin.position.x, info.origin.position.y
+        key = (self._map_seq, self._vg_seq, w, h, round(res, 6), round(ox, 4), round(oy, 4))
+        if key == self._clear_key and self._clear_field is not None:
+            return self._clear_field
+        try:
+            import numpy as np
+            from scipy import ndimage
+        except Exception:                     # noqa: BLE001 - 没装 scipy 就退回轴向扫线
+            self._clear_key = None
+            self._clear_field = None
+            return None
+        arr = np.asarray(m.data, dtype=np.int16).reshape(h, w)
+        blocked = arr >= 50
+        unknown = arr < 0
+        vg = self.vision_grid
+        if self.use_vision_obstacles and vg is not None:
+            vr = vg.info.resolution
+            vox, voy = vg.info.origin.position.x, vg.info.origin.position.y
+            v = np.asarray(vg.data, dtype=np.int16).reshape(vg.info.height, vg.info.width)
+            occ = np.argwhere(v == 100)
+            if occ.size and vr > 0:
+                wx = vox + (occ[:, 1] + 0.5) * vr
+                wy = voy + (occ[:, 0] + 0.5) * vr
+                ci = ((wx - ox) / res).astype(np.int32)
+                cj = ((wy - oy) / res).astype(np.int32)
+                ok = (ci >= 0) & (ci < w) & (cj >= 0) & (cj < h)
+                if ok.any():
+                    blocked = blocked.copy()
+                    blocked[cj[ok], ci[ok]] = True
+        dist_cells = ndimage.distance_transform_edt(~blocked)
+        field = (dist_cells * res, ox, oy, res, w, h, unknown)
+        self._clear_key = key
+        self._clear_field = field
+        return field
+
+    def clearance_at(self, field, wx, wy):
+        """世界坐标 → (到最近障碍距离 m, 未知占比 0..1)；窗口按 0.5 m 统计未知占比。"""
+        dist_m, ox, oy, res, w, h, unknown = field
+        import numpy as np
+        ci = int((wx - ox) / res)
+        cj = int((wy - oy) / res)
+        if not (0 <= ci < w and 0 <= cj < h):
+            return 0.0, 1.0
+        d = float(dist_m[cj, ci])
+        r = max(1, int(0.5 / res))
+        lo_i, hi_i = max(0, ci - r), min(w, ci + r + 1)
+        lo_j, hi_j = max(0, cj - r), min(h, cj + r + 1)
+        win = unknown[lo_j:hi_j, lo_i:hi_i]
+        tot = int(win.size) or 1
+        return d, float(int(win.sum()) / tot)
+
     def path_and_width(self, x, y):
         """BFS 出整条路径，再沿路径查"垂直于路径的连续自由宽度"。
 
@@ -544,7 +636,7 @@ class Arbiter(Node):
         start = sy * w + sx
         seen[start] = 1
         q = deque([(sx, sy)])
-        budget = 80000
+        budget = max(80000, w * h * 2)     # D11：预算随地图面积走，避免远处目标被误判不可达
         found = False
         while q and budget > 0:
             cx, cy = q.popleft(); budget -= 1
@@ -590,6 +682,34 @@ class Arbiter(Node):
             if mx < 0 or my < 0 or mx >= ow or my >= oh:
                 return 100
             return odata[my * ow + mx]
+
+        # ---- D1/D2/D3：优先用"到最近障碍的距离场"（含视觉障碍，且整条路径到末端都查）----
+        field = self.clearance_field() if self.clearance_mode == 'distance' else None
+        if field is not None:
+            step = max(1, self.corridor_stride)
+            idxs = list(range(0, len(path), step))
+            tail = int(self.corridor_tail_dense / res)
+            if tail > 0 and len(path) > 1:
+                idxs = sorted(set(idxs) | set(range(max(0, len(path) - tail), len(path))))
+                if idxs[-1] != len(path) - 1:
+                    idxs.append(len(path) - 1)      # 目标格本身必须查（D1）
+            min_w = float('inf')
+            min_unk = 0.0
+            min_at = None
+            for i in idxs:
+                idx = path[i]
+                cx_, cy_ = idx % w, idx // w
+                wxp_ = cx_ * res + ox
+                wyp_ = cy_ * res + oy
+                d, unk_ = self.clearance_at(field, wxp_, wyp_)
+                width_ = 2.0 * d                    # 净宽 ≈ 2×到最近障碍的距离
+                if width_ < min_w:
+                    min_w, min_unk, min_at = width_, unk_, (wxp_, wyp_)
+            if min_at is None:
+                return True, None, None, 0.0
+            if min_w < self.corridor_width:
+                return True, min_at, min_w, min_unk
+            return True, None, min_w, min_unk
 
         need = self.corridor_width
         skip = int(self.corridor_skip_far / res)
@@ -913,6 +1033,10 @@ class Arbiter(Node):
                         and unk <= self.corridor_unknown_max and fallback is None):
                     fallback = (gx, gy, r, min_w, unk)
                 continue
+            try:
+                r['min_w'] = min_w
+            except Exception:                     # noqa: BLE001
+                pass
             self.publish_goal(gx, gy, r)
             return
         if fallback is not None:
@@ -980,6 +1104,10 @@ class Arbiter(Node):
                     '前向净空预检否决：走廊 < %.2fm @(%.2f,%.2f)，目标 (%.2f,%.2f)'
                     % (self.corridor_width, narrow[0], narrow[1], gx, gy))
                 continue
+            try:
+                r['min_w'] = min_w
+            except Exception:                     # noqa: BLE001
+                pass
             self.publish_goal(gx, gy, r)
             return
         if fallback is not None:
@@ -1013,7 +1141,7 @@ class Arbiter(Node):
                 % (('%.2f,%.2f' % (r['x'], r['y'])) if r else '?',
                    (r['unknown'] if r else u) if (r or u is not None) else '?',
                    r['block'] if r else '?',
-                   r['width'] if r else '?',
+                   ('%.2f' % r['min_w']) if (r and 'min_w' in r) else (r['width'] if r else '?'),
                    ('%.0f' % r['penalty']) if r else '?',
                    gx, gy, self.stats))
         except Exception:
