@@ -535,9 +535,9 @@ class Arbiter(Node):
         gx = int((x - ox) / res)
         gy = int((y - oy) / res)
         if not (0 <= sx < w and 0 <= sy < h) or not (0 <= gx < w and 0 <= gy < h):
-            return False, None
+            return False, None, None, 0.0
         if data[gy * w + gx] < 0 or data[gy * w + gx] >= 90:
-            return False, None
+            return False, None, None, 0.0
         from collections import deque
         parent = {}
         seen = bytearray(w * h)
@@ -563,7 +563,7 @@ class Arbiter(Node):
                     parent[idx] = cy * w + cx
                     q.append((nx, ny))
         if not found:
-            return False, None
+            return False, None, None, 0.0
         if not self.corridor_check:
             return True, None, None, 0.0
         # 回溯路径

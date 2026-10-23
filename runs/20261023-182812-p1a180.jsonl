@@ -1,0 +1,9 @@
+{"ts":"2026-10-23T18:28:12+08:00","tag":"p1a180",""check":"pre_launch","nodes":0,"gzserver":0,"residue":"""}
+{"ts":"2026-10-23T18:28:12+08:00","tag":"p1a180",""check":"pose","x":0.0,"y":0.0,"yaw":0.0"}
+{"ts":"2026-10-23T18:28:12+08:00","tag":"p1a180",""check":"variant","disable_retreat":1,"supervisor":"true""}
+{"ts":"2026-10-23T18:28:12+08:00","tag":"p1a180",""check":"vision","enabled":1"}
+{"ts":"2026-10-23T18:28:16+08:00","tag":"p1a180",""check":"launch","pgid":"83617""}
+{"ts":"2026-10-23T18:30:28+08:00","tag":"p1a180",""check":"post_teardown","nodes":1,"gzserver":0,"residue":"""}
+{"ts":"2026-10-23T18:30:28+08:00","tag":"p1a180",""verdict":"PASS_clean""}
+{"check":"memory","samples": 13, "peak_gz_mb": 549, "peak_vision_mb": 70, "peak_nav2_mb": 215, "peak_carto_mb": 56, "min_avail_mb": 10843, "cpu_gz_pct": 27.2, "cpu_vision_pct": 6.1, "cpu_nav2_pct": 44.1, "cpu_carto_pct": 5.9}
+{"check":"collision","summary":{"contacts": 0, "grazes": 0, "alerts": 0, "stalls": 0, "reverse_windows": 0, "reverse_m": 0, "reverse_assist_windows": 0, "reverse_assist_m": 0, "reverse_hard_windows": 0, "reverse_hard_m": 0, "chassis_contacts": 0, "wheel_contacts": 0, "physical_contacts": 0, "min_clearance_ever": 0.417}}
