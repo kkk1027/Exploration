@@ -951,16 +951,31 @@ class Arbiter(Node):
             self._stuck_ref = (now, self.pose[0], self.pose[1])
         self.stuck_zones = [z for z in self.stuck_zones if z[2] > now]
 
-    def _stuck_penalty(self, x, y, now):
-        pen = 0
+    def zone_penalty(self, x, y, now):
+        """"禁入/降权"区域罚分（v1 与 v2/v3 共用）。
+
+        包含：受阻区、碰撞区（D7：近半径等效硬拒）、区域级被拒历史（D13）。
+        一律用**罚分**而非硬 skip —— 全都落在禁区时仍能派出最不坏的那个。
+        """
+        pen = 0.0
         for zx, zy, _ in self.stuck_zones:
             if math.hypot(x - zx, y - zy) < 1.5:
-                pen += 400          # 等价于扣掉 400 个未知格的收益（降权而非硬拒）
+                pen += 400.0
+                break
         self.contact_zones = [z for z in self.contact_zones if z[2] > now]
         for zx, zy, _ in self.contact_zones:
-            if math.hypot(x - zx, y - zy) < self.contact_zone_radius:
+            d = math.hypot(x - zx, y - zy)
+            if d < self.contact_hard_radius:
+                pen += self.contact_hard_penalty
+                break
+            if d < self.contact_zone_radius:
                 pen += self.contact_zone_penalty
+                break
+        pen += self.region_penalty_of(x, y)
         return pen
+
+    def _stuck_penalty(self, x, y, now):
+        return self.zone_penalty(x, y, now)
 
     def grid(self):
         """把 /map 转成打分内核要的 dict（只做一次浅转换，避免每候选重复取属性）。"""
@@ -983,21 +998,7 @@ class Arbiter(Node):
                 self.stats['penalized_black'] = self.stats.get('penalized_black', 0) + 1
                 self._note_uniq('penalized_black', x, y)
                 break
-        for zx, zy, _ in self.stuck_zones:
-            if math.hypot(x - zx, y - zy) < 1.5:
-                pen += 400.0
-                break
-        self.contact_zones = [z for z in self.contact_zones if z[2] > now]
-        for zx, zy, _ in self.contact_zones:
-            d = math.hypot(x - zx, y - zy)
-            if d < self.contact_hard_radius:
-                pen += self.contact_hard_penalty      # D7：撞点近旁本质禁止
-                break
-            if d < self.contact_zone_radius:
-                pen += self.contact_zone_penalty
-                break
-        # D13：区域级被拒历史（陷阱区）
-        pen += self.region_penalty_of(x, y)
+        pen += self.zone_penalty(x, y, now)
         # 反复拉锯：同一个位置附近被派发过很多次却没推进 → 降权
         self.pub_history = [h for h in self.pub_history if now - h[2] < self.retry_window]
         n = sum(1 for hx, hy, _ in self.pub_history
