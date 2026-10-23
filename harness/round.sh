@@ -104,7 +104,7 @@ if [ "$VISION" = "1" ]; then
 else
   python3 harness/vision_nav_params.py --restore 2>&1 | tee -a "$OUT/harness.log" || true
 fi
-setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE spawn_x:=$SX spawn_y:=$SY spawn_yaw:=$SYAW disable_retreat:=$DISABLE_RETREAT escape_supervisor:=$SUPERVISOR car_escape:=$CAR_ESCAPE rviz:=${RVIZ:-false} stack_delay:=${STACK_DELAY:-0.0} scoring:=${SCORING:-v3} corridor_width:=${CORRIDOR_W:-1.05} supervisor_rotate_min_range:=${SUP_ROT_MIN:-0.34} supervisor_advance_stop_range:=${SUP_ADV_STOP:-0.34} probe_log:=$OUT/probe.jsonl supervisor_log:=$OUT/supervisor.jsonl vision:=$VISION vision_dump:=$([ "$VISION" = "1" ] && echo "$OUT/vision_grid" || echo '') watchdog_log:=$OUT/watchdog.jsonl nudge_log:=$OUT/nudge.jsonl" \
+setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE spawn_x:=$SX spawn_y:=$SY spawn_yaw:=$SYAW disable_retreat:=$DISABLE_RETREAT escape_supervisor:=$SUPERVISOR car_escape:=$CAR_ESCAPE rviz:=${RVIZ:-false} stack_delay:=${STACK_DELAY:-0.0} scoring:=${SCORING:-v1} corridor_width:=${CORRIDOR_W:-1.05} supervisor_rotate_min_range:=${SUP_ROT_MIN:-0.34} supervisor_advance_stop_range:=${SUP_ADV_STOP:-0.34} probe_log:=$OUT/probe.jsonl supervisor_log:=$OUT/supervisor.jsonl vision:=$VISION vision_dump:=$([ "$VISION" = "1" ] && echo "$OUT/vision_grid" || echo '') watchdog_log:=$OUT/watchdog.jsonl nudge_log:=$OUT/nudge.jsonl" \
   > "$OUT/launch.log" 2>&1 < /dev/null &
 sleep 3; PGID=$(cat "$OUT/pgid" 2>/dev/null || echo "")
 say "已启动：PGID=$PGID  日志 $OUT/launch.log"
