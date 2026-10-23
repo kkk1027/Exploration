@@ -17,7 +17,12 @@ source /home/kbf/stemm_exploration_sim_ws/install/setup.bash
 V="${1:-1}"; TAG="${2:-tbl}"
 BASE=/home/kbf/stemm_exploration_sim_ws
 OUT="$BASE/logs/table_v${V}_${TAG}_$(date +%Y%m%d-%H%M%S)"; mkdir -p "$OUT"
-SX="${SX:-2.04}"; SY="${SY:-1.37}"; GX="${GX:-5.90}"; GY="${GY:-1.37}"; SECS="${SECS:-90}"
+# 起点用**世界坐标**，目标用**map 坐标**（cartographer 的 map 帧原点 = 起动位姿，
+# 所以 map 坐标 = 世界坐标 - 起点世界坐标，本测试限定 yaw=0）
+SX="${SX:-2.04}"; SY="${SY:-1.37}"; SECS="${SECS:-90}"
+GWX="${GWX:-5.24}"; GWY="${GWY:-1.37}"          # 目标的世界坐标（两张桌子之后）
+GX="${GX:-$(python3 -c "print(round($GWX - $SX, 3))")}"
+GY="${GY:-$(python3 -c "print(round($GWY - $SY, 3))")}"
 say() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$OUT/harness.log"; }
 residue() {
   ps -eo pid,args | grep -E "wheeltec_two_wheel_model/(scan_deadzone_relay|imu_bias_shim)|cartographer_exploration_sim/(collision_probe|session_driver)|gzserver" \
@@ -35,7 +40,7 @@ else
 fi
 trap 'python3 /home/kbf/stemm_exploration_sim_ws/harness/vision_nav_params.py --restore >/dev/null 2>&1' EXIT INT TERM
 
-say "起栈：vision=$V 起点=($SX,$SY) 目标=($GX,$GY)"
+say "起栈：vision=$V 起点(世界)=($SX,$SY) 目标(map)=($GX,$GY)"
 setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py \
   vision:=$V rviz:=false escape_supervisor:=false auto_explore:=false explore_sec:=900.0 \
   spawn_x:=$SX spawn_y:=$SY spawn_yaw:=0.0 probe_log:=$OUT/probe.jsonl" > "$OUT/launch.log" 2>&1 < /dev/null &

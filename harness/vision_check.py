@@ -61,6 +61,17 @@ def grid_to_np(msg):
     return g.reshape(msg.info.height, msg.info.width)
 
 
+def scales(grid):
+    """nav2 的 /costmap 发的是**占用语义**：100=致命、99=内切、1~98=膨胀、-1(255)=未知；
+    原始 0~255 代价只在 /costmap_raw 上。判据：出现 100 且没有 254 → 占用语义。"""
+    if grid.size == 0:
+        return 254, 253
+    has254 = bool((grid == 254).any())
+    if not has254 and bool((grid == 100).any()):
+        return 100, 99
+    return 254, 253
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--timeout', type=float, default=90.0)
@@ -80,6 +91,8 @@ def main():
     if n.vision is not None and n.costmap is not None:
         v, c = n.vision, n.costmap
         vg, cg = grid_to_np(v), grid_to_np(c)
+        LETHAL, INSCR = scales(cg)
+        out['cost_scale'] = {'lethal': LETHAL, 'inscribed': INSCR, 'max': int(cg.max())}
         v_occ = np.argwhere(vg == 100)
         out['vision_cells'] = int(v_occ.shape[0])
         out['vision_frame'] = v.header.frame_id
@@ -100,7 +113,7 @@ def main():
             if 0 <= cx < c.info.width and 0 <= cy < c.info.height:
                 in_cm += 1
                 val = cg[cy, cx]
-                if val == 254:
+                if val == LETHAL:
                     lethal += 1
                 elif val > 0:
                     infl += 1
@@ -115,7 +128,10 @@ def main():
                 vals.append(int(cg[cy, cx]))
         hist = {}
         for val in vals:
-            k = '254' if val == 254 else ('253' if val == 253 else ('0' if val == 0 else '1-252'))
+            k = ('lethal' if val == LETHAL else
+                 'inscribed' if val == INSCR else
+                 'unknown' if val == 255 else
+                 'free' if val == 0 else 'inflated')
             hist[k] = hist.get(k, 0) + 1
         out['value_hist'] = hist
 
@@ -127,7 +143,7 @@ def main():
                 for (iy, ix) in v_occ:
                     cx = int((vox + (ix + 0.5) * vr - cox) / cr) + ddx
                     cy = int((voy + (iy + 0.5) * vr - coy) / cr) + ddy
-                    if 0 <= cx < c.info.width and 0 <= cy < c.info.height and cg[cy, cx] == 254:
+                    if 0 <= cx < c.info.width and 0 <= cy < c.info.height and cg[cy, cx] == LETHAL:
                         hit += 1
                 r = hit / max(1, v_occ.shape[0])
                 if r > best[0]:
@@ -135,7 +151,7 @@ def main():
         out['best_offset'] = best
 
         # ③ 纯视觉格：视觉有、而 0.15 m 内没有任何致命格 —— 这才是"视觉层真的在起作用"
-        lethal_idx = np.argwhere(cg == 254)
+        lethal_idx = np.argwhere(cg == LETHAL)
         if lethal_idx.size:
             pw = np.stack([cox + (lethal_idx[:, 1] + 0.5) * cr,
                            coy + (lethal_idx[:, 0] + 0.5) * cr], axis=1)
@@ -150,7 +166,7 @@ def main():
             solo_lethal = 0
             for (wx, wy) in vw[solo]:
                 cx = int((wx - cox) / cr); cy = int((wy - coy) / cr)
-                if 0 <= cx < c.info.width and 0 <= cy < c.info.height and cg[cy, cx] == 254:
+                if 0 <= cx < c.info.width and 0 <= cy < c.info.height and cg[cy, cx] == LETHAL:
                     solo_lethal += 1
             out['vision_only_lethal'] = solo_lethal
             out['vision_only_lethal_ratio'] = round(solo_lethal / max(1, int(solo.sum())), 3)
