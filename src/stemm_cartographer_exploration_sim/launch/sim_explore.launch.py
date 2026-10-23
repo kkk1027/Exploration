@@ -102,7 +102,8 @@ def generate_launch_description():
                                'global_frame': 'map',
                                'self_filter_radius': LaunchConfiguration('vision_self_radius'),
                                'z_max': 1.80,
-                               'low_z_max': 0.35}])
+                               'low_z_max': 0.35,
+                               'dump_path': LaunchConfiguration('vision_dump')}])
 
     # P0-3：雷达引导的"旋转 + 前进"脱困（与栈同时起，等车端节点就绪后自行等待触发）
     supervisor = Node(package='stemm_cartographer_exploration_sim',
@@ -177,6 +178,8 @@ def generate_launch_description():
             description='累计受阻多少秒后退出脱困（用户要求的 40 s 兜底）'),
         DeclareLaunchArgument('vision', default_value='false',
             description='是否启动视觉障碍源（方案A）。nav2 图层注入需同时 apply 参数补丁'),
+        DeclareLaunchArgument('vision_dump', default_value='',
+            description='视觉累积栅格的落盘前缀（空=不落盘；事故复盘用）'),
         DeclareLaunchArgument('vision_self_radius', default_value='0.38',
             description='视觉障碍的自身过滤半径（m，以机器人原点为圆心）'),
         DeclareLaunchArgument('stack', default_value='true',

@@ -200,8 +200,19 @@ def validate(text, expect_tags=True):
 JOURNAL = {}
 
 
+CACHE = os.path.join('/home/kbf/stemm_exploration_sim_ws', 'patches')
+
+
 def journal_path(path):
-    return path + '.vision_journal.json'
+    """备份/journal 都落在仿真仓库里 —— 车端仓库只留"被改的那一个文件"，
+    不额外生产垃圾文件（与既有 .sim_backup 约定区分开）。"""
+    os.makedirs(CACHE, exist_ok=True)
+    return os.path.join(CACHE, 'stemm_safe_nav2_params.vision_journal.json')
+
+
+def backup_path(path):
+    os.makedirs(CACHE, exist_ok=True)
+    return os.path.join(CACHE, 'stemm_safe_nav2_params.vision_backup.yaml')
 
 
 def load_journal(path):
@@ -241,7 +252,7 @@ def main():
             print(f'  {name}.plugins = {names}')
         return 0
 
-    backup = path + '.vision_backup'
+    backup = backup_path(path)
     if a.apply and not os.path.exists(backup):
         shutil.copy2(path, backup)
         print(f'  已备份 → {backup}')

@@ -90,7 +90,7 @@ vision = None
 if vision_line or 'vision_obstacle_grid' in txt:
     cells = 0
     for line in txt.splitlines():
-        m = re.search(r'累积使能 (\d+) 格', line)
+        m = re.search(r'累积使能 (\d+)(?:/\d+)? 格', line)
         if m:
             cells = max(cells, int(m.group(1)))
     layer_err = has('Failed to create', 'voxel') or has('Could not find plugin') \

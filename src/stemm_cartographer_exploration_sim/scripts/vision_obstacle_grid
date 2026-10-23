@@ -19,6 +19,7 @@
   * 任何 TF/数据异常只告警不崩，nav2 侧层失效时退化为纯雷达（可回退）。
 """
 import math
+import os
 
 import numpy as np
 import rclpy
@@ -79,12 +80,17 @@ class VisionObstacleGrid(Node):
         d('range_min', 0.25)
         d('self_filter_radius', 0.38)
         d('min_points_per_cell', 2)
+        # 跨帧持久化：同一格必须在 >= min_frames 帧里都被观测到才算障碍。
+        # 目的：抑制掠射角/深度噪点在地面与墙根产生的"幽灵格"（它们会无谓地挤窄通道）
+        d('min_frames', 2)
         d('max_points', 120000)
         d('live_hz', 5.0)
         d('accum_hz', 1.0)
         d('max_side_cells', 6000)
         d('obstacle_z', 0.15)
         d('live_voxel', 0.05)
+        # 收尾时把累积栅格落盘（事故复盘用；空=不落盘）
+        d('dump_path', '')
 
         g = self.get_parameter
         self.cloud_topic = g('cloud_topic').value
@@ -97,12 +103,15 @@ class VisionObstacleGrid(Node):
         self.range_min = float(g('range_min').value)
         self.self_r = float(g('self_filter_radius').value)
         self.min_pts = max(1, int(g('min_points_per_cell').value))
+        self.min_frames = max(1, int(g('min_frames').value))
         self.max_points = int(g('max_points').value)
         self.max_side = int(g('max_side_cells').value)
         self.obstacle_z = float(g('obstacle_z').value)
         self.live_voxel = max(0.01, float(g('live_voxel').value))
+        self.dump_path = str(g('dump_path').value or '')
 
         self.cells = set()
+        self.hits = {}          # 格 → 被观测到的帧数（跨帧持久化）
         self.last_live = np.zeros((0, 3), dtype=np.float64)
         self.last_vox = np.zeros((0, 3), dtype=np.float64)
         self.last_low = np.zeros((0, 3), dtype=np.float64)
@@ -218,7 +227,12 @@ class VisionObstacleGrid(Node):
         if good.size:
             gx = good // base - OFF
             gy = good % base - OFF
-            self.cells.update(zip(gx.tolist(), gy.tolist()))
+            hits = self.hits
+            for c in zip(gx.tolist(), gy.tolist()):
+                n = hits.get(c, 0) + 1
+                hits[c] = n if n < 10000 else 10000
+                if n >= self.min_frames:
+                    self.cells.add(c)
         self.stats['filtered'] = int(uniq.size - good.size)
 
     # ---------------- 输出 ----------------
@@ -267,10 +281,36 @@ class VisionObstacleGrid(Node):
         msg.data = data.reshape(-1).tolist()
         self.pub_grid.publish(msg)
 
+    def dump_grid(self):
+        """把累积障碍落成 PGM（map_server trinary 约定：0=占用、205=未知、254=自由），
+        便于事后核对"机器人卡在哪、那里是不是视觉标出来的"。"""
+        if not self.dump_path or not self.cells:
+            return
+        arr = np.fromiter((v for c in self.cells for v in c), dtype=np.int64,
+                          count=2 * len(self.cells)).reshape(-1, 2)
+        minx, miny = int(arr[:, 0].min()), int(arr[:, 1].min())
+        maxx, maxy = int(arr[:, 0].max()), int(arr[:, 1].max())
+        w, h = maxx - minx + 1, maxy - miny + 1
+        if w > self.max_side or h > self.max_side:
+            self.get_logger().warn('累积栅格过大，跳过落盘')
+            return
+        img = np.full((h, w), 205, dtype=np.uint8)     # 未知
+        img[arr[:, 1] - miny, arr[:, 0] - minx] = 0    # 占用
+        path = self.dump_path
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path + '.pgm', 'wb') as f:
+            f.write(f'P5\n{w} {h}\n255\n'.encode())
+            f.write(img.tobytes())
+        with open(path + '.yaml', 'w', encoding='utf-8') as f:
+            f.write(f'image: {os.path.basename(path)}.pgm\nresolution: {self.res}\n'
+                    f'origin: [{minx * self.res:.6f}, {miny * self.res:.6f}, 0.0]\n'
+                    f'negate: 0\noccupied_thresh: 0.65\nfree_thresh: 0.196\n')
+        self.get_logger().info(f'累积障碍栅格已落盘：{path}.pgm（{w}x{h}, {len(self.cells)} 格）')
+
     def report(self):
         s = self.stats
         self.get_logger().info(
-            f'视觉障碍：累积使能 {len(self.cells)} 格；帧 {s["frames"]}，'
+            f'视觉障碍：累积使能 {len(self.cells)}/{len(self.hits)} 格（过 {self.min_frames} 帧确认）；帧 {s["frames"]}，'
             f'TF 失败 {s["tf_fail"]}，本帧点 {s["last_pts"]} 有效 {s["last_kept"]}，'
             f'单点噪点滤除 {s["filtered"]}，异常帧 {s["bad"]}')
 
@@ -283,6 +323,10 @@ def main():
     except (KeyboardInterrupt, Exception):
         pass
     finally:
+        try:
+            node.dump_grid()
+        except Exception as e:  # 落盘失败不影响收尾
+            print(f'[vision] dump 失败：{e}')
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()

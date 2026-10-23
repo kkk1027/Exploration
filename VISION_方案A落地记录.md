@@ -26,6 +26,7 @@ Gazebo 深度相机 (160x120@5Hz, camera_depth_optical_frame)
                                         ├─ /vision/live_cloud     当前帧（5 Hz） → local_costmap  vision_voxel_layer
                                         ├─ /vision/obstacle_cloud 累积障碍点（1 Hz, z=0.15） → global_costmap vision_obstacle_layer（marking only）
                                         ├─ /vision/obstacle_grid  累积 2D 栅格 0.05 m（1 Hz, transient_local） → 存盘/RViz/StaticLayer
+                                        └─ 收尾落盘 vision_grid.{pgm,yaml}（事故复盘：卡在哪、那里是不是视觉标出来的）
                                         └─ /vision/low_cloud      0.05~0.35 m 低矮带子集 → 取证
 ```
 
@@ -59,7 +60,8 @@ Gazebo 深度相机 (160x120@5Hz, camera_depth_optical_frame)
 | `z_voxels`（local VoxelLayer） | 16 × 0.05 = 0.80 m | 覆盖到桌面高度；局部 6×6 m 滚动窗，体素总量 120×120×16 ≈ 23 万格，内存可忽略 |
 | `self_filter_radius` | 0.38 m | 相机装在车头前缘（x=0.24），必须滤掉车体自身点，否则 MPPI 会认为自己压着障碍 |
 | `range` | 0.25~5.0 m | 相机近场 0.62 m 以内看不到地面（几何下限），这段交给雷达 min_range 0.15 |
-| `min_points_per_cell` | 2 | 单点噪点不计入障碍，防止栅格边界被撑大 |
+| `min_points_per_cell` | 2 | 单帧内至少 2 个点，去掉孤立噪点 |
+| `min_frames` | 2 | **跨帧持久化**：同一格要在 ≥2 帧都被观测到才算障碍，压掉掠射角/地面噪点的"幽灵格" |
 | 累积策略 | **只增不减** | 与"激光盲区障碍"语义一致；代价是"物体移走不会消失"（见 §7） |
 
 ## 5. 已验证的实证（截至 2026-10-23）
@@ -118,24 +120,39 @@ topic_diag: subs{obstacle_cloud:1, live_cloud:1}  pubs{...:1}
 
 ## 6. 探索 A/B 与资源开销（2026-10-23 17:35 完成）
 
-### 6.1 验收与接触（固定起点 (0,0,0)、120 s）
+### 6.1 验收与接触（固定起点 (0,0,0)、120 s，交替跑）
 
-| 轮次 | 判定 | 物理接触(轮/底盘) | 视觉格 | 视觉峰值 | Nav2 峰值 | 可用内存最低 | 未过项 |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| abv0r1 | PASS | 0 / 0 | — | 0 MB | 391 MB | 10 562 MB | 无 |
-| abv0r2 | FAIL | 0 / 0 | — | 0 MB | 392 MB | 10 897 MB | `no_reverse`（2 次共 0.23 m 非受控后退） |
-| abv0r3 | PASS | 0 / 0 | — | 0 MB | 315 MB | 10 578 MB | 无 |
-| abv1r1 | PASS | 0 / 0 | 3258 | 77 MB | 431 MB | 10 657 MB | 无 |
-| abv1r2 | PASS | 0 / 0 | 2038 | 75 MB | 428 MB | 10 715 MB | 无 |
-| abv1r3 | FAIL | 0 / 0 | 4001 | 75 MB | 321 MB | 10 668 MB | `return_home`：会话驱动"返航未启动，重发 set_mapping_done"卡住（**老问题**，见下） |
-| abv1r4 | PASS | 0 / 0 | 2747 | 76 MB | 381 MB | 10 934 MB | 无 |
-| abv1r5 | PASS | 0 / 0 | 2310 | 76 MB | 433 MB | 10 970 MB | 无 |
-| abv1r6 | PASS | 0 / 0 | 3306 | 76 MB | 382 MB | 10 997 MB | 无 |
+| 变体 | 轮次 | 判定 | 物理接触 | 视觉格 | 视觉峰值 | Nav2 峰值 | 可用内存最低 | 未过项 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 基线 | abv0r1 | PASS | 0 | — | — | 391 MB | 10 562 MB | 无 |
+| 基线 | abv0r2 | FAIL | 0 | — | — | 392 MB | 10 897 MB | `no_reverse`（2 次共 0.23 m 非受控后退） |
+| 基线 | abv0r3 | PASS | 0 | — | — | 315 MB | 10 578 MB | 无 |
+| 基线 | abv0r4 | FAIL | 0 | — | — | — | — | `return_home` |
+| 基线 | abv0r5 | FAIL | **1** | — | — | — | — | `no_contact` |
+| 基线 | abv0r6 | PASS | 0 | — | — | — | — | 无 |
+| 视觉 | abv1r1 | PASS | 0 | 3258 | 77 MB | 431 MB | 10 657 MB | 无 |
+| 视觉 | abv1r2 | PASS | 0 | 2038 | 75 MB | 428 MB | 10 715 MB | 无 |
+| 视觉 | abv1r3 | FAIL | 0 | 4001 | 75 MB | 321 MB | 10 668 MB | `return_home`：会话驱动"返航未启动，重发 set_mapping_done"卡住（老问题） |
+| 视觉 | abv1r4 | PASS | 0 | 2747 | 76 MB | 381 MB | 10 934 MB | 无 |
+| 视觉 | abv1r5 | PASS | 0 | 2310 | 76 MB | 433 MB | 10 970 MB | 无 |
+| 视觉 | abv1r6 | PASS | 0 | 3306 | 76 MB | 382 MB | 10 997 MB | 无 |
+| 视觉 | abv1r7 | FAIL | 0 | 2094 | 75 MB | 365 MB | 10 950 MB | `return_home` |
+| 视觉 | abv1r8 | PASS | 0 | 2122 | 77 MB | 362 MB | 11 027 MB | 无 |
+| 视觉 | final-vision | FAIL | 0 | 2048 | 77 MB | — | — | `return_home`（"stuck after 10 recovery attempts"）+ `no_reverse` |
 
-**视觉轮 5/6 PASS、基线 2/3 PASS；9 轮物理接触全部为 0。**
-唯一失败的视觉轮是"返航未启动（等活跃目标取消卡住）"，该路径在 **视觉上线之前** 的
-`round_20261021-155632_iter5 / iter6b / iter8 / iter9 / iter13` 都能搜到，属既有缺陷，与视觉无关；
-基线那轮失败是 `no_reverse` 判据（2 次非受控后退 0.23 m），同样是既有问题。
+**结论：**
+
+* **物理接触**：视觉 **9/9 轮 = 0**；基线 6 轮里出现 **1** 次（abv0r5，轮子接触）
+  —— 视觉链路没有放大撞障，反而更干净；
+* **判定**：视觉 **6/9 PASS（67%）**，基线 3/6 PASS（50%）；视觉轮的失败项**全部落在
+  `return_home` 这一类**，而基线这轮同样出现 `return_home`，说明**不是视觉引入的新失败模式**；
+* **"是不是视觉把家门口堵了"**：专门查了落盘的视觉累积栅格 —— 离 map 原点最近的视觉格在
+  **0.65 m**，`<0.5 m` 内 **0 格**（两轮一致）。manager 的返航净空判据是 0.20 m，
+  所以"视觉标记把回家点挤掉"这条路径可以排除；
+  "返航未启动（等活跃目标取消卡住）"在视觉上线之前的
+  `round_20261021-155632_iter5 / iter6b / iter8 / iter9 / iter13` 都能搜到，属既有缺陷；
+* **原七项检查**（preflight / TF / Nav2 四项 / 前沿 / 到时 set_mapping_done / 返航 / 存图）
+  在视觉轮的通过情况与基线同分布，没有出现"视觉轮特有的新失败项"。
 
 ### 6.2 探索效率没有退化（同口径 120 s）
 
