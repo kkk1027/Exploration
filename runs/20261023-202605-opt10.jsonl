@@ -1,0 +1,5 @@
+{"ts":"2026-10-23T20:26:05+08:00","tag":"opt10",""check":"pre_launch","nodes":1,"gzserver":0,"residue":"""}
+{"ts":"2026-10-23T20:26:05+08:00","tag":"opt10",""check":"pose","x":0.0,"y":0.0,"yaw":0.0"}
+{"ts":"2026-10-23T20:26:05+08:00","tag":"opt10",""check":"variant","disable_retreat":1,"supervisor":"true""}
+{"ts":"2026-10-23T20:26:05+08:00","tag":"opt10",""check":"vision","enabled":1"}
+{"ts":"2026-10-23T20:26:08+08:00","tag":"opt10",""check":"launch","pgid":"165691""}

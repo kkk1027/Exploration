@@ -1,0 +1,9 @@
+{"ts":"2026-10-23T20:06:45+08:00","tag":"opt5",""check":"pre_launch","nodes":10,"gzserver":0,"residue":"""}
+{"ts":"2026-10-23T20:06:45+08:00","tag":"opt5",""check":"pose","x":0.0,"y":0.0,"yaw":0.0"}
+{"ts":"2026-10-23T20:06:45+08:00","tag":"opt5",""check":"variant","disable_retreat":1,"supervisor":"true""}
+{"ts":"2026-10-23T20:06:45+08:00","tag":"opt5",""check":"vision","enabled":1"}
+{"ts":"2026-10-23T20:06:48+08:00","tag":"opt5",""check":"launch","pgid":"148018""}
+{"ts":"2026-10-23T20:14:26+08:00","tag":"opt5",""check":"post_teardown","nodes":10,"gzserver":0,"residue":"""}
+{"ts":"2026-10-23T20:14:26+08:00","tag":"opt5",""verdict":"PASS_clean""}
+{"check":"memory","samples": 42, "peak_gz_mb": 553, "peak_vision_mb": 78, "peak_nav2_mb": 372, "peak_carto_mb": 70, "min_avail_mb": 10587, "cpu_gz_pct": 24.2, "cpu_vision_pct": 7.6, "cpu_nav2_pct": 21.5, "cpu_carto_pct": 2.9}
+{"check":"collision","summary":{"contacts": 158, "grazes": 7, "alerts": 7, "stalls": 1, "reverse_windows": 9, "reverse_m": 1.216, "reverse_assist_windows": 9, "reverse_assist_m": 1.216, "reverse_hard_windows": 0, "reverse_hard_m": 0, "chassis_contacts": 151, "wheel_contacts": 0, "physical_contacts": 151, "min_clearance_ever": 0.0}}
