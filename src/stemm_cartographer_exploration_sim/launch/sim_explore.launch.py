@@ -28,9 +28,14 @@ from launch_ros.actions import Node
 def generate_launch_description():
     model = get_package_share_directory('wheeltec_two_wheel_model')
     nav_share = get_package_share_directory('wheeltec_two_wheel_nav')
-    rviz_cfg = os.path.join(nav_share, 'rviz', 'slam.rviz')
+    # 方案A：默认用仿真包自带的配置（已含视觉栅格/代价地图/视觉点云/规划路径），
+    # 厂商 slam.rviz 保持不动；需要旧视图时用 rviz_config:=<path> 覆盖。
+    rviz_cfg = LaunchConfiguration('rviz_config')
     explore = get_package_share_directory('stemm_cartographer_exploration')
     sim_pkg = get_package_share_directory('stemm_cartographer_exploration_sim')
+    default_rviz_cfg = os.path.join(sim_pkg, 'config', 'sim_vision.rviz')
+    if not os.path.exists(default_rviz_cfg):
+        default_rviz_cfg = os.path.join(nav_share, 'rviz', 'slam.rviz')
 
     world_cfg = LaunchConfiguration('world')
     explore_sec = LaunchConfiguration('explore_sec')
@@ -105,6 +110,16 @@ def generate_launch_description():
                                'low_z_max': 0.35,
                                'dump_path': LaunchConfiguration('vision_dump')}])
 
+    # P1-2：静止看门狗 —— 车端前向安全闸会让 nav2 "在导航但不动"，这里 5 s 级识别并自愈
+    watchdog = Node(package='stemm_cartographer_exploration_sim',
+                    executable='explore_watchdog', name='explore_watchdog',
+                    output='screen',
+                    condition=IfCondition(LaunchConfiguration('watchdog')),
+                    parameters=[{'use_sim_time': use_sim_time,
+                                 'enabled': True,
+                                 'stall_sec': LaunchConfiguration('watchdog_stall_sec'),
+                                 'log_path': LaunchConfiguration('watchdog_log')}])
+
     # P0-3：雷达引导的"旋转 + 前进"脱困（与栈同时起，等车端节点就绪后自行等待触发）
     supervisor = Node(package='stemm_cartographer_exploration_sim',
                       executable='escape_supervisor', name='escape_supervisor',
@@ -145,6 +160,8 @@ def generate_launch_description():
         DeclareLaunchArgument('world', default_value=os.path.join(
             model, 'world', 'custom_room_2ms.world'),
             description='仿真世界（默认 2 ms 步长版）'),
+        DeclareLaunchArgument('rviz_config', default_value=default_rviz_cfg,
+            description='rviz2 配置：默认仿真包��� sim_vision.rviz（含视觉层显示）'),
         DeclareLaunchArgument('rviz', default_value='true',
             description='是否启动 rviz2（地图/激光/机器人模型可视化）'),
         DeclareLaunchArgument('spawn_x', default_value='0.0'),
@@ -176,6 +193,12 @@ def generate_launch_description():
             description='脱困前进时前向 ±45° 的最小测距门槛'),
         DeclareLaunchArgument('supervisor_recovery_timeout', default_value='40.0',
             description='累计受阻多少秒后退出脱困（用户要求的 40 s 兜底）'),
+        DeclareLaunchArgument('watchdog', default_value='true',
+            description='是否启用静止看门狗（车端安全闸导致的"在导航但不动"）'),
+        DeclareLaunchArgument('watchdog_stall_sec', default_value='5.0',
+            description='静止多少秒判定卡死并自愈（取消目标+上报受阻区）'),
+        DeclareLaunchArgument('watchdog_log', default_value='',
+            description='静止事件 JSONL 路径（空=只打日志）'),
         DeclareLaunchArgument('vision', default_value='false',
             description='是否启动视觉障碍源（方案A）。nav2 图层注入需同时 apply 参数补丁'),
         DeclareLaunchArgument('vision_dump', default_value='',
@@ -194,6 +217,7 @@ def generate_launch_description():
         robot,
         probe,
         vision,
+        watchdog,
         TimerAction(period=stack_delay, actions=[stack, patch_sim_time, arbiter, supervisor]),
         TimerAction(period=stack_delay, actions=[driver]),
         rviz])

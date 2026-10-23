@@ -323,6 +323,10 @@ class Arbiter(Node):
         # （雷达 0.225 m 高度看不见）→ f2 轮 690 次轮子接触全在这里。抬高净宽下限后这类
         # "看着能过、实际过不去"的口子会被前向净空预检直接否掉。
         self.corridor_width = float(p('corridor_width_m', 1.05).value)
+        # 硬下限：低于这个净宽一律不派（车宽 0.40 + 车端前向安全闸 0.45 的几何下界 0.90，
+        # 取 0.92 留 2 cm 余地）；未知占比过高说明"这块还没探"，同样不派。
+        self.corridor_hard = float(p('corridor_hard_m', 0.92).value)
+        self.corridor_unknown_max = float(p('corridor_unknown_max', 0.35).value)
         self.corridor_skip_far = float(p('corridor_skip_far_m', 1.2).value)
         self.corridor_stride = max(1, int(p('corridor_stride_cells', 2).value))
         self.narrow_penalty_sec = float(p('narrow_blacklist_sec', 45.0).value)
@@ -391,7 +395,7 @@ class Arbiter(Node):
         self._stuck_ref = None    # (t, x, y)
         self.stats = {'seen': 0, 'rejected_size': 0, 'rejected_path': 0,
                       'rejected_black': 0, 'published': 0,
-                      'rejected_narrow': 0, 'narrow_fallback': 0,
+                      'rejected_narrow': 0, 'narrow_fallback': 0, 'narrow_blocked_all': 0,
                       'escape_zones': 0}
 
         qmap = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
@@ -510,17 +514,19 @@ class Arbiter(Node):
     def path_and_width(self, x, y):
         """BFS 出整条路径，再沿路径查"垂直于路径的连续自由宽度"。
 
-        返回 (reachable, narrow_at)。narrow_at 为第一处走廊宽度不足的格子坐标。
+        返回 (reachable, narrow_at, min_width, unknown_share)。
+        narrow_at 为走廊宽度不足处坐标；min_width 为路径实测最小净宽（未知格按半宽计），
+        unknown_share 为该处的未知占比（用来判断"看着宽其实是没探到"）。
         判据：路径上任一点，垂直方向上连续自由格（<90 且已知）的总长必须 >= corridor_width，
         以免把目标派到"必须挤过窄缝"的地方 —— 这正是反复楔死的来源。
         """
         cm = self.costmap
         if cm is None or self.pose is None:
-            return True, None
+            return True, None, None, 0.0
         info = cm.info
         res = info.resolution
         if res <= 0:
-            return True, None
+            return True, None, None, 0.0
         w, h = info.width, info.height
         ox, oy = info.origin.position.x, info.origin.position.y
         data = cm.data
@@ -559,7 +565,7 @@ class Arbiter(Node):
         if not found:
             return False, None
         if not self.corridor_check:
-            return True, None
+            return True, None, None, 0.0
         # 回溯路径
         path = []
         cur = gy * w + gx
@@ -574,21 +580,23 @@ class Arbiter(Node):
         # 直接按净宽读会把 1.05 m 的通道误判成窄缝。
         occ = self.map
         if occ is None:
-            return True, None
+            return True, None, None, 0.0
         ores = occ.info.resolution
         ow, oh = occ.info.width, occ.info.height
         oox, ooy = occ.info.origin.position.x, occ.info.origin.position.y
         odata = occ.data
 
-        def map_blocked(mx, my):
+        def map_val(mx, my):
             if mx < 0 or my < 0 or mx >= ow or my >= oh:
-                return True
-            v = odata[my * ow + mx]
-            return v >= 50                     # -1(未知) 与自由都算可通行
+                return 100
+            return odata[my * ow + mx]
 
         need = self.corridor_width
         skip = int(self.corridor_skip_far / res)
         half = int(need / ores / 2) + 1
+        min_w = float('inf')       # 路径上实测最小净宽（未知格按半宽计）
+        min_unk = 0.0              # 取到最小宽度处的未知占比
+        min_at = None
         for i in range(0, max(0, len(path) - skip), self.corridor_stride):
             idx = path[i]
             cx, cy = idx % w, idx // w
@@ -607,24 +615,40 @@ class Arbiter(Node):
             mcy = int((wyp - ooy) / ores)
             if half * ores > 2.0:              # 分辨率异常时保护
                 half = int(2.0 / ores)
-            free_lo = 0
-            k = 1
-            while k <= half:
-                mx = int(round(mcx + px * k)); my = int(round(mcy + py * k))
-                if map_blocked(mx, my):
-                    break
-                free_lo = k; k += 1
-            free_hi = 0
-            k = 1
-            while k <= half:
-                mx = int(round(mcx - px * k)); my = int(round(mcy - py * k))
-                if map_blocked(mx, my):
-                    break
-                free_hi = k; k += 1
-            width = (free_lo + free_hi + 1) * ores
-            if width < need:
-                return True, (wxp, wyp)
-        return True, None
+            # 逐格扫：免费格按 1 计、未知格按 0.5 计（2026-10-23：原来把未知当自由，
+            # 门洞半米没探到就以为"1.05 m 宽"，车开进去才发现只有 0.9 m）
+            def scan(sign):
+                known = 0.0
+                unk = 0.0
+                k = 1
+                while k <= half:
+                    mx = int(round(mcx + sign * px * k)); my = int(round(mcy + sign * py * k))
+                    v = map_val(mx, my)
+                    if v >= 50:
+                        break
+                    if v < 0:
+                        unk += 1.0
+                        if unk > 0.5 * half:      # 未知太多就不再看更远
+                            break
+                    else:
+                        known += 1.0
+                    k += 1
+                return known, unk
+
+            klo, ulo = scan(+1)
+            khi, uhi = scan(-1)
+            n_cells = klo + khi + 1.0
+            n_unk = ulo + uhi
+            width = (n_cells - 0.5 * n_unk) * ores
+            if width < min_w:
+                min_w = width
+                min_unk = n_unk / max(1.0, n_cells)
+                min_at = (wxp, wyp)
+        if min_at is None:
+            return True, None, None, 0.0
+        if min_w < need:
+            return True, min_at, min_w, min_unk
+        return True, None, min_w, min_unk
 
     def on_odom(self, m):
         q = m.pose.pose.position
@@ -792,7 +816,7 @@ class Arbiter(Node):
         fallback = None
         for u, negd, x, y in scored[:self.max_cand]:
             gx, gy = self.pull_back(x, y)
-            ok, narrow = self.path_and_width(gx, gy)
+            ok, narrow, min_w, unk = self.path_and_width(gx, gy)
             if not ok:
                 self.blacklist.append((gx, gy, now + self.bl_sec))
                 self.stats['rejected_path'] += 1
@@ -800,7 +824,8 @@ class Arbiter(Node):
             if narrow is not None:
                 self.stats['rejected_narrow'] += 1
                 self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
-                if fallback is None:
+                if (min_w is not None and min_w >= self.corridor_hard
+                        and unk <= self.corridor_unknown_max and fallback is None):
                     fallback = (gx, gy)
                 self.get_logger().info(
                     '前向净空预检否决：走廊 < %.2fm @(%.2f,%.2f)，目标 (%.2f,%.2f)'
@@ -873,7 +898,7 @@ class Arbiter(Node):
         fallback = None
         for r in keep[:self.max_cand]:
             gx, gy = self.pull_back(r['x'], r['y'])
-            ok, narrow = self.path_and_width(gx, gy)
+            ok, narrow, min_w, unk = self.path_and_width(gx, gy)
             if not ok:
                 self.blacklist.append((gx, gy, now + self.bl_sec))
                 self.stats['rejected_path'] += 1
@@ -881,16 +906,29 @@ class Arbiter(Node):
             if narrow is not None:
                 self.stats['rejected_narrow'] += 1
                 self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
-                if fallback is None:
-                    fallback = (gx, gy, r)
+                # 软回退只允许"确实够宽、而且宽度不是靠未知格撑出来的"候选。
+                # 2026-10-23：原来无条件派发最优窄候选，车开进 0.9 m 门洞后被车端
+                # 前向安全闸（0.45 m）判死、原地静止 40~90 s，就是这条路径造成的。
+                if (min_w is not None and min_w >= self.corridor_hard
+                        and unk <= self.corridor_unknown_max and fallback is None):
+                    fallback = (gx, gy, r, min_w, unk)
                 continue
             self.publish_goal(gx, gy, r)
             return
         if fallback is not None:
             self.stats['narrow_fallback'] += 1
+            self.get_logger().warn(
+                '[v3] 候选全部需穿窄缝，回退派发实测最宽者 (%.2f,%.2f) 净宽 %.2f m 未知占比 %.0f%%'
+                % (fallback[0], fallback[1], fallback[3], 100 * fallback[4]))
             self.publish_goal(fallback[0], fallback[1], fallback[2])
             return
-        self.get_logger().warn(f'[v3] 本轮候选全部被拒：{self.stats}')
+        # 全部低于硬下限：宁可原地等新前沿，也不把车塞进过不去的口子
+        self.stats['narrow_blocked_all'] = self.stats.get('narrow_blocked_all', 0) + 1
+        if now - getattr(self, '_last_narrow_warn', 0.0) > 10.0:
+            self._last_narrow_warn = now
+            self.get_logger().warn(
+                '[v3] 本轮候选全部低于走廊硬下限 %.2f m（不做软回退，等新前沿）；统计 %s'
+                % (self.corridor_hard, self.stats))
 
     def _tick_v2(self):
         now = time.monotonic()
@@ -928,7 +966,7 @@ class Arbiter(Node):
         fallback = None
         for r in keep[:self.max_cand]:
             gx, gy = self.pull_back(r['x'], r['y'])
-            ok, narrow = self.path_and_width(gx, gy)
+            ok, narrow, min_w, unk = self.path_and_width(gx, gy)
             if not ok:
                 self.blacklist.append((gx, gy, now + self.bl_sec))
                 self.stats['rejected_path'] += 1

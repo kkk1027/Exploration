@@ -1,0 +1,205 @@
+#!/usr/bin/env python3
+"""explore_watchdog —— 探索期的"长时间静止"看门狗（方案：P1-2）。
+
+为什么需要（2026-10-23 实测）：
+  车端在前向净空 < 0.45 m 时会 publish_zero_velocity 并进入 safety_stop /
+  blocked_waiting_clearance，nav2 那边**不会失败**，于是整轮就"看起来在导航、其实一动不动"，
+  直到 escape_supervisor 累计受阻 40 s 才放弃 —— 用户看到的就是"窄道内无征兆的长时静止"。
+
+本节点把这种静默状态变成 5 s 级、可诊断、可自愈的事件：
+  1) 检测：有活跃导航目标 + 位移 < disp_eps 持续 >= stall_sec；
+  2) 归因：区分"指令本来就是 0（车端安全闸/manager 让停）"与"有指令但车不走"；
+  3) 处置：把当前位置作为受阻区上报给 frontier_arbiter（/escape_blocked_zone），
+     并 cancel 当前 NavigateToPose 目标 —— 让仲裁立刻换一个候选，而不是干等 40~90 s；
+  4) 取证：JSONL 记录 pose / cmd / 前向净空 / mode / last_error。
+
+不碰 /scan、/map、/cmd_vel，只读 + 一次 cancel，可整节点关掉（enabled=false）。
+"""
+import json
+import math
+import time
+
+import rclpy
+from action_msgs.msg import GoalInfo, GoalStatusArray
+from action_msgs.srv import CancelGoal
+from geometry_msgs.msg import PoseStamped, Twist
+from nav_msgs.msg import Odometry
+from rclpy.node import Node
+from std_msgs.msg import String
+
+ACTIVE = (1, 2, 3)          # ACCEPTED / EXECUTING / CANCELING
+
+
+class ExploreWatchdog(Node):
+    def __init__(self):
+        super().__init__('explore_watchdog')
+        d = self.declare_parameter
+        d('enabled', True)
+        d('stall_sec', 5.0)
+        d('disp_eps', 0.03)
+        d('cooldown_sec', 8.0)
+        d('zone_radius_log', 1.0)
+        d('odom_topic', '/odom_combined')
+        d('cmd_topic', '/cmd_vel')
+        d('nav_state_topic', '/stemm_cartographer/nav_state')
+        d('status_topic', '/navigate_to_pose/_action/status')
+        d('zone_topic', '/escape_blocked_zone')
+        d('log_path', '')
+        g = self.get_parameter
+        self.enabled = bool(g('enabled').value)
+        self.stall_sec = float(g('stall_sec').value)
+        self.disp_eps = float(g('disp_eps').value)
+        self.cooldown = float(g('cooldown_sec').value)
+        self.log_path = str(g('log_path').value or '')
+
+        self.pose = None
+        self.cmd = (0.0, 0.0)
+        self.goals = {}              # goal_id(hex) -> status
+        self.nav = {}
+        self.ref = None              # (t, x, y) 位移参考点
+        self.last_fire = 0.0
+        self.stalls = 0
+        self.places = []             # [(x,y,t)] 近期卡死点
+
+        self.create_subscription(Odometry, g('odom_topic').value, self.on_odom, 20)
+        self.create_subscription(Twist, g('cmd_topic').value, self.on_cmd, 20)
+        self.create_subscription(GoalStatusArray, g('status_topic').value, self.on_status, 10)
+        self.create_subscription(String, g('nav_state_topic').value, self.on_nav, 10)
+        self.pub_zone = self.create_publisher(PoseStamped, g('zone_topic').value, 10)
+        self.cancel_cli = self.create_client(
+            CancelGoal, g('status_topic').value.rsplit('/_action', 1)[0] + '/_action/cancel_goal')
+        self.create_timer(1.0, self.tick)
+        self.get_logger().info(
+            'explore_watchdog up: stall>=%.1fs disp<%.2fm cooldown=%.0fs enabled=%s'
+            % (self.stall_sec, self.disp_eps, self.cooldown, self.enabled))
+
+    # ---------- 输入 ----------
+    def on_odom(self, m):
+        p = m.pose.pose.position
+        self.pose = (p.x, p.y)
+
+    def on_cmd(self, m):
+        self.cmd = (m.linear.x, m.angular.z)
+
+    def on_status(self, m):
+        self.goals = {bytes(g.goal_info.goal_id.uuid).hex(): g.status for g in m.status_list}
+
+    def on_nav(self, m):
+        try:
+            self.nav = json.loads(m.data or '{}')
+        except Exception:               # noqa: BLE001 - 车端偶发非 JSON
+            self.nav = {}
+
+    # ---------- 判据 ----------
+    def active_goals(self):
+        return [k for k, v in self.goals.items() if v in ACTIVE]
+
+    def record(self, row):
+        if not self.log_path:
+            return
+        try:
+            with open(self.log_path, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(row, ensure_ascii=False) + '\n')
+        except Exception:               # noqa: BLE001
+            pass
+
+    def tick(self):
+        if not self.enabled or self.pose is None:
+            return
+        goals = self.active_goals()
+        if not goals:
+            self.ref = None
+            return
+        now = time.monotonic()
+        if self.ref is None:
+            self.ref = (now, self.pose[0], self.pose[1])
+            return
+        t0, x0, y0 = self.ref
+        moved = math.hypot(self.pose[0] - x0, self.pose[1] - y0)
+        if moved >= self.disp_eps:
+            self.ref = (now, self.pose[0], self.pose[1])
+            return
+        if now - t0 < self.stall_sec or now - self.last_fire < self.cooldown:
+            return
+
+        cmd_zero = abs(self.cmd[0]) < 0.02 and abs(self.cmd[1]) < 0.05
+        why = ('指令为 0（车端安全闸/manager 让停）' if cmd_zero
+               else '有指令但车不动（轮子打滑/被压住）')
+        front = self.nav.get('front_min_range')
+        mode = self.nav.get('mode')
+        state = self.nav.get('navigation_state')
+        err = self.nav.get('last_error') or ''
+        self.stalls += 1
+        self.last_fire = now
+        self.ref = (now, self.pose[0], self.pose[1])
+        self.get_logger().warn(
+            '静止超时 %.1fs @(%.2f,%.2f)：%s；cmd=(%.2f,%.2f) 前向=%.2fm mode=%s state=%s err=%s'
+            % (now - t0, self.pose[0], self.pose[1], why, self.cmd[0], self.cmd[1],
+               front if front is not None else -1.0, mode, state, err))
+        self.record({'type': 'stall', 't': round(time.time(), 3),
+                     'stall_sec': round(now - t0, 2), 'pos': [round(self.pose[0], 3),
+                     round(self.pose[1], 3)], 'why': why,
+                     'cmd': list(self.cmd), 'front_min_range': front,
+                     'mode': mode, 'navigation_state': state, 'last_error': err})
+
+        # 同一处反复卡死 → 记一次"顽固点"，供后续更长时间拉黑
+        same = [p for p in self.places
+                if math.hypot(p[0] - self.pose[0], p[1] - self.pose[1]) < 1.0
+                and time.monotonic() - p[2] < 120.0]
+        self.places.append((self.pose[0], self.pose[1], time.monotonic()))
+        if same:
+            self.get_logger().warn(
+                '同一处 120 s 内第 %d 次静止：建议把 (%.2f,%.2f) 附近更长时间拉黑'
+                % (len(same) + 1, self.pose[0], self.pose[1]))
+
+        # 上报受阻区（frontier_arbiter 已在订阅）
+        zone = PoseStamped()
+        zone.header.frame_id = 'map'
+        zone.header.stamp = self.get_clock().now().to_msg()
+        zone.pose.position.x = float(self.pose[0])
+        zone.pose.position.y = float(self.pose[1])
+        zone.pose.orientation.w = 1.0
+        self.pub_zone.publish(zone)
+
+        # 取消当前目标 → 让仲裁立刻换候选（而不是干等 40 s）
+        self.cancel_active(goals)
+
+    def cancel_active(self, goals):
+        """取消当前所有活跃目标。
+
+        action_msgs/srv/CancelGoal 的约定：goal_info.goal_id.uuid 全 0 且 stamp 全 0
+        ⇒ 取消该 action server 上的全部目标。这里就用这个最稳的写法。
+        """
+        if not self.cancel_cli.service_is_ready():
+            self.get_logger().warn('cancel_goal 服务未就绪，本轮只上报受阻区')
+            return
+        req = CancelGoal.Request()
+        req.goal_info = GoalInfo()          # 全零 = 取消全部
+        fut = self.cancel_cli.call_async(req)
+
+        def _done(f):
+            try:
+                res = f.result()
+                n = len(res.goals_canceling)
+            except Exception:               # noqa: BLE001
+                n = -1
+            self.get_logger().info(
+                '静止自愈：已请求取消活跃目标（活跃 %d，服务回报取消 %d）' % (len(goals), n))
+        fut.add_done_callback(_done)
+
+
+def main():
+    rclpy.init()
+    node = ExploreWatchdog()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, Exception):
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

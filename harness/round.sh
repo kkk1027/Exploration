@@ -104,7 +104,7 @@ if [ "$VISION" = "1" ]; then
 else
   python3 harness/vision_nav_params.py --restore 2>&1 | tee -a "$OUT/harness.log" || true
 fi
-setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE spawn_x:=$SX spawn_y:=$SY spawn_yaw:=$SYAW disable_retreat:=$DISABLE_RETREAT escape_supervisor:=$SUPERVISOR car_escape:=$CAR_ESCAPE rviz:=${RVIZ:-false} stack_delay:=${STACK_DELAY:-0.0} scoring:=${SCORING:-v3} corridor_width:=${CORRIDOR_W:-1.05} supervisor_rotate_min_range:=${SUP_ROT_MIN:-0.34} supervisor_advance_stop_range:=${SUP_ADV_STOP:-0.34} probe_log:=$OUT/probe.jsonl supervisor_log:=$OUT/supervisor.jsonl vision:=$VISION vision_dump:=$([ "$VISION" = "1" ] && echo "$OUT/vision_grid" || echo '')" \
+setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE spawn_x:=$SX spawn_y:=$SY spawn_yaw:=$SYAW disable_retreat:=$DISABLE_RETREAT escape_supervisor:=$SUPERVISOR car_escape:=$CAR_ESCAPE rviz:=${RVIZ:-false} stack_delay:=${STACK_DELAY:-0.0} scoring:=${SCORING:-v3} corridor_width:=${CORRIDOR_W:-1.05} supervisor_rotate_min_range:=${SUP_ROT_MIN:-0.34} supervisor_advance_stop_range:=${SUP_ADV_STOP:-0.34} probe_log:=$OUT/probe.jsonl supervisor_log:=$OUT/supervisor.jsonl vision:=$VISION vision_dump:=$([ "$VISION" = "1" ] && echo "$OUT/vision_grid" || echo '') watchdog_log:=$OUT/watchdog.jsonl" \
   > "$OUT/launch.log" 2>&1 < /dev/null &
 sleep 3; PGID=$(cat "$OUT/pgid" 2>/dev/null || echo "")
 say "已启动：PGID=$PGID  日志 $OUT/launch.log"
@@ -176,6 +176,26 @@ RES=$(pgrep -af "cartographer_node|sim_session_driver|controller_server|planner_
 say "收尾后：ROS 节点数=$NODES  gzserver=$GZ  残留=[${RES}]"
 rec "\"check\":\"post_teardown\",\"nodes\":$NODES,\"gzserver\":$GZ,\"residue\":\"${RES}\""
 [ "$GZ" = "0" ] && [ -z "$RES" ] && rec '"verdict":"PASS_clean"' || rec '"verdict":"FAIL_residue"'
+
+# ---- P1-2：静止看门狗事件汇总 ----
+if [ -f "$OUT/watchdog.jsonl" ]; then
+  python3 - "$OUT/watchdog.jsonl" <<'PYEOF2'
+import json, sys, collections
+rows = []
+for line in open(sys.argv[1], encoding='utf-8', errors='ignore'):
+    line = line.strip()
+    if line:
+        try:
+            rows.append(json.loads(line))
+        except Exception:
+            pass
+why = collections.Counter(r.get('why', '?') for r in rows)
+print('[watchdog] 静止事件 %d 次：%s' % (len(rows), dict(why)))
+for r in rows[:6]:
+    print('    %.1fs @(%.2f,%.2f) %s err=%s'
+          % (r.get('stall_sec', 0), r['pos'][0], r['pos'][1], r.get('why'), r.get('last_error')))
+PYEOF2
+fi
 
 # ---- 方案A：撤销视觉图层注入 + 内存峰值汇总 ----
 python3 harness/vision_nav_params.py --restore 2>&1 | tee -a "$OUT/harness.log" || true
