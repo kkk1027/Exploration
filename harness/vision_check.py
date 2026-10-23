@@ -24,12 +24,16 @@ from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 class Check(Node):
     def __init__(self):
         super().__init__('vision_check')
+        self.subs = {}
+        self.pubs = {}
         q = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                        durability=DurabilityPolicy.VOLATILE)
         self.vision = None
         self.costmap = None
         self.create_subscription(OccupancyGrid, '/vision/obstacle_grid', self.on_vision, q)
         self.create_subscription(OccupancyGrid, '/global_costmap/costmap', self.on_costmap, q)
+        # 诊断：谁在订阅视觉障碍云（nav2 视觉图层应当出现在这里）
+        self.create_timer(1.0, self.sniff)
 
     def on_vision(self, msg):
         self.vision = msg
@@ -37,10 +41,24 @@ class Check(Node):
     def on_costmap(self, msg):
         self.costmap = msg
 
+    def sniff(self):
+        try:
+            self.subs['obstacle_cloud'] = len(self.get_subscriptions_info_by_topic('/vision/obstacle_cloud'))
+            self.pubs['obstacle_cloud'] = len(self.get_publishers_info_by_topic('/vision/obstacle_cloud'))
+            self.subs['live_cloud'] = len(self.get_subscriptions_info_by_topic('/vision/live_cloud'))
+            self.pubs['live_cloud'] = len(self.get_publishers_info_by_topic('/vision/live_cloud'))
+        except Exception as e:
+            self.subs['err'] = str(e)
+
 
 def grid_to_np(msg):
-    g = np.array(msg.data, dtype=np.int16).reshape(msg.info.height, msg.info.width)
-    return g
+    """OccupancyGrid.data 是 int8[]：nav2 的 254(致命)/253(内切)/255(未知) 到 Python 侧
+    分别是 -2/-3/-1。必须先按 int8 读出来再抬到 0..255，否则会漏掉所有致命格。"""
+    g = np.array(msg.data, dtype=np.int8).astype(np.int16)
+    mask = g < 0
+    if mask.any():
+        g[mask] += 256
+    return g.reshape(msg.info.height, msg.info.width)
 
 
 def main():
@@ -86,12 +104,65 @@ def main():
                     lethal += 1
                 elif val > 0:
                     infl += 1
+        # ① 值直方图（只统计落在代价地图范围内的视觉格）
+        vals = []
+        for (iy, ix) in v_occ:
+            wx = vox + (ix + 0.5) * vr
+            wy = voy + (iy + 0.5) * vr
+            cx = int((wx - cox) / cr)
+            cy = int((wy - coy) / cr)
+            if 0 <= cx < c.info.width and 0 <= cy < c.info.height:
+                vals.append(int(cg[cy, cx]))
+        hist = {}
+        for val in vals:
+            k = '254' if val == 254 else ('253' if val == 253 else ('0' if val == 0 else '1-252'))
+            hist[k] = hist.get(k, 0) + 1
+        out['value_hist'] = hist
+
+        # ② 坐标偏移搜索：若存在系统性半格错位，会在这里暴露
+        best = (0.0, None)
+        for ddx in range(-3, 4):
+            for ddy in range(-3, 4):
+                hit = 0
+                for (iy, ix) in v_occ:
+                    cx = int((vox + (ix + 0.5) * vr - cox) / cr) + ddx
+                    cy = int((voy + (iy + 0.5) * vr - coy) / cr) + ddy
+                    if 0 <= cx < c.info.width and 0 <= cy < c.info.height and cg[cy, cx] == 254:
+                        hit += 1
+                r = hit / max(1, v_occ.shape[0])
+                if r > best[0]:
+                    best = (round(r, 3), [ddx, ddy])
+        out['best_offset'] = best
+
+        # ③ 纯视觉格：视觉有、而 0.15 m 内没有任何致命格 —— 这才是"视觉层真的在起作用"
+        lethal_idx = np.argwhere(cg == 254)
+        if lethal_idx.size:
+            pw = np.stack([cox + (lethal_idx[:, 1] + 0.5) * cr,
+                           coy + (lethal_idx[:, 0] + 0.5) * cr], axis=1)
+        else:
+            pw = np.zeros((0, 2))
+        vw = np.stack([vox + (v_occ[:, 1] + 0.5) * vr, voy + (v_occ[:, 0] + 0.5) * vr], axis=1)
+        if pw.shape[0] and vw.shape[0]:
+            d2 = ((vw[:, None, :] - pw[None, :, :]) ** 2).sum(axis=2)
+            nearest = np.sqrt(d2.min(axis=1))
+            solo = nearest > 0.15
+            out['vision_only_cells'] = int(solo.sum())
+            solo_lethal = 0
+            for (wx, wy) in vw[solo]:
+                cx = int((wx - cox) / cr); cy = int((wy - coy) / cr)
+                if 0 <= cx < c.info.width and 0 <= cy < c.info.height and cg[cy, cx] == 254:
+                    solo_lethal += 1
+            out['vision_only_lethal'] = solo_lethal
+            out['vision_only_lethal_ratio'] = round(solo_lethal / max(1, int(solo.sum())), 3)
         out['vision_cells_in_costmap'] = in_cm
         out['lethal_at_vision'] = lethal
         out['inflated_at_vision'] = infl
         out['lethal_ratio'] = round(lethal / in_cm, 3) if in_cm else 0.0
         out['covered_ratio'] = round(lethal / v_occ.shape[0], 3) if out['vision_cells'] else 0.0
-        ok = (out['vision_cells'] > 0 and in_cm > 0 and out['lethal_ratio'] >= a.ratio_min)
+        solo_ratio = out.get('vision_only_lethal_ratio', 0.0)
+        ok = (out['vision_cells'] > 0 and in_cm > 0 and
+              (out['lethal_ratio'] >= a.ratio_min or solo_ratio >= a.ratio_min))
+    out['topic_diag'] = {'subs': n.subs, 'pubs': n.pubs}
     out['verdict'] = 'PASS' if ok else 'FAIL'
     print(json.dumps(out, ensure_ascii=False, indent=1))
     if a.json:

@@ -36,8 +36,8 @@ BLOCK_L = f'''{SENT % "begin(local)"}
         publish_voxel_map: False
         origin_z: 0.0
         z_resolution: 0.05
-        z_voxels: 12
-        unknown_threshold: 12
+        z_voxels: 16
+        unknown_threshold: 16
         mark_threshold: 0
         combination_method: 1
         observation_sources: vision_cloud
@@ -47,7 +47,9 @@ BLOCK_L = f'''{SENT % "begin(local)"}
           marking: True
           clearing: True
           min_obstacle_height: 0.05
-          max_obstacle_height: 0.60
+          # 0.80：cafe_table 桌面在 0.755(+0.02) m，取 0.60 会滤掉桌面点、
+          # 只剩 4.2 cm 细立柱 —— 那样这套视觉层治不了"假口子"
+          max_obstacle_height: 0.80
           obstacle_max_range: 3.0
           obstacle_min_range: 0.0
           raytrace_max_range: 3.5
@@ -67,7 +69,7 @@ BLOCK_G = f'''{SENT % "begin(global)"}
           marking: True
           clearing: False
           min_obstacle_height: 0.05
-          max_obstacle_height: 0.60
+          max_obstacle_height: 0.85
           obstacle_max_range: 30.0
           obstacle_min_range: 0.0
           raytrace_max_range: 30.0

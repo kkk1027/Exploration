@@ -40,8 +40,8 @@ sleep "$WAIT"
   timeout 12 ros2 run tf2_ros tf2_echo odom_combined camera_depth_optical_frame 2>/dev/null | head -8 || echo "TF 不可达"
 } 2>&1 | tee "$OUT/probe.txt"
 echo "[probe] 收尾"
-pkill -f "sim_explore.launch.py" 2>/dev/null
-sleep 2; pkill -x gzserver 2>/dev/null; sleep 3
-pkill -9 -f "sim_explore.launch.py" 2>/dev/null; pkill -9 -x gzserver 2>/dev/null
+kill -TERM -- "-$PG" 2>/dev/null; sleep 2; pkill -x gzserver 2>/dev/null; sleep 3
+kill -9 -- "-$PG" 2>/dev/null; pkill -9 -x gzserver 2>/dev/null
+sleep 1; pkill -9 -f "wheeltec_two_wheel_model/(scan_deadzone_relay|imu_bias_shim)" 2>/dev/null
 echo "[probe] 残留检查：gzserver=$(pgrep -cx gzserver)  launch=$(pgrep -fc 'sim_explore.launch.py')"
 echo "[probe] 产物：$OUT/probe.txt"
