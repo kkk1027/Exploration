@@ -307,6 +307,9 @@ class Arbiter(Node):
         super().__init__('frontier_arbiter')
         p = self.declare_parameter
         self.min_unknown = int(p('min_unknown_cells', 30).value)
+        # D4：v3 的规模门槛原本只看"近处 1 m 未知格"，而真正进分的是 0.3~3.0 m 前方锥。
+        # 保守做法：两个判据取"或"——原本能过的照样过，只是把"近处少、前方一大片"的候选也放进来。
+        self.min_ahead = int(p('min_ahead_cells', 300).value)
         self.radius = float(p('check_radius', 1.0).value)
         self.pullback = float(p('pullback_m', 0.6).value)
         self.bl_sec = float(p('blacklist_sec', 60.0).value)
@@ -343,6 +346,10 @@ class Arbiter(Node):
         self.contact_zone_sec = float(p('contact_zone_sec', 300.0).value)
         self.contact_zone_radius = float(p('contact_zone_radius_m', 2.5).value)
         self.contact_zone_penalty = float(p('contact_zone_penalty', 1500.0).value)
+        # D7：把"撞过的地方"从软降权升级为**近半径内等效硬拒**（1e5 远高于主项上限 3000），
+        # 但仍是罚分而非硬 skip —— 万一所有候选都在禁区，也要能派出最不坏的那个，不许饿死。
+        self.contact_hard_radius = float(p('contact_hard_radius_m', 1.2).value)
+        self.contact_hard_penalty = float(p('contact_hard_penalty', 1e5).value)
         # 收益函数 v2（S3+S2）：大块未知优先、碎角降权、已探完区域降权
         self.cfg = {
             'info_radius': float(p('info_radius', 1.0).value),
@@ -361,6 +368,13 @@ class Arbiter(Node):
         self.retry_radius = float(p('retry_radius_m', 1.2).value)
         self.retry_window = float(p('retry_window_sec', 300.0).value)
         self.pub_history = []        # [(x, y, ts)] 已派发过的目标（用于"反复拉锯"降权）
+        # D13：区域级（1 m 网格）被拒计数 —— 同一片"陷阱区"会持续生产候选，
+        # 点级黑名单压不住，这里按区域整体降权（仍是罚分，不做硬拒）
+        self.region_sec = float(p('region_penalty_sec', 120.0).value)
+        self.region_penalty = float(p('region_penalty', 150.0).value)
+        self.region_cap = int(p('region_penalty_cap', 900).value)
+        self.region_refuse_hard = int(p('region_refuse_hard_count', 6).value)
+        self.region = {}            # (i,j) -> [ts, ...] 被拒时刻
         self.verbose_rank = str(p('verbose_rank', True).value).lower() in ('true', '1', 'yes')
         # 两级打分：昂贵指标只算前 N 个（候选池可能几百个）
         self.prefilter_n = int(p('prefilter_n', 12).value)
@@ -531,6 +545,45 @@ class Arbiter(Node):
                     q.append((nx, ny))
         return False
 
+
+    def _note_uniq(self, kind, x, y):
+        """D5：同一 tick 里同一个候选只计一次，给出"唯一候选数"口径。"""
+        seen = getattr(self, '_tick_uniq', None)
+        if seen is None:
+            self._tick_uniq = seen = set()
+        key = (kind, round(x, 1), round(y, 1))
+        if key in seen:
+            return
+        seen.add(key)
+        k = kind + '_uniq'
+        self.stats[k] = self.stats.get(k, 0) + 1
+
+    def note_refusal(self, x, y):
+        """D13：把"这个候选被拒"记到 1 m 网格区域表里。"""
+        now = time.monotonic()
+        key = (int(math.floor(x)), int(math.floor(y)))
+        lst = self.region.setdefault(key, [])
+        lst.append(now)
+        if len(lst) > 40:
+            del lst[:-40]
+        # 顺手过期清理（限制表大小）
+        if len(self.region) > 400:
+            self.region = {k: v for k, v in self.region.items()
+                           if v and now - v[-1] < self.region_sec}
+
+    def region_penalty_of(self, x, y):
+        now = time.monotonic()
+        key = (int(math.floor(x)), int(math.floor(y)))
+        lst = [t for t in self.region.get(key, []) if now - t < self.region_sec]
+        if lst:
+            self.region[key] = lst
+        n = len(lst)
+        if n == 0:
+            return 0.0
+        pen = min(self.region_cap, self.region_penalty * n)
+        if n >= self.region_refuse_hard:
+            pen += 1e4                      # 该区域反复被拒 → 等效"最后才考虑"
+        return pen
 
     # ---- D1/D2/D3：净空场 ----
     def clearance_field(self):
@@ -810,13 +863,54 @@ class Arbiter(Node):
 
     def pull_back(self, x, y):
         if self.pose is None or self.pullback <= 0:
-            return x, y
+            return self.snap_known_free(x, y)
         dx, dy = self.pose[0] - x, self.pose[1] - y
         d = math.hypot(dx, dy)
         if d < 1e-6:
-            return x, y
+            return self.snap_known_free(x, y)
         k = min(self.pullback, d * 0.5) / d
-        return x + dx * k, y + dy * k
+        return self.snap_known_free(x + dx * k, y + dy * k)
+
+    def snap_known_free(self, x, y, max_r_m=0.35):
+        """D9：回拉点若落进未知/占据格，吸附到最近"已知自由"格（螺旋搜索 ≤0.35 m）。
+
+        原因：BFS 把未知当不可通行，回拉点落在未知里会让候选直接被判"不可达"
+        （实测 rejected_path 131–494/轮）。找不到就原样返回，不改变语义。
+        """
+        m = self.map
+        if m is None:
+            return x, y
+        info = m.info
+        res = info.resolution
+        if res <= 0:
+            return x, y
+        w, h = info.width, info.height
+        ox, oy = info.origin.position.x, info.origin.position.y
+        ci = int((x - ox) / res)
+        cj = int((y - oy) / res)
+
+        def known_free(i, j):
+            if not (0 <= i < w and 0 <= j < h):
+                return False
+            v = m.data[j * w + i]
+            return 0 <= v < 50
+
+        if known_free(ci, cj):
+            return x, y
+        rmax = max(1, int(max_r_m / res))
+        for r in range(1, rmax + 1):
+            best = None
+            for dj in range(-r, r + 1):
+                for di in range(-r, r + 1):
+                    if max(abs(di), abs(dj)) != r:
+                        continue
+                    if known_free(ci + di, cj + dj):
+                        d2 = di * di + dj * dj
+                        if best is None or d2 < best[0]:
+                            best = (d2, ci + di, cj + dj)
+            if best is not None:
+                return (ox + (best[1] + 0.5) * res, oy + (best[2] + 0.5) * res)
+        return x, y
 
     def reachable_async(self, x, y):
         """异步可达性校验：返回 future 或 None（不可用/已有在途请求）"""
@@ -887,6 +981,7 @@ class Arbiter(Node):
             if math.hypot(x - bx, y - by) < self.bl_r:
                 pen += 250.0
                 self.stats['penalized_black'] = self.stats.get('penalized_black', 0) + 1
+                self._note_uniq('penalized_black', x, y)
                 break
         for zx, zy, _ in self.stuck_zones:
             if math.hypot(x - zx, y - zy) < 1.5:
@@ -894,9 +989,15 @@ class Arbiter(Node):
                 break
         self.contact_zones = [z for z in self.contact_zones if z[2] > now]
         for zx, zy, _ in self.contact_zones:
-            if math.hypot(x - zx, y - zy) < self.contact_zone_radius:
+            d = math.hypot(x - zx, y - zy)
+            if d < self.contact_hard_radius:
+                pen += self.contact_hard_penalty      # D7：撞点近旁本质禁止
+                break
+            if d < self.contact_zone_radius:
                 pen += self.contact_zone_penalty
                 break
+        # D13：区域级被拒历史（陷阱区）
+        pen += self.region_penalty_of(x, y)
         # 反复拉锯：同一个位置附近被派发过很多次却没推进 → 降权
         self.pub_history = [h for h in self.pub_history if now - h[2] < self.retry_window]
         n = sum(1 for hx, hy, _ in self.pub_history
@@ -905,6 +1006,7 @@ class Arbiter(Node):
         return pen
 
     def tick(self):
+        self._tick_uniq = set()
         if self.scoring == 'v3':
             return self._tick_v3()
         if self.scoring == 'v2':
@@ -940,10 +1042,14 @@ class Arbiter(Node):
             if not ok:
                 self.blacklist.append((gx, gy, now + self.bl_sec))
                 self.stats['rejected_path'] += 1
+                self._note_uniq('rejected_path', gx, gy)
+                self.note_refusal(gx, gy)
                 continue
             if narrow is not None:
                 self.stats['rejected_narrow'] += 1
+                self._note_uniq('rejected_narrow', gx, gy)
                 self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
+                self.note_refusal(gx, gy)
                 if (min_w is not None and min_w >= self.corridor_hard
                         and unk <= self.corridor_unknown_max and fallback is None):
                     fallback = (gx, gy)
@@ -1004,8 +1110,12 @@ class Arbiter(Node):
             self.get_logger().error(f'v3 打分异常，回退 v1：{type(exc).__name__}: {exc}')
             self.scoring = 'v1'
             return self._tick_v1()
-        keep = [r for r in ranked if r['unknown'] >= self.min_unknown]
+        keep = [r for r in ranked
+                if r['unknown'] >= self.min_unknown or r.get('ahead', 0) >= self.min_ahead]
         self.stats['rejected_size'] += len(ranked) - len(keep)
+        for r_drop in ranked:
+            if r_drop not in keep:
+                self._note_uniq('rejected_size', r_drop['x'], r_drop['y'])
         if not keep:
             self.get_logger().warn(
                 f'[v3] 无候选过规模门槛（min_unknown={self.min_unknown}）；统计 {self.stats}')
@@ -1022,10 +1132,14 @@ class Arbiter(Node):
             if not ok:
                 self.blacklist.append((gx, gy, now + self.bl_sec))
                 self.stats['rejected_path'] += 1
+                self._note_uniq('rejected_path', gx, gy)
+                self.note_refusal(gx, gy)
                 continue
             if narrow is not None:
                 self.stats['rejected_narrow'] += 1
+                self._note_uniq('rejected_narrow', gx, gy)
                 self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
+                self.note_refusal(gx, gy)
                 # 软回退只允许"确实够宽、而且宽度不是靠未知格撑出来的"候选。
                 # 2026-10-23：原来无条件派发最优窄候选，车开进 0.9 m 门洞后被车端
                 # 前向安全闸（0.45 m）判死、原地静止 40~90 s，就是这条路径造成的。
@@ -1075,8 +1189,12 @@ class Arbiter(Node):
             self.get_logger().error(f'打分异常，回退旧逻辑：{type(exc).__name__}: {exc}')
             ranked = []
         # 规模门槛：未知格太少（碎角/坑）直接不要
-        keep = [r for r in ranked if r['unknown'] >= self.min_unknown]
+        keep = [r for r in ranked
+                if r['unknown'] >= self.min_unknown or r.get('ahead', 0) >= self.min_ahead]
         self.stats['rejected_size'] += len(ranked) - len(keep)
+        for r_drop in ranked:
+            if r_drop not in keep:
+                self._note_uniq('rejected_size', r_drop['x'], r_drop['y'])
         if not keep:
             self.get_logger().warn(
                 f'无候选过规模门槛（min_unknown={self.min_unknown}）；统计 {self.stats}')
@@ -1094,10 +1212,14 @@ class Arbiter(Node):
             if not ok:
                 self.blacklist.append((gx, gy, now + self.bl_sec))
                 self.stats['rejected_path'] += 1
+                self._note_uniq('rejected_path', gx, gy)
+                self.note_refusal(gx, gy)
                 continue
             if narrow is not None:
                 self.stats['rejected_narrow'] += 1
+                self._note_uniq('rejected_narrow', gx, gy)
                 self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
+                self.note_refusal(gx, gy)
                 if fallback is None:
                     fallback = (gx, gy, r)
                 self.get_logger().info(
