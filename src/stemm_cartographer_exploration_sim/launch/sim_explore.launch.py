@@ -20,7 +20,8 @@ from launch.actions import (DeclareLaunchArgument, ExecuteProcess,
 from launch.event_handlers import OnProcessExit
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import EnvironmentVariable, LaunchConfiguration
+from launch.substitutions import (EnvironmentVariable, LaunchConfiguration,
+                                  PythonExpression)
 from ament_index_python.packages import get_package_prefix
 from launch_ros.actions import Node
 
@@ -122,6 +123,16 @@ def generate_launch_description():
 
     # ② nav2 生命周期 nudge：guard 的 90 s 超时是车端硬编码、不能改，
     #    所以由仿真侧把"卡在 inactive"的节点用 change_state 推起来（不改车端源码）。
+    # LaunchConfiguration 之间不能做算术 → 用 PythonExpression 求"栈启动后的延迟"
+    t_nudge = PythonExpression([
+        'float("', LaunchConfiguration('stack_delay'), '") + 10.0'])
+    t_vision = PythonExpression([
+        'float("', LaunchConfiguration('stack_delay'), '") + float("',
+        LaunchConfiguration('vision_delay'), '")'])
+    t_rviz = PythonExpression([
+        'float("', LaunchConfiguration('stack_delay'), '") + float("',
+        LaunchConfiguration('rviz_delay'), '")'])
+
     nudge = Node(package='stemm_cartographer_exploration_sim',
                  executable='nav2_lifecycle_nudge', name='nav2_lifecycle_nudge',
                  output='screen', condition=stack_on,
@@ -239,6 +250,6 @@ def generate_launch_description():
         # ready_guard 90 s 超时、整轮 0 派发。视觉节点在 map 帧出现前本来也是空转。
         TimerAction(period=stack_delay, actions=[stack, patch_sim_time, arbiter, supervisor]),
         TimerAction(period=stack_delay, actions=[driver]),
-        TimerAction(period=stack_delay + 10.0, actions=[nudge]),
-        TimerAction(period=stack_delay + vision_delay, actions=[vision, watchdog]),
-        TimerAction(period=stack_delay + rviz_delay, actions=[rviz])])
+        TimerAction(period=t_nudge, actions=[nudge]),
+        TimerAction(period=t_vision, actions=[vision, watchdog]),
+        TimerAction(period=t_rviz, actions=[rviz])])

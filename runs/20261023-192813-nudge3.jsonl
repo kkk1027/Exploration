@@ -1,0 +1,8 @@
+{"ts":"2026-10-23T19:28:14+08:00","tag":"nudge3",""check":"pre_launch","nodes":1,"gzserver":0,"residue":"""}
+{"ts":"2026-10-23T19:28:14+08:00","tag":"nudge3",""check":"pose","x":0.0,"y":0.0,"yaw":0.0"}
+{"ts":"2026-10-23T19:28:14+08:00","tag":"nudge3",""check":"variant","disable_retreat":1,"supervisor":"true""}
+{"ts":"2026-10-23T19:28:14+08:00","tag":"nudge3",""check":"vision","enabled":1"}
+{"ts":"2026-10-23T19:28:17+08:00","tag":"nudge3",""check":"launch","pgid":"124742""}
+{"ts":"2026-10-23T19:28:27+08:00","tag":"nudge3",""check":"post_teardown","nodes":1,"gzserver":0,"residue":"""}
+{"ts":"2026-10-23T19:28:27+08:00","tag":"nudge3",""verdict":"PASS_clean""}
+{"check":"memory","samples": 1, "peak_gz_mb": 0, "peak_vision_mb": 0, "peak_nav2_mb": 0, "peak_carto_mb": 0, "min_avail_mb": 11887}
