@@ -33,8 +33,22 @@ checks['tf_healthy'] = has('mapping TF is healthy')
 checks['nav2_active'] = has('stably ready') or has('ready_guard_timing')
 checks['frontier'] = has('assigned RRT frontier') or has('Begin navigating')
 checks['mapping_done'] = has('SetBool_Response', 'success=True') or has('mapping done acknowledged')
-m = re.findall(r'返航(?:到位|完成)[^\n]*', txt)
-checks['return_home'] = m[-1][:120] if m else None
+# 返航判据：只认**正向完成行**，必须排掉否定句
+# （2026-10-23 踩过：'中断退出：会话未走到返航到位，仍尝试存图' 曾被当成返航成功）
+NEG = ('未走到返航到位', '未返航', '返航未启动', '返航失败', '返航超时', '返航卡住',
+       '会话未走到', '中断退出', 'keeping launch alive for manual takeover',
+       'return-home failed', 'stuck after', 'return_home_failed')
+POS = (r'返航(?:到位|完成)',
+       r'return-home completed',
+       r'return-home position reached')
+pos = []
+for line in txt.splitlines():
+    low = line.lower()
+    if any(neg in line or neg in low for neg in NEG):
+        continue
+    if any(re.search(p_, line) for p_ in POS):
+        pos.append(line.strip()[:160])
+checks['return_home'] = pos[-1] if pos else None
 mapfile = os.path.expanduser('~/stemm_sim_ws/maps/explore_latest.pgm')
 checks['map_saved'] = f'{os.path.getsize(mapfile)} B' if os.path.exists(mapfile) else None
 
