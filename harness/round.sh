@@ -104,7 +104,7 @@ if [ "$VISION" = "1" ]; then
 else
   python3 harness/vision_nav_params.py --restore 2>&1 | tee -a "$OUT/harness.log" || true
 fi
-setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE spawn_x:=$SX spawn_y:=$SY spawn_yaw:=$SYAW disable_retreat:=$DISABLE_RETREAT escape_supervisor:=$SUPERVISOR car_escape:=$CAR_ESCAPE rviz:=${RVIZ:-false} stack_delay:=${STACK_DELAY:-0.0} scoring:=${SCORING:-v3} corridor_width:=${CORRIDOR_W:-1.05} supervisor_rotate_min_range:=${SUP_ROT_MIN:-0.34} supervisor_advance_stop_range:=${SUP_ADV_STOP:-0.34} probe_log:=$OUT/probe.jsonl supervisor_log:=$OUT/supervisor.jsonl vision:=$VISION vision_dump:=$([ "$VISION" = "1" ] && echo "$OUT/vision_grid" || echo '') watchdog_log:=$OUT/watchdog.jsonl" \
+setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE spawn_x:=$SX spawn_y:=$SY spawn_yaw:=$SYAW disable_retreat:=$DISABLE_RETREAT escape_supervisor:=$SUPERVISOR car_escape:=$CAR_ESCAPE rviz:=${RVIZ:-false} stack_delay:=${STACK_DELAY:-0.0} scoring:=${SCORING:-v3} corridor_width:=${CORRIDOR_W:-1.05} supervisor_rotate_min_range:=${SUP_ROT_MIN:-0.34} supervisor_advance_stop_range:=${SUP_ADV_STOP:-0.34} probe_log:=$OUT/probe.jsonl supervisor_log:=$OUT/supervisor.jsonl vision:=$VISION vision_dump:=$([ "$VISION" = "1" ] && echo "$OUT/vision_grid" || echo '') watchdog_log:=$OUT/watchdog.jsonl nudge_log:=$OUT/nudge.jsonl" \
   > "$OUT/launch.log" 2>&1 < /dev/null &
 sleep 3; PGID=$(cat "$OUT/pgid" 2>/dev/null || echo "")
 say "已启动：PGID=$PGID  日志 $OUT/launch.log"
@@ -176,6 +176,33 @@ RES=$(pgrep -af "cartographer_node|sim_session_driver|controller_server|planner_
 say "收尾后：ROS 节点数=$NODES  gzserver=$GZ  残留=[${RES}]"
 rec "\"check\":\"post_teardown\",\"nodes\":$NODES,\"gzserver\":$GZ,\"residue\":\"${RES}\""
 [ "$GZ" = "0" ] && [ -z "$RES" ] && rec '"verdict":"PASS_clean"' || rec '"verdict":"FAIL_residue"'
+
+# ---- 起栈诊断：ready_guard 时序 + 生命周期 nudge 事件 ----
+if grep -q "ready_guard_timing" "$OUT/launch.log" 2>/dev/null; then
+  say "起栈时序：$(grep -o 'ready_guard_timing[^\n]*' "$OUT/launch.log" | tail -1 | cut -c1-110)"
+elif grep -qE "Nav2 did not become active|did not become ready" "$OUT/launch.log" 2>/dev/null; then
+  say "✗ 起栈失败：nav2 生命周期未在 guard 超时内激活"
+  rec '"check":"startup_fail"'
+fi
+if [ -s "$OUT/nudge.jsonl" ]; then
+  python3 - "$OUT/nudge.jsonl" <<'PYEOF3'
+import json, sys
+rows = []
+for line in open(sys.argv[1], encoding='utf-8', errors='ignore'):
+    line = line.strip()
+    if line:
+        try:
+            rows.append(json.loads(line))
+        except Exception:
+            pass
+nudges = [r for r in rows if r.get('type') == 'nudge']
+summ = [r for r in rows if r.get('type') == 'summary']
+print('[nudge] 插队 %d 次%s' % (len(nudges),
+      ('；' + ', '.join('%s×%d' % (n['node'].lstrip('/'), n['attempt']) for n in nudges)) if nudges else '（起栈正常，未插队）'))
+if summ:
+    print('  收尾：%d 个 ACTIVE' % len(summ[-1].get('active', [])))
+PYEOF3
+fi
 
 # ---- P1-2：静止看门狗事件汇总 ----
 if [ -f "$OUT/watchdog.jsonl" ]; then

@@ -120,6 +120,15 @@ def generate_launch_description():
                                  'stall_sec': LaunchConfiguration('watchdog_stall_sec'),
                                  'log_path': LaunchConfiguration('watchdog_log')}])
 
+    # ② nav2 生命周期 nudge：guard 的 90 s 超时是车端硬编码、不能改，
+    #    所以由仿真侧把"卡在 inactive"的节点用 change_state 推起来（不改车端源码）。
+    nudge = Node(package='stemm_cartographer_exploration_sim',
+                 executable='nav2_lifecycle_nudge', name='nav2_lifecycle_nudge',
+                 output='screen', condition=stack_on,
+                 parameters=[{'use_sim_time': use_sim_time,
+                              'enabled': LaunchConfiguration('nudge'),
+                              'log_path': LaunchConfiguration('nudge_log')}])
+
     # P0-3：雷达引导的"旋转 + 前进"脱困（与栈同时起，等车端节点就绪后自行等待触发）
     supervisor = Node(package='stemm_cartographer_exploration_sim',
                       executable='escape_supervisor', name='escape_supervisor',
@@ -199,12 +208,20 @@ def generate_launch_description():
             description='静止多少秒判定卡死并自愈（取消目标+上报受阻区）'),
         DeclareLaunchArgument('watchdog_log', default_value='',
             description='静止事件 JSONL 路径（空=只打日志）'),
+        DeclareLaunchArgument('nudge_log', default_value='',
+            description='生命周期 nudge 事件 JSONL 路径（空=只打日志）'),
         DeclareLaunchArgument('vision', default_value='false',
             description='是否启动视觉障碍源（方案A）。nav2 图层注入需同时 apply 参数补丁'),
         DeclareLaunchArgument('vision_dump', default_value='',
             description='视觉累积栅格的落盘前缀（空=不落盘；事故复盘用）'),
         DeclareLaunchArgument('vision_self_radius', default_value='0.38',
             description='视觉障碍的自身过滤半径（m，以机器人原点为圆心）'),
+        DeclareLaunchArgument('vision_delay', default_value='25.0',
+            description='视觉源/看门狗/nudge 相对"栈启动"再延迟多少秒（起栈降载）'),
+        DeclareLaunchArgument('rviz_delay', default_value='30.0',
+            description='rviz 相对"栈启动"再延迟多少秒（渲染会抢 CPU）'),
+        DeclareLaunchArgument('nudge', default_value='true',
+            description='是否启用 nav2 生命周期 nudge（推卡在 inactive 的节点起来）'),
         DeclareLaunchArgument('stack', default_value='true',
             description='是否启动车端探索栈（false=只起机器人+取证/脱困，单元测试用）'),
         DeclareLaunchArgument('disable_retreat', default_value='1',
@@ -216,8 +233,12 @@ def generate_launch_description():
                         '（ready_guard 90 s 内未激活、整轮被打断），故恢复固定延迟。'),
         robot,
         probe,
-        vision,
-        watchdog,
+        # 2026-10-23 起栈降载：视觉源/看门狗/nudge 都挪到"栈启动之后"再起。
+        # 实测起栈窗口（gzserver+cartographer+nav2 生命周期）对 CPU 极敏感，
+        # 多压一个点云节点/一个 rviz 就可能让 controller_server 停在 inactive、
+        # ready_guard 90 s 超时、整轮 0 派发。视觉节点在 map 帧出现前本来也是空转。
         TimerAction(period=stack_delay, actions=[stack, patch_sim_time, arbiter, supervisor]),
         TimerAction(period=stack_delay, actions=[driver]),
-        rviz])
+        TimerAction(period=stack_delay + 10.0, actions=[nudge]),
+        TimerAction(period=stack_delay + vision_delay, actions=[vision, watchdog]),
+        TimerAction(period=stack_delay + rviz_delay, actions=[rviz])])
