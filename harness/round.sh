@@ -33,10 +33,22 @@ mem_sample() {
     done
     echo "$sum"
   }
-  printf '{"t":%s,"avail_mb":%s,"gz_mb":%s,"vision_mb":%s,"nav2_mb":%s,"carto_mb":%s}\n' \
+  # CPU：同一批进程的累计 tick（utime+stime），由汇总脚本按时间差换算成"几个核"
+  cpu_of() {
+    local sum=0 pp
+    for pp in $(pgrep -f "$1" 2>/dev/null); do
+      [ -r "/proc/$pp/stat" ] || continue
+      sum=$((sum + $(awk '{print $14+$15}' "/proc/$pp/stat" 2>/dev/null || echo 0)))
+    done
+    echo "$sum"
+  }
+  printf '{"t":%s,"avail_mb":%s,"gz_mb":%s,"vision_mb":%s,"nav2_mb":%s,"carto_mb":%s,"cpu_gz":%s,"cpu_vision":%s,"cpu_nav2":%s,"cpu_carto":%s}\n' \
     "$(date +%s)" "${avail:-0}" "$(rss_of 'gzserver')" "$(rss_of 'vision_obstacle_grid')" \
     "$(rss_of 'controller_server|planner_server|bt_navigator|behavior_server|smoother_server|waypoint_follower')" \
-    "$(rss_of 'cartographer_node')" >> "$MEMLOG"
+    "$(rss_of 'cartographer_node')" \
+    "$(cpu_of 'gzserver')" "$(cpu_of 'vision_obstacle_grid')" \
+    "$(cpu_of 'controller_server|planner_server|bt_navigator|behavior_server|smoother_server|waypoint_follower')" \
+    "$(cpu_of 'cartographer_node')" >> "$MEMLOG"
 }
 say() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$OUT/harness.log"; }
 rec() { printf '{"ts":"%s","tag":"%s","%s"}\n' "$(date -Iseconds)" "$TAG" "$1" >> "$J"; }
@@ -171,12 +183,27 @@ if [ -s "$MEMLOG" ]; then
   python3 - "$MEMLOG" "$J" <<'PYEOF'
 import json, sys
 rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
+# 只在"栈还活着"的采样区间里算 CPU（收尾后进程消失，tick 会归零，否则会算出负值）
+rows_live = [r for r in rows if (r.get('gz_mb') or 0) > 0 and (r.get('cpu_gz') or 0) >= 0]
 peak = {k: max((r.get(k) or 0) for r in rows) for k in
         ('gz_mb', 'vision_mb', 'nav2_mb', 'carto_mb')}
 low = min((r.get('avail_mb') or 0) for r in rows)
 summary = {'samples': len(rows), 'peak_gz_mb': peak['gz_mb'], 'peak_vision_mb': peak['vision_mb'],
            'peak_nav2_mb': peak['nav2_mb'], 'peak_carto_mb': peak['carto_mb'],
            'min_avail_mb': low}
+# CPU 换算：100 = 一个核跑满；tick 差 / (时间差 × CLK_TCK)
+try:
+    import os as _os
+    hz = _os.sysconf('SC_CLK_TCK')
+    src = rows_live if len(rows_live) >= 2 else rows
+    dt = max(1, src[-1]['t'] - src[0]['t'])
+    for k, tag in (('cpu_gz', 'gz'), ('cpu_vision', 'vision'),
+                   ('cpu_nav2', 'nav2'), ('cpu_carto', 'carto')):
+        vals = [r.get(k) for r in src if r.get(k) is not None]
+        if len(vals) >= 2:
+            summary['cpu_%s_pct' % tag] = round(100.0 * (vals[-1] - vals[0]) / (dt * hz), 1)
+except Exception:
+    pass
 with open(sys.argv[2], 'a') as f:
     f.write('{"check":"memory",' + json.dumps(summary, ensure_ascii=False)[1:] + '\n')
 print('[memory] ' + json.dumps(summary, ensure_ascii=False))
