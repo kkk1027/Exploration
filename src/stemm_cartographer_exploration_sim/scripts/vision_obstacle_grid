@@ -91,6 +91,9 @@ class VisionObstacleGrid(Node):
         d('live_voxel', 0.05)
         # 收尾时把累积栅格落盘（事故复盘用；空=不落盘）
         d('dump_path', '')
+        # 局部体素层的源必须发在**传感器/车体**帧：nav2 用 cloud 的 frame 原点当"传感器原点"
+        # 做射线清除，若发在 map 帧，射线就从地图原点打出去、会把真实障碍擦掉。
+        d('live_frame', 'base_footprint')
 
         g = self.get_parameter
         self.cloud_topic = g('cloud_topic').value
@@ -109,6 +112,7 @@ class VisionObstacleGrid(Node):
         self.obstacle_z = float(g('obstacle_z').value)
         self.live_voxel = max(0.01, float(g('live_voxel').value))
         self.dump_path = str(g('dump_path').value or '')
+        self.live_frame = str(g('live_frame').value or 'base_footprint')
 
         self.cells = set()
         self.hits = {}          # 格 → 被观测到的帧数（跨帧持久化）
@@ -175,6 +179,8 @@ class VisionObstacleGrid(Node):
 
         try:
             tr = self.tf_buffer.lookup_transform(self.global_frame, msg.header.frame_id, Time())
+            tr_live = (self.tf_buffer.lookup_transform(self.live_frame, msg.header.frame_id, Time())
+                       if self.live_frame else None)
         except Exception:
             self.stats['tf_fail'] += 1
             if not self._warned_tf:
@@ -188,22 +194,32 @@ class VisionObstacleGrid(Node):
         P = np.stack([x[ok], y[ok], z[ok]], axis=1)
         Pw = P @ R.T + np.array([t.x, t.y, t.z])
 
-        dx = Pw[:, 0] - t.x
-        dy = Pw[:, 1] - t.y
-        dist = np.hypot(dx, dy)
+        # 自身过滤/距离/高度带都在**车体帧**里判（车体帧原点就是机器人原点，
+        # 与 map 帧原点无关；map 帧原点只是建图起点）
+        if tr_live is not None:
+            tl = tr_live.transform.translation
+            Rl = quat_to_matrix(tr_live.transform.rotation)
+            Pl = P @ Rl.T + np.array([tl.x, tl.y, tl.z])
+            dist = np.hypot(Pl[:, 0], Pl[:, 1])
+            zc = Pl[:, 2]
+        else:
+            dist = np.hypot(Pw[:, 0] - t.x, Pw[:, 1] - t.y)
+            zc = Pw[:, 2]
         keep = ((dist > self.self_r) & (dist < self.range_max) &
-                (Pw[:, 2] > self.z_min) & (Pw[:, 2] < self.z_max))
+                (zc > self.z_min) & (zc < self.z_max))
         n_bad = int(z.size - (np.isfinite(x) & np.isfinite(y) & np.isfinite(z)).sum())
         self.stats['bad'] += n_bad
         self.stats['last_pts'] = int(z.size)
         self.stats['last_kept'] = int(keep.sum())
         self.last_live = Pw[keep]
+        self.last_live_body = (Pl[keep] if (tr_live is not None) else Pw[keep])
 
         # 体素抽稀：同一 5 cm 体素只保留一个点，喂 local_costmap 体素层时省 TF/CPU
         if self.last_live.shape[0]:
-            key3 = np.floor(self.last_live / self.live_voxel).astype(np.int64)
+            body = getattr(self, 'last_live_body', self.last_live)
+            key3 = np.floor(body / self.live_voxel).astype(np.int64)
             _, idx = np.unique(key3, axis=0, return_index=True)
-            self.last_vox = self.last_live[np.sort(idx)]
+            self.last_vox = body[np.sort(idx)]
         else:
             self.last_vox = np.zeros((0, 3), dtype=np.float64)
         # 低矮带（贴地底板/台阶/低矮箱子）——取证与可视化
@@ -241,7 +257,7 @@ class VisionObstacleGrid(Node):
             return
         stamp = self.get_clock().now().to_msg()
         src = self.last_vox if self.last_vox.shape[0] else self.last_live
-        self.pub_live.publish(cloud_msg(src, self.global_frame, stamp))
+        self.pub_live.publish(cloud_msg(src, self.live_frame or self.global_frame, stamp))
         if self.last_low.shape[0]:
             self.pub_low.publish(cloud_msg(self.last_low, self.global_frame, stamp))
 
