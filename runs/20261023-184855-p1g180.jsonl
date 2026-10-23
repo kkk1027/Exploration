@@ -3,3 +3,7 @@
 {"ts":"2026-10-23T18:48:56+08:00","tag":"p1g180",""check":"variant","disable_retreat":1,"supervisor":"true""}
 {"ts":"2026-10-23T18:48:56+08:00","tag":"p1g180",""check":"vision","enabled":1"}
 {"ts":"2026-10-23T18:48:59+08:00","tag":"p1g180",""check":"launch","pgid":"105587""}
+{"ts":"2026-10-23T18:49:40+08:00","tag":"p1g180",""check":"post_teardown","nodes":0,"gzserver":0,"residue":"""}
+{"ts":"2026-10-23T18:49:40+08:00","tag":"p1g180",""verdict":"PASS_clean""}
+{"check":"memory","samples": 4, "peak_gz_mb": 545, "peak_vision_mb": 68, "peak_nav2_mb": 0, "peak_carto_mb": 49, "min_avail_mb": 11109, "cpu_gz_pct": 24.9, "cpu_vision_pct": 5.1, "cpu_nav2_pct": 0.0, "cpu_carto_pct": 5.0}
+{"check":"collision","summary":{"contacts": 0, "grazes": 0, "alerts": 0, "stalls": 0, "reverse_windows": 0, "reverse_m": 0, "reverse_assist_windows": 0, "reverse_assist_m": 0, "reverse_hard_windows": 0, "reverse_hard_m": 0, "chassis_contacts": 0, "wheel_contacts": 0, "physical_contacts": 0, "min_clearance_ever": 0.421}}
