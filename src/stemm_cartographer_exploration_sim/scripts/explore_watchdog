@@ -120,17 +120,39 @@ class ExploreWatchdog(Node):
                 or mode in ('returning_home', 'finalizing_map'))
 
     def return_fallback(self, now):
-        """P0-1：返航期"卡在等取消/等 TF"时的兜底。"""
+        """P0-1：返航期"卡在等取消/等 TF"时的兜底（保守版，2026-10-24）。"""
         if not self.in_return():
             self._return_since = None
             self._return_cancels = 0
             return False
+        # 终点 0.6 m 内属于"settle + 姿态宽限"阶段，取消目标只会破坏 manager 的终态判定
+        dist_home = math.hypot(self.pose[0], self.pose[1]) if self.pose else 99.0
+        if dist_home <= 0.6:
+            self._return_since = now
+            self._return_cancels = 0
+            return True
         if self._return_since is None:
             self._return_since = now
             return False
         if now - self._return_since < self.return_stall_sec:
             return False
+        state = str((self.nav or {}).get('navigation_state') or '')
         goals = self.active_goals()
+        # 关键修正：只有"等取消/等 TF"这类**等待态**才主动取消；
+        # returning_home+executing 是在正常导航，取消它会让 manager 判失败（实测返航失败 75%）。
+        if 'waiting' not in state:
+            if goals and now - getattr(self, '_last_ret_log', 0.0) > 10.0:
+                self._last_ret_log = now
+                self.get_logger().warn(
+                    '返航中无进展 %.0fs @(%.2f,%.2f)（state=%s，距原点 %.2f m）—— 不取消目标，'
+                    '交由 manager/脱困处理'
+                    % (now - self._return_since, self.pose[0], self.pose[1], state, dist_home))
+                self.record({'type': 'return_no_progress', 'state': state,
+                             'dist_home': round(dist_home, 3),
+                             'pos': [round(self.pose[0], 3), round(self.pose[1], 3)],
+                             't': round(time.time(), 3)})
+            self._return_since = now
+            return True
         if goals:
             if self._return_cancels >= self.return_cancel_max:
                 return True
@@ -160,8 +182,11 @@ class ExploreWatchdog(Node):
     def tick(self):
         if not self.enabled or self.pose is None:
             return
-        # 返航兜底优先（此时"不动"是预期行为之一，不能按普通静止处理）
-        if self.return_fallback(time.monotonic()):
+        # 返航期一律由返航兜底接管：此时"不动"既可能是等精确终态、也可能是真卡住，
+        # 但**普通 5 s 静止取消在这里是有害的**（会把 manager 等待终态的目标提前取消，
+        # 实测直接把返航从 0/2 失败推到 6/8 失败）。
+        if self.in_return():
+            self.return_fallback(time.monotonic())
             self.ref = None
             return
         goals = self.active_goals()
