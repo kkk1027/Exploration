@@ -1,0 +1,6 @@
+{"ts":"2026-10-24T13:16:12+08:00","tag":"s2r2",""check":"pre_launch","nodes":10,"gzserver":0,"residue":"84086 ""}
+{"ts":"2026-10-24T13:16:18+08:00","tag":"s2r2",""check":"post_cleanup","nodes":0,"gzserver":0,"residue":"""}
+{"ts":"2026-10-24T13:16:18+08:00","tag":"s2r2",""check":"pose","x":0.0,"y":0.0,"yaw":0.0"}
+{"ts":"2026-10-24T13:16:18+08:00","tag":"s2r2",""check":"variant","disable_retreat":1,"supervisor":"true""}
+{"ts":"2026-10-24T13:16:18+08:00","tag":"s2r2",""check":"vision","enabled":1"}
+{"ts":"2026-10-24T13:16:21+08:00","tag":"s2r2",""check":"launch","pgid":"88581""}
