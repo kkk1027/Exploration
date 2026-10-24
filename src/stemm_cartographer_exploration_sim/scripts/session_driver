@@ -132,6 +132,30 @@ class SessionDriver(Node):
 
     def _on_odom(self, msg):
         self.pose_xy = (msg.pose.pose.position.x, msg.pose.pose.position.y)
+        # P0-返航兜底过度：记录最近若干秒的位置序列，用来判断"车是不是真没动"。
+        # 背景：下面那段"返航未启动→重发 set_mapping_done→cancel-all"的兜底，
+        # 原判据只有 return_home_ok is None —— 它不知道 manager 其实已经派出返航
+        # 目标、车正在往回开，于是每轮都无条件打 3 次 cancel-all，把 manager 的
+        # 3 次返航重试预算全部吃掉（实测 V0/V1/V2 **每一轮**都是 3/3 用满）。
+        # 预算一满就零容错：只要再有一次干扰（如 front obstacle 重试）就整轮返航失败。
+        hist = getattr(self, '_pose_hist', None)
+        if hist is None:
+            hist = self._pose_hist = []
+        hist.append((time.monotonic(), self.pose_xy[0], self.pose_xy[1]))
+        if len(hist) > 200:                  # 里程计 ~20 Hz，200 条≈10 s
+            del hist[:len(hist) - 200]
+
+    def _moved_recently(self, win_sec=4.0, thr_m=0.06):
+        """最近 win_sec 内位移是否超过 thr_m（True=还在动）。"""
+        hist = getattr(self, '_pose_hist', None)
+        if not hist:
+            return False
+        now = time.monotonic()
+        old = [h for h in hist if now - h[0] >= win_sec]
+        if not old:
+            return False
+        t0, x0, y0 = old[-1]
+        return math.hypot(self.pose_xy[0] - x0, self.pose_xy[1] - y0) >= thr_m
 
     # ---- 主循环 ---------------------------------------------------------
     def _tick(self):
@@ -180,7 +204,10 @@ class SessionDriver(Node):
                 self.get_logger().warn(f'滚动存图失败（忽略）：{exc}')
         # 若卡在"等活跃目标取消"，每 6 s 重发一次 set_mapping_done
         # （重发在目标结束后会命中 _dispatch_pending_home_goal 分支）
+        # 只在"车真的没在动"时才走这条兜底：车还在往回家方向开的时候去 cancel-all，
+        # 等于把 manager 已经发起的返航目标掐掉，纯属自伤（实测占全部返航失败的 100%）。
         if (self.return_home_ok is None and self.t_done_called is not None
+                and not self._moved_recently()
                 and now - self.t_done_called > 3.0
                 and now - self.t_done_called > 3.0 * (getattr(self, '_retries', 0) + 1)
                 and getattr(self, '_retries', 0) < 10):
@@ -190,7 +217,7 @@ class SessionDriver(Node):
             try:
                 self._call_done()
                 # P0-1：连续 3 次重发仍不启动 ⇒ 判定"等活跃目标取消卡住"，主动 cancel-all
-                if self._retries >= 3 and self._cancel_sent < 3:
+                if self._retries >= 3 and self._cancel_sent < 2:
                     self._cancel_sent += 1
                     self._cancel_all_goals()
             except Exception as exc:                 # noqa: BLE001
