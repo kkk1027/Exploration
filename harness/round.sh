@@ -17,6 +17,8 @@ BASE=/home/kbf/stemm_exploration_sim_ws
 TS=$(date +%Y%m%d-%H%M%S)
 OUT="$BASE/logs/round_${TS}_${TAG}"; mkdir -p "$OUT"
 J="$BASE/runs/${TS}-${TAG}.jsonl"
+# 返航"等精确终态"的宽限（P0-1，用户要求暂时放宽）：>0 时用可回退注入改车端 launch，0=原厂 6 s
+GRACE_SEC="${GRACE_SEC:-22.0}"
 # 方案A 视觉层开关（VISION=1 时注入 nav2 视觉图层 + 起视觉障碍源；0=纯雷达基线）
 VISION="${VISION:-0}"
 MEMLOG="$OUT/mem.jsonl"
@@ -91,6 +93,13 @@ say "P0 变体：disable_retreat=$DISABLE_RETREAT escape_supervisor=$SUPERVISOR"
 rec "\"check\":\"variant\",\"disable_retreat\":$DISABLE_RETREAT,\"supervisor\":\"$SUPERVISOR\""
 
 # ---- 方案A：nav2 视觉图层注入（幂等、可回退；teardown 后自动撤销）----
+# ---- P0-1：返航姿态宽限注入（可回退；teardown 撤销）----
+if [ "$(python3 -c "print(1 if float('$GRACE_SEC')>0 else 0)")" = "1" ]; then
+  python3 harness/patch_car_launch.py --apply --grace "$GRACE_SEC" 2>&1 | tee -a "$OUT/harness.log"
+  say "返航姿态宽限：${GRACE_SEC}s（原厂 6 s；GRACE_SEC=0 可关）"
+  trap 'python3 /home/kbf/stemm_exploration_sim_ws/harness/patch_car_launch.py --restore >/dev/null 2>&1; python3 /home/kbf/stemm_exploration_sim_ws/harness/vision_nav_params.py --restore >/dev/null 2>&1' EXIT INT TERM
+fi
+
 say "视觉层 VISION=$VISION"
 rec "\"check\":\"vision\",\"enabled\":$VISION"
 trap 'python3 /home/kbf/stemm_exploration_sim_ws/harness/vision_nav_params.py --restore >/dev/null 2>&1' EXIT INT TERM
@@ -103,6 +112,7 @@ if [ "$VISION" = "1" ]; then
   fi
 else
   python3 harness/vision_nav_params.py --restore 2>&1 | tee -a "$OUT/harness.log" || true
+python3 harness/patch_car_launch.py --restore 2>&1 | tee -a "$OUT/harness.log" || true
 fi
 setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE spawn_x:=$SX spawn_y:=$SY spawn_yaw:=$SYAW disable_retreat:=$DISABLE_RETREAT escape_supervisor:=$SUPERVISOR car_escape:=$CAR_ESCAPE rviz:=${RVIZ:-false} stack_delay:=${STACK_DELAY:-0.0} scoring:=${SCORING:-v1} corridor_width:=${CORRIDOR_W:-1.05} supervisor_rotate_min_range:=${SUP_ROT_MIN:-0.34} supervisor_advance_stop_range:=${SUP_ADV_STOP:-0.34} probe_log:=$OUT/probe.jsonl supervisor_log:=$OUT/supervisor.jsonl vision:=$VISION vision_dump:=$([ "$VISION" = "1" ] && echo "$OUT/vision_grid" || echo '') watchdog_log:=$OUT/watchdog.jsonl nudge_log:=$OUT/nudge.jsonl" \
   > "$OUT/launch.log" 2>&1 < /dev/null &
@@ -226,6 +236,7 @@ fi
 
 # ---- 方案A：撤销视觉图层注入 + 内存峰值汇总 ----
 python3 harness/vision_nav_params.py --restore 2>&1 | tee -a "$OUT/harness.log" || true
+python3 harness/patch_car_launch.py --restore 2>&1 | tee -a "$OUT/harness.log" || true
 if [ -s "$MEMLOG" ]; then
   python3 - "$MEMLOG" "$J" <<'PYEOF'
 import json, sys

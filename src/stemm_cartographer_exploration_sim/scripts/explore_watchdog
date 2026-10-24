@@ -39,6 +39,10 @@ class ExploreWatchdog(Node):
         d('disp_eps', 0.03)
         d('cooldown_sec', 8.0)
         d('zone_radius_log', 1.0)
+        # 返航期兜底（P0-1）：manager 有时会卡在"等活跃目标取消""再开始返航，
+        # 表现为 nav_state 已进入 return 但车不动、也无新目标。这里主动 cancel-all 解锁。
+        d('return_stall_sec', 8.0)
+        d('return_cancel_max', 3)
         d('odom_topic', '/odom_combined')
         d('cmd_topic', '/cmd_vel')
         d('nav_state_topic', '/stemm_cartographer/nav_state')
@@ -51,6 +55,10 @@ class ExploreWatchdog(Node):
         self.disp_eps = float(g('disp_eps').value)
         self.cooldown = float(g('cooldown_sec').value)
         self.log_path = str(g('log_path').value or '')
+        self.return_stall_sec = float(g('return_stall_sec').value)
+        self.return_cancel_max = int(g('return_cancel_max').value)
+        self._return_since = None
+        self._return_cancels = 0
 
         self.pose = None
         self.cmd = (0.0, 0.0)
@@ -103,8 +111,58 @@ class ExploreWatchdog(Node):
         except Exception:               # noqa: BLE001
             pass
 
+    def in_return(self):
+        nav = self.nav or {}
+        state = str(nav.get('navigation_state') or '')
+        mode = str(nav.get('mode') or '')
+        return (bool(nav.get('pending_home_goal'))
+                or 'return_home' in state or 'return_home' in mode
+                or mode in ('returning_home', 'finalizing_map'))
+
+    def return_fallback(self, now):
+        """P0-1：返航期"卡在等取消/等 TF"时的兜底。"""
+        if not self.in_return():
+            self._return_since = None
+            self._return_cancels = 0
+            return False
+        if self._return_since is None:
+            self._return_since = now
+            return False
+        if now - self._return_since < self.return_stall_sec:
+            return False
+        goals = self.active_goals()
+        if goals:
+            if self._return_cancels >= self.return_cancel_max:
+                return True
+            self._return_cancels += 1
+            nav = self.nav or {}
+            self.get_logger().warn(
+                '返航兜底第 %d/%d 次：%d 个活跃目标未取消（state=%s mode=%s）→ 主动 cancel-all'
+                % (self._return_cancels, self.return_cancel_max, len(goals),
+                   nav.get('navigation_state'), nav.get('mode')))
+            self.record({'type': 'return_cancel', 'attempt': self._return_cancels,
+                         'active': len(goals), 'pos': [round(self.pose[0], 3), round(self.pose[1], 3)],
+                         'state': nav.get('navigation_state'), 'mode': nav.get('mode'),
+                         't': round(time.time(), 3)})
+            self.cancel_active(goals)
+        else:
+            nav = self.nav or {}
+            self.get_logger().warn(
+                '返航待机但无活跃目标（state=%s mode=%s last_error=%s）—— 该分支 sim 侧无法解锁，'
+                '已记录，等待 manager 自行推进'
+                % (nav.get('navigation_state'), nav.get('mode'), nav.get('last_error')))
+            self.record({'type': 'return_no_goal', 'state': nav.get('navigation_state'),
+                         'mode': nav.get('mode'), 't': round(time.time(), 3)})
+            self._return_since = now          # 避免刷屏
+        self._return_since = now
+        return True
+
     def tick(self):
         if not self.enabled or self.pose is None:
+            return
+        # 返航兜底优先（此时"不动"是预期行为之一，不能按普通静止处理）
+        if self.return_fallback(time.monotonic()):
+            self.ref = None
             return
         goals = self.active_goals()
         if not goals:

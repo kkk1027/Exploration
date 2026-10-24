@@ -22,6 +22,8 @@ from geometry_msgs.msg import PoseStamped
 from std_msgs.msg import String
 from nav_msgs.msg import OccupancyGrid, Odometry
 from rclpy.node import Node
+from action_msgs.msg import GoalInfo
+from action_msgs.srv import CancelGoal
 from std_srvs.srv import SetBool
 
 MAP_FRAME = 'map'
@@ -58,6 +60,10 @@ class SessionDriver(Node):
         self.map_msg = None
         self.create_subscription(OccupancyGrid, '/map', self._on_map, qos_map)
         self.cli = self.create_client(SetBool, '/stemm_cartographer/set_mapping_done')
+        # P0-1：返航卡在"等活跃目标取消"时主动 cancel-all（零 UUID = 取消全部）
+        self.cancel_cli = self.create_client(
+            CancelGoal, '/navigate_to_pose/_action/cancel_goal')
+        self._cancel_sent = 0
         self.pose_xy = None
         self._start_clock_resampler_for_return()   # 栈启动即启用（滞后插值，不会超前引擎时间）
         self.create_timer(1.0, self._tick)
@@ -183,7 +189,10 @@ class SessionDriver(Node):
                 f'返航未启动，第 {self._retries} 次重发 set_mapping_done（等活跃目标取消可能卡住）')
             try:
                 self._call_done()
-                pass  # cancel-all 需 goal handle，rclpy 不便实现；实测"重发 set_mapping_done"已足够
+                # P0-1：连续 3 次重发仍不启动 ⇒ 判定"等活跃目标取消卡住"，主动 cancel-all
+                if self._retries >= 3 and self._cancel_sent < 3:
+                    self._cancel_sent += 1
+                    self._cancel_all_goals()
             except Exception as exc:                 # noqa: BLE001
                 self.get_logger().error(f'重试/取消兜底异常（已忽略）：{type(exc).__name__}: {exc}')
         dist = None
@@ -290,6 +299,29 @@ class SessionDriver(Node):
                      f'origin: [{o.position.x}, {o.position.y}, 0.0]\n'
                      f'negate: 0\noccupied_thresh: 0.65\nfree_thresh: 0.196\n')
         return True
+
+    def _cancel_all_goals(self):
+        """P0-1：取消 /navigate_to_pose 上的全部目标（零 UUID）。
+
+        action_msgs/srv/CancelGoal 的约定：goal_info.goal_id.uuid 与 stamp 全 0 ⇒ 取消全部。
+        manager 的"等活跃目标取消"分支因此可以继续推进，不必等它自己超时。
+        """
+        if not self.cancel_cli.wait_for_service(timeout_sec=1.0):
+            self.get_logger().warn('cancel_goal 服务不可用，跳过主动取消')
+            return
+        req = CancelGoal.Request()
+        req.goal_info = GoalInfo()
+        fut = self.cancel_cli.call_async(req)
+        self.get_logger().warn(
+            f'返航兜底：主动 cancel-all 第 {self._cancel_sent} 次（清掉卡住的活跃目标）')
+
+        def _done(f):
+            try:
+                n = len(f.result().goals_canceling)
+            except Exception:                        # noqa: BLE001
+                n = -1
+            self.get_logger().info(f'cancel-all 完成：取消 {n} 个目标')
+        fut.add_done_callback(_done)
 
     def _save_map(self):
         out = self.map_out
