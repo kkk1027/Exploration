@@ -231,7 +231,11 @@ def generate_launch_description():
             description='前向净空预检的走廊净宽下限（m）；抬高可挡掉"看着能过、实际过不去"的口子'),
         DeclareLaunchArgument('candidate_probe_log', default_value='',
             description='候选质量探针 JSONL 路径（空=不记录）'),
-        DeclareLaunchArgument('max_candidates', default_value='6',
+        # 2026-10-25 十轮实测：6 → 14 后 manager 自派占比 55% → 41%（仲裁派发 28% → 43%），
+        # 全绿 10/10、接触 0、返航失败 0 与基线持平，内存/CPU 采样无差异。
+        # 原因：每 tick 只校验前 6 个候选，一失败就记"本轮候选全部被拒"，
+        # 而候选池里常有一百多个点没被看过。
+        DeclareLaunchArgument('max_candidates', default_value='14',
             description='每 tick 校验的候选数上限；越大越不容易"候选全灭"但更吃 CPU'),
         DeclareLaunchArgument('gate', default_value='false',
             description='V1 候选闸门（落点级硬闸门：esc_dirs/comp_r2 拒、occ 软惩罚）'),
