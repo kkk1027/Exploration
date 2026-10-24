@@ -81,5 +81,6 @@ if python3 "$W/harness/test_fallback_obs.py" >/dev/null 2>&1; then ok "保底观
 if python3 "$W/harness/test_veto.py" >/dev/null 2>&1; then ok "后置 veto 判据（10 组约束）"; else bad "后置 veto 判据异常（可能误掐目标）"; fi
 if python3 "$W/harness/test_param_types.py" >/dev/null 2>&1; then ok "launch→节点 参数类型一致"; else bad "launch 传参类型与节点 declare 不一致（节点会当场崩）"; fi
 if python3 "$W/harness/test_tail_park.py" >/dev/null 2>&1; then ok "末段停车友好偏置（7 组边界）"; else bad "末段停车友好偏置异常"; fi
+if python3 "$W/harness/test_standoff.py" >/dev/null 2>&1; then ok "返航前接管点选择（8 项断言）"; else bad "返航前接管点异常（可能把车送进死角）"; fi
 
 if [ "$FAIL" -eq 0 ]; then echo "[smoke] 结果：PASS"; exit 0; else echo "[smoke] 结果：FAIL（$FAIL 项）"; exit 1; fi

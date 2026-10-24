@@ -25,6 +25,8 @@ from rclpy.node import Node
 from action_msgs.msg import GoalInfo
 from action_msgs.srv import CancelGoal
 from std_srvs.srv import SetBool
+from nav2_msgs.action import NavigateToPose
+from rclpy.action import ActionClient
 
 MAP_FRAME = 'map'
 HOME_RADIUS = 0.25
@@ -65,6 +67,28 @@ class SessionDriver(Node):
             CancelGoal, '/navigate_to_pose/_action/cancel_goal')
         self._cancel_sent = 0
         self.pose_xy = None
+        # ===== 返航前"挪一步"兜底（2026-10-24）=====
+        # 实测最主要的残余失败模式：探索时间到时车停在贴障位置，车端 manager 以
+        # "current pose is too close to occupied /map cells" / "front obstacle
+        # too close" 拒绝派返航，且只重试 3 次 × 2 s（6 秒耗尽）、不会先挪开。
+        # 272 轮历史里这条消息命中 21 轮（7.7%）。
+        # 做法：结束建图**之前**判断"是否停得太贴障"，是就先派一个 ≤0.6 m 的
+        # 接管点（朝地图净空最大的方向）让车挪开，到位/超时后再结束建图。
+        # 放在 set_mapping_done 之前是关键——这样不消耗 manager 的返航重试预算。
+        self.standoff_enabled = bool(self.declare_parameter('standoff_enabled', True).value)
+        # 与车端自身的安全门限对齐：车端是 front < 0.45 m 就 publish_zero_velocity /
+        # safety_stop，"停得太贴"的判定用同一个量级才不会漏（日志实测 0.28 m / 0.56 m 两档）
+        self.standoff_trigger = float(self.declare_parameter('standoff_trigger_m', 0.45).value)
+        self.standoff_goal = float(self.declare_parameter('standoff_goal_m', 0.60).value)
+        self.standoff_timeout = float(
+            self.declare_parameter('standoff_timeout_sec', 8.0).value)
+        self.standoff_max = int(self.declare_parameter('standoff_max', 2).value)
+        self._standoff_pending = False
+        self._standoff_target = None
+        self._standoff_deadline = 0.0
+        self._standoff_started = 0.0
+        self._standoff_count = 0
+        self.nav_cli = ActionClient(self, NavigateToPose, 'navigate_to_pose')
         self._start_clock_resampler_for_return()   # 栈启动即启用（滞后插值，不会超前引擎时间）
         self.create_timer(1.0, self._tick)
         self.get_logger().info(
@@ -145,6 +169,131 @@ class SessionDriver(Node):
         if len(hist) > 200:                  # 里程计 ~20 Hz，200 条≈10 s
             del hist[:len(hist) - 200]
 
+    # ---- 返航前"挪一步" ---------------------------------------------
+    def _grid_params(self):
+        """(data, res, w, h, ox, oy) 或 None。"""
+        m = self.map_msg
+        if m is None:
+            return None
+        try:
+            info = m.info
+            res = float(info.resolution)
+            if res <= 0:
+                return None
+            return (m.data, res, int(info.width), int(info.height),
+                    float(info.origin.position.x), float(info.origin.position.y))
+        except Exception:                              # noqa: BLE001
+            return None
+
+    def _cell(self, g, i, j):
+        data, _res, w, h, _ox, _oy = g
+        if not (0 <= i < w and 0 <= j < h):
+            return 100                                 # 图外当障碍
+        try:
+            return int(data[j * w + i])
+        except Exception:                              # noqa: BLE001
+            return 100
+
+    def map_clearance(self, x, y, scan_m=1.20):
+        """车所在格到最近占据格的距离（m）；图不在/无数据返回 None。
+
+        只关心"占据"（>=50）；未知格不算障碍——manager 的拒派判据也是看 occupied。
+        """
+        g = self._grid_params()
+        if g is None:
+            return None
+        _data, res, w, h, ox, oy = g
+        ci, cj = int((x - ox) / res), int((y - oy) / res)
+        rmax = max(1, int(scan_m / res))
+        best = None
+        for r in range(0, rmax + 1):
+            hit = False
+            for dj in range(-r, r + 1):
+                for di in range(-r, r + 1):
+                    if max(abs(di), abs(dj)) != r:
+                        continue
+                    if self._cell(g, ci + di, cj + dj) >= 50:
+                        hit = True
+                        break
+                if hit:
+                    break
+            if hit:
+                best = r * res
+                break
+        # 扫描半径内没有占据格 = 很开阔（返回扫描半径，而不是 None）——
+        # 返回 None 会被上层当成"没有地图"，那是两回事。
+        return scan_m if best is None else best
+
+    def pick_standoff(self, x, y, max_len=0.60, need_m=0.45, margin=0.85):
+        """在地图里找一个"能站得住"的接管点：朝净空最大的方向走 max_len。
+
+        判定：该方向上连续所有格都必须已知自由（0<=v<50），且落点半径 need_m 内
+        没有占据格。找不到就返回 None（宁可不挪）。
+        """
+        g = self._grid_params()
+        if g is None:
+            return None
+        _data, res, w, h, ox, oy = g
+        ci, cj = int((x - ox) / res), int((y - oy) / res)
+        best_len, best = 0.0, None
+        for k in range(24):
+            ang = 2.0 * math.pi * k / 24.0
+            ca, sa = math.cos(ang), math.sin(ang)
+            reach = 0.0
+            step = res
+            while reach + step <= max_len + 1e-9:
+                reach += step
+                i = ci + int(round(ca * reach / res))
+                j = cj + int(round(sa * reach / res))
+                if not (0 <= self._cell(g, i, j) < 50):
+                    break
+            if reach < need_m:
+                continue
+            r = reach * margin
+            i = ci + int(round(ca * r / res))
+            j = cj + int(round(sa * r / res))
+            cx, cy = ox + (i + 0.5) * res, oy + (j + 0.5) * res
+            if self.map_clearance(cx, cy, scan_m=need_m) is not None \
+                    and self.map_clearance(cx, cy, scan_m=need_m) < need_m * 0.85:
+                continue
+            if reach > best_len:
+                best_len, best = reach, (cx, cy)
+        return best
+
+    def _pick_standoff_if_tight(self):
+        if not self.standoff_enabled or self.pose_xy is None:
+            return None
+        if self._standoff_count >= self.standoff_max:
+            return None
+        clr = self.map_clearance(self.pose_xy[0], self.pose_xy[1])
+        if clr is None or clr >= self.standoff_trigger:
+            return None
+        goal = self.pick_standoff(self.pose_xy[0], self.pose_xy[1], self.standoff_goal)
+        if goal is None:
+            return None
+        self.get_logger().warn(
+            '探索结束时车停得太贴障（地图净空 %.2f m < %.2f m）→ 先挪到接管点 '
+            '(%.2f,%.2f) 再结束建图' % (clr, self.standoff_trigger, goal[0], goal[1]))
+        return goal
+
+    def _send_standoff(self, goal):
+        if not self.nav_cli.wait_for_server(timeout_sec=2.0):
+            self.get_logger().warn('接管点：navigate_to_pose 不可用，跳过（直接结束建图）')
+            return False
+        msg = NavigateToPose.Goal()
+        msg.pose.header.frame_id = MAP_FRAME
+        msg.pose.header.stamp = self.get_clock().now().to_msg()
+        msg.pose.pose.position.x = float(goal[0])
+        msg.pose.pose.position.y = float(goal[1])
+        msg.pose.pose.orientation.w = 1.0
+        try:
+            self.nav_cli.send_goal_async(msg)
+        except Exception as exc:                       # noqa: BLE001
+            self.get_logger().warn(f'接管点派发失败（忽略）：{exc}')
+            return False
+        self._standoff_count += 1
+        return True
+
     def _moved_recently(self, win_sec=4.0, thr_m=0.06):
         """最近 win_sec 内位移是否超过 thr_m（True=还在动）。"""
         hist = getattr(self, '_pose_hist', None)
@@ -185,6 +334,24 @@ class SessionDriver(Node):
         # 阶段2：到点则触发"结束建图"（与实机同一条服务）
         if not self.done_sent:
             if now - self.t_first_goal >= self.explore_sec:
+                if self._standoff_pending:
+                    arrived = (self.pose_xy is not None and self._standoff_target is not None
+                               and math.hypot(self.pose_xy[0] - self._standoff_target[0],
+                                              self.pose_xy[1] - self._standoff_target[1]) <= 0.25)
+                    if not arrived and now < self._standoff_deadline:
+                        return                       # 还在往接管点挪
+                    self._standoff_pending = False
+                    self.get_logger().info(
+                        '=== 返航前接管点：%s（用时 %.1fs），继续结束建图 ==='
+                        % ('已到位' if arrived else '超时放弃', now - self._standoff_started))
+                else:
+                    goal = self._pick_standoff_if_tight()
+                    if goal is not None and self._send_standoff(goal):
+                        self._standoff_pending = True
+                        self._standoff_target = goal
+                        self._standoff_started = now
+                        self._standoff_deadline = now + self.standoff_timeout
+                        return
                 self.get_logger().info(
                     f'=== 探索限时到（{self.explore_sec:.0f}s），调用 set_mapping_done 结束建图 ===')
                 self.t_done_called = now
