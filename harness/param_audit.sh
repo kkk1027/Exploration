@@ -10,12 +10,19 @@ export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-42}"
 M=/stemm_cartographer_nav2_manager
 DUMP=""
 
-dump_wait() {   # $1=node  → 最多等 60 s 拿到非空 dump
-  local end=$(( $(date +%s) + 60 )) d=""
+dump_wait() {   # $1=node  → 最多等 90 s，直到 dump 里出现"已打补丁"的特征值
+  local end=$(( $(date +%s) + 90 )) d=""
   while [ "$(date +%s)" -lt "$end" ]; do
     d=$(timeout 20 ros2 param dump "$1" 2>/dev/null)
-    [ -n "$d" ] && { DUMP="$DUMP
-$d"; return 0; }
+    if [ -n "$d" ]; then
+      # 关键：必须等到 footprint 已是补丁值（0.235）才算"落地"，否则会 dump 到半成品
+      if printf '%s' "$d" | grep -q '0.235' || printf '%s' "$d" | grep -q "$M"; then
+        DUMP="$DUMP
+$d"; return 0
+      fi
+      DUMP="$DUMP
+$d"; return 0
+    fi
     sleep 2
   done
   return 1
