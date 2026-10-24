@@ -12,6 +12,7 @@
      只保留最新一份。
   5. 全程把关键时间点打到日志：探索用时 / 返航用时 / 结果。
 """
+import json
 import math
 import subprocess
 import sys
@@ -137,7 +138,26 @@ class SessionDriver(Node):
             self.get_logger().info('=== 自主探索开始计时（收到第一个前沿目标）===')
 
     def _on_nav_state(self, msg):
-        txt = (msg.data or '').lower()
+        raw = msg.data or ''
+        # 车端 manager 的 JSON 状态里带着它自己的四向最小测距与 front_blocked，
+        # 这正是它拒绝派返航的依据（1 Hz 发布）。判"停得太贴障"必须用它，不能只看 /map：
+        # 低矮障碍常常没画进 cartographer 的 /map（正是视觉融合要补的盲区）。
+        try:
+            o = json.loads(raw)
+            if isinstance(o, dict):
+                self.nav = o
+                if not getattr(self, '_nav_seen_logged', False):
+                    self._nav_seen_logged = True
+                    self.get_logger().info(
+                        'nav_state 解析成功：共 %d 个字段（含四向测距=%s）'
+                        % (len(o), all(k in o for k in
+                           ('front_min_range', 'left_min_range', 'right_min_range'))))
+        except Exception as exc:                 # noqa: BLE001
+            if not getattr(self, '_nav_fail_logged', False):
+                self._nav_fail_logged = True
+                self.get_logger().warn(
+                    f'nav_state 不是 JSON（{type(exc).__name__}）：{raw[:80]!r}')
+        txt = raw.lower()
         # 严格判定：finalizing_* / returning_home 只是"准备返航"，不能算完成。
         # 只有明确的完成态，或"位置达成"类措辞才算。
         is_done = ('return_home_complete' in txt
@@ -371,7 +391,19 @@ class SessionDriver(Node):
         msg.pose.header.stamp = self.get_clock().now().to_msg()
         msg.pose.pose.position.x = float(goal[0])
         msg.pose.pose.position.y = float(goal[1])
-        msg.pose.pose.orientation.w = 1.0
+        # 朝"移动方向"摆头：只挪位置不改朝向的话，车挪开了、车头照样顶着障碍，
+        # 车端 `front obstacle too close` 仍会拒绝派返航（k1r1 实测）。
+        yaw = None
+        if self.pose_xy is not None:
+            dx = float(goal[0]) - self.pose_xy[0]
+            dy = float(goal[1]) - self.pose_xy[1]
+            if math.hypot(dx, dy) > 0.05:
+                yaw = math.atan2(dy, dx)
+        if yaw is None:
+            msg.pose.pose.orientation.w = 1.0
+        else:
+            msg.pose.pose.orientation.z = math.sin(yaw * 0.5)
+            msg.pose.pose.orientation.w = math.cos(yaw * 0.5)
         try:
             self.nav_cli.send_goal_async(msg)
         except Exception as exc:                       # noqa: BLE001
@@ -423,7 +455,7 @@ class SessionDriver(Node):
                 if self._standoff_pending:
                     arrived = (self.pose_xy is not None and self._standoff_target is not None
                                and math.hypot(self.pose_xy[0] - self._standoff_target[0],
-                                              self.pose_xy[1] - self._standoff_target[1]) <= 0.25)
+                                              self.pose_xy[1] - self._standoff_target[1]) <= 0.35)
                     if not arrived and now < self._standoff_deadline:
                         return                       # 还在往接管点挪
                     self._standoff_pending = False
