@@ -93,6 +93,10 @@ def generate_launch_description():
                                 # 历史约 140 轮日志里 "[v3]" 出现 0 次 —— 一直是 v1 在跑。
                                 # 默认保持 v1（= 历史实测口径），要试 v3 必须显式 scoring:=v3。
                                 'scoring': LaunchConfiguration('scoring'),
+                                # 注意：这个 launch 参数以前**根本没接到仲裁器**
+                                # （声明了 corridor_width，但节点参数里没有映射），
+                                # 所以 CORRIDOR_W=0.85 一直是空操作（实测日志仍打 1.05）。
+                                'corridor_width_m': LaunchConfiguration('corridor_width'),
                                 # V2-③ 后置 veto：默认关，实验时 veto:=true
                                 'veto_enabled': LaunchConfiguration('veto'),
                                 'veto_min_esc_dirs': LaunchConfiguration('veto_min_esc'),

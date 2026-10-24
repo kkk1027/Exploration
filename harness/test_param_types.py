@@ -154,11 +154,23 @@ def main():
         checked += 1
         if ptype is not d:
             bad.append((node, pname, ptype.__name__, d.__name__))
+    # 反向检查：声明了却**从未被 LaunchConfiguration 引用**的 launch 参数 = 空旋钮。
+    # 今天抓到的第三个静默失效：corridor_width 声明了、也一直从 round.sh 传进来，
+    # 但 launch 里没有任何地方引用它 → CORRIDOR_W=0.85 实测日志仍打 1.05。
+    # 注意只查"引用"，不查引用到了哪个位置（condition/remappings/arguments 都算引用）。
+    text = open(LAUNCH, encoding='utf-8').read()
+    dead = []
+    for name in sorted(argtypes):
+        if "LaunchConfiguration('%s')" % name not in text:
+            dead.append(name)
+    print(f'  （另有 {len(dead)} 个 launch 参数声明了但从未被引用）')
+    for name in dead:
+        bad.append(('launch', name, '已声明但无人引用（空旋钮）', '—'))
     print(f'launch 传参 -> 节点 declare 类型一致性：检查 {checked} 处')
     for node, pname, want, got in bad:
         print(f'  ✗ {node}.{pname}: launch 会传 {want}，节点 declare 的是 {got}')
     if bad:
-        print('结果：FAIL（运行期会抛 InvalidParameterTypeException 打死节点）')
+        print('结果：FAIL（要么运行期抛 InvalidParameterTypeException 打死节点，要么是个空旋钮）')
         return 1
     print('结果：PASS')
     return 0
