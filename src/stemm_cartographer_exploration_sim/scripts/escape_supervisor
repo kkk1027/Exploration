@@ -550,6 +550,12 @@ class EscapeSupervisor(Node):
                  pos=[round(v, 2) for v in (self.pose or (0, 0, 0))[:2]],
                  nav=self.nav_state, stats=dict(self.stats))
 
+    def _why_block(self, why, now):
+        if now - getattr(self, '_last_why_log', 0.0) > 5.0:
+            self._last_why_log = now
+            self.get_logger().info('强制脱困被挡：%s' % why)
+            self.log(type='forced_unit_refused', why=why, nav=self.nav_state)
+
     def maybe_force_unit(self, now):
         """P0-甲：被看门狗点名时立刻起一个脱困单元（安全闸门一个都不放松）。"""
         if not self.enabled or self.phase == 'reverse':
@@ -557,15 +563,19 @@ class EscapeSupervisor(Node):
         if now - self.force_request_at > 2.0 or self.force_request_at <= 0.0:
             return False
         if now < self.disabled_until or now < self.spot_until:
-            return False
+            self._why_block('冷却/退避中', now); return False
         if now - self.points_stamp > self.scan_stale_sec:
-            return False
+            self._why_block('雷达数据陈旧(%.1fs)' % (now - self.points_stamp), now); return False
         if self.pose is None:
-            return False
+            self._why_block('无位姿', now); return False
         if self.require_near_obstacle > 0.0:
-            if self.min_range_all(stride=2) > self.require_near_obstacle:
-                return False            # 离障碍还远：不是楔死
+            clear = self.min_range_all(stride=2)
+            if clear > self.require_near_obstacle:
+                self._why_block('离障碍还远 %.2f>%.2f' % (clear, self.require_near_obstacle), now)
+                return False
         if self.units_this_episode >= self.max_units_per_episode:
+            self._why_block('本回合单元数已用完 %d/%d' % (self.units_this_episode,
+                                                       self.max_units_per_episode), now)
             return False
         self.force_request_at = 0.0
         self.get_logger().warn('收到看门狗脱困请求 → 强制起一个脱困单元')

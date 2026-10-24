@@ -160,8 +160,17 @@ else
   MAXW=$(python3 -c "print(int(float('$EXPLORE') + 300))")
   say "全流程模式：最多等待 ${MAXW}s（探索 ${EXPLORE}s + 返航/存图余量）"
   waited=0
+  AUDIT_DONE=0
+  BACKSTEP_EXPECT=$([ "${EXPLORE_BACKSTEP:-1}" = "1" ] && echo 1 || echo 0)
   while [ "$waited" -lt "$MAXW" ]; do
     sleep 10; waited=$((waited+10)); mem_sample
+    # P0-乙：起栈就绪后立刻做参数落地自检（此时 patch_sim_time 已跑完、栈还活着）
+    if [ "$AUDIT_DONE" = "0" ] && grep -q "ready_guard_timing" "$OUT/launch.log" 2>/dev/null; then
+      bash harness/param_audit.sh "$OUT/param_audit.json" "$BACKSTEP_EXPECT" 2>&1 | tee -a "$OUT/harness.log"
+      if [ "${PIPESTATUS[0]}" = "0" ]; then rec '"check":"param_audit","ok":true'
+      else say "✗ 参数自检未全通过 → 本轮 invalid(param_audit)"; rec '"check":"param_audit","ok":false'; fi
+      AUDIT_DONE=1
+    fi
     if grep -q "会话结束" "$OUT/launch.log" 2>/dev/null; then say "检测到会话结束（${waited}s）"; break; fi
     # 注意：会话驱动在返航期每 2 s 滚动存图，"地图文件出现"不再是收尾信号，
     # 必须等"会话结束"或 manager 明确返航到位（否则会在返航刚开始时就收尾）。
@@ -171,17 +180,6 @@ else
     fi
     pgrep -x gzserver >/dev/null || { say "gzserver 已退出（${waited}s）"; break; }
   done
-fi
-
-# ---- P0-乙：参数落地自检（栈还活着时做，防"看起来正常但参数没设上"）----
-BACKSTEP_EXPECT=$([ "${EXPLORE_BACKSTEP:-1}" = "1" ] && echo 1 || echo 0)
-bash harness/param_audit.sh "$OUT/param_audit.json" "$BACKSTEP_EXPECT" 2>&1 | tee -a "$OUT/harness.log"
-AUDIT_RC=${PIPESTATUS[0]}
-if [ "$AUDIT_RC" = "0" ]; then
-  rec '"check":"param_audit","ok":true'
-else
-  say "✗ 参数自检未全通过 → 本轮记为 invalid(param_audit)"
-  rec '"check":"param_audit","ok":false'
 fi
 
 # ---- 3) teardown（按 PGID） ----
