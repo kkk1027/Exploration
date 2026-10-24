@@ -24,7 +24,12 @@ import subprocess
 import sys
 
 ANCHOR = "            'return_home_max_retries': 3,\n"
-ANCHOR2 = "            'explore_startup_delay_sec': 8.0,\n"
+# V2-① 的 rrt_fallback_wait_sec 走"原地改值"而不是"插新键"：
+# 车端 launch 里这个键在同一个 parameters 字典中出现两次（223 行注入位附近与
+# 343 行 'rrt_fallback_wait_sec': 0.0），Python 字典字面量重复键是**后者覆盖前者**，
+# 所以新插一个 12.0 会被后面的 0.0 静默覆盖 —— 实测就是"注入成功但完全不生效"。
+# 因此这里改成：把**最后一个**出现的那一行整行替换，原行记进 journal，restore 时放回。
+RRT_KEY = "'rrt_fallback_wait_sec':"
 SENT2_B = "            # ---- sim_patch(rrt_fallback_wait) ----\n"
 SENT2_E = "            # ---- sim_patch(end2) ----\n"
 SENT_B = "            # ---- sim_patch(return_home_orientation_grace) ----\n"
@@ -72,6 +77,7 @@ def main():
 
     if a.apply:
         new = txt
+        dup_orig = None
         if not injected:
             if ANCHOR not in new:
                 print('  ✗ 找不到锚点（车端 launch 变了？）；放弃，不改文件')
@@ -81,13 +87,20 @@ def main():
                      + SENT_E)
             new = new.replace(ANCHOR, ANCHOR + block, 1)
         if not injected2 and a.rrt_wait > 0:
-            if ANCHOR2 not in new:
-                print('  ✗ 找不到 rrt_fallback_wait 锚点；只注入 grace')
+            if RRT_KEY not in new:
+                print('  ✗ 车端 launch 里没有 rrt_fallback_wait_sec 键；只注入 grace')
             else:
+                # 取最后一处（字典字面量里生效的那个）整行替换
+                i = new.rindex(RRT_KEY)
+                ls = new.rfind('\n', 0, i) + 1
+                le = new.index('\n', i) + 1
+                dup_orig = new[ls:le]
+                indent = dup_orig[:len(dup_orig) - len(dup_orig.lstrip())]
                 block2 = (SENT2_B
-                          + f"            'rrt_fallback_wait_sec': {a.rrt_wait},\n"
+                          + f"{indent}'rrt_fallback_wait_sec': {a.rrt_wait},\n"
                           + SENT2_E)
-                new = new.replace(ANCHOR2, ANCHOR2 + block2, 1)
+                new = new[:ls] + block2 + new[le:]
+                print(f'  生效行原样（将记入 journal）: {dup_orig.strip()}')
         if new == txt:
             print('  已注入，跳过')
             return 0
@@ -100,8 +113,16 @@ def main():
         backup = os.path.join(CACHE, 'car_launch.pristine.py')
         if not os.path.exists(backup):
             shutil.copy2(path, backup)
-        json.dump({'anchor': ANCHOR, 'grace': a.grace, 'rrt_wait': a.rrt_wait},
-                  open(journal_path(), 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
+        jold = {}
+        try:
+            jold = json.load(open(journal_path(), encoding='utf-8'))
+        except Exception:                  # noqa: BLE001
+            jold = {}
+        j = {'anchor': ANCHOR, 'grace': a.grace, 'rrt_wait': a.rrt_wait,
+             'dup_orig_line': dup_orig if dup_orig is not None
+                              else jold.get('dup_orig_line')}
+        json.dump(j, open(journal_path(), 'w', encoding='utf-8'),
+                  ensure_ascii=False, indent=1)
         open(path, 'w', encoding='utf-8').write(new)
         print(f'  ✓ 已注入 grace={a.grace} rrt_wait={a.rrt_wait}')
         return 0
@@ -110,12 +131,23 @@ def main():
     if not injected and not injected2:
         print('  无注入可撤销')
         return 0
+    # rrt_wait 段是"整行替换"，撤的时候要把原行原样放回去（逐字节还原）
+    try:
+        j = json.load(open(journal_path(), encoding='utf-8'))
+    except Exception:                      # noqa: BLE001
+        j = {}
+    dup_orig = j.get('dup_orig_line')
     new = txt
-    for b, e in ((SENT_B, SENT_E), (SENT2_B, SENT2_E)):
+    while SENT2_B in new:
+        i = new.index(SENT2_B)
+        k = new.index(SENT2_E, i) + len(SENT2_E)
+        new = new[:i] + (dup_orig or '') + new[k:]
+        dup_orig = None                    # 只放回一次
+    for b, e in ((SENT_B, SENT_E),):
         while b in new:
             i = new.index(b)
-            j = new.index(e, i) + len(e)
-            new = new[:i] + new[j:]
+            k = new.index(e, i) + len(e)
+            new = new[:i] + new[k:]
     open(path, 'w', encoding='utf-8').write(new)
     try:
         os.remove(journal_path())

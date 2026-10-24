@@ -49,6 +49,10 @@ chk() {  # $1=参数名 $2=期望值（子串，忽略大小写/空格）$3=可�
 chk use_sim_time True
 chk footprint '[[-0.18,-0.235]'
 chk return_home_retreat_enabled False
+# V2-① 通道窗口：这两个参数车端在 __init__ 里一次性缓存，只能 launch 级注入；
+# 这里核对"运行期真的读到了 22 / 12"，否则等于没注入（踩过重复键覆盖的坑）。
+chk return_home_orientation_grace_sec 22.0
+chk rrt_fallback_wait_sec 12.0
 if [ "$BACKSTEP" = "1" ]; then
   chk exploration_retreat_max_distance_m 0.15
   chk exploration_retreat_speed_mps 0.05
