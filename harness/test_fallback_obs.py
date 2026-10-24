@@ -53,6 +53,9 @@ class FakeSelf:
         self.fallback_max_total = 30
         self._fb_last = 0.0
         self._fb_count = 0
+        # 末段偏置（本测试固定为"不在末段窗口"，窗口行为由 test_tail_park.py 覆盖）
+        self.tail_min_esc = 5
+        self.tail_penalty_value = 900.0
 
     def clearance_field(self):
         return self._field
@@ -62,6 +65,9 @@ class FakeSelf:
 
     def pull_back(self, x, y):
         return (x, y)
+
+    def in_tail_window(self):
+        return False
 
 
 def build_methods(cls):

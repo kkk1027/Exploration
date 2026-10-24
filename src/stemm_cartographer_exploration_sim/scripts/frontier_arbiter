@@ -407,6 +407,19 @@ class Arbiter(Node):
         self._nav_seen = False
         self._active_uuid = []         # 当前 ACCEPTED/EXECUTING 的 goal uuid（bytes）
         self._veto_detail = []
+        # ===== 探索末段"停车友好"偏置（2026-10-24）=====
+        # 实测最主要的残余失败模式：探索时间到时车停在贴障位置，车端 manager 以
+        # "current pose is too close to occupied /map cells" / "front obstacle too
+        # close" 拒绝启动返航，3 次重试 6 秒内耗尽 → 整轮返航失败
+        # （272 轮历史里这条消息出现在 21 轮 = 7.7%，且新几组失败几乎全是它）。
+        # 做法：最后 tail_sec 秒里给"四周不够开阔"的候选加罚，让车尽量停在空地；
+        #       同时把保底观察点的门槛临时放宽，避免末段干脆没有目标。
+        self.tail_park_enabled = self._as_bool(p('tail_park_enabled', True).value)
+        self.explore_sec = float(p('explore_sec', 180.0).value)
+        self.tail_sec = float(p('tail_park_sec', 25.0).value)
+        self.tail_min_esc = int(p('tail_park_min_esc_dirs', 5).value)
+        self.tail_penalty_value = float(p('tail_park_penalty', 900.0).value)
+        self._first_pub_t = None
         self.corridor_stride = max(1, int(p('corridor_stride_cells', 2).value))
         self.narrow_penalty_sec = float(p('narrow_blacklist_sec', 45.0).value)
         # 物理接触区（撞过的地方）：强降权 + 长记忆，避免反复撞同一张桌子
@@ -835,16 +848,25 @@ class Arbiter(Node):
         if self._fb_count >= self.fallback_max_total:
             return None
         now = time.monotonic()
-        if now - self._fb_last < self.fallback_cooldown:
-            return None
         field = self.clearance_field()
         if field is None:
+            return None
+        # 末段窗口里放宽门槛与冷却：宁可派个"还算开阔"的点，也不要让车在
+        # 探索结束那一刻处于"无目标 + 停在贴障位置"的状态（返航会被车端拒绝）。
+        min_esc = self.fallback_min_esc
+        max_dist = self.fallback_max_dist
+        cooldown = self.fallback_cooldown
+        if self.in_tail_window():
+            min_esc = min(min_esc, max(3, self.tail_min_esc - 1))
+            max_dist = max(max_dist, 2.5)
+            cooldown = min(cooldown, 4.0)
+        if now - self._fb_last < cooldown:
             return None
         best, best_score = None, -1e9
         for (x, y) in cands[:max(8, self.max_cand * 2)]:
             gx, gy = self.pull_back(x, y)
             dist = math.hypot(gx - self.pose[0], gy - self.pose[1])
-            if dist > self.fallback_max_dist or dist < 0.8:
+            if dist > max_dist or dist < 0.8:
                 continue
             try:
                 f = self.region_complexity(field, gx, gy)
@@ -852,7 +874,7 @@ class Arbiter(Node):
                 continue
             if not f:
                 continue
-            if f['esc_dirs'] < self.fallback_min_esc or f['comp_r2'] < self.fallback_min_comp:
+            if f['esc_dirs'] < min_esc or f['comp_r2'] < self.fallback_min_comp:
                 continue
             # 开阔优先 + 近一点：esc_dirs 高、距离近、窄格占比低。
             # 注意 region_complexity 返回的是 narrow_r2/free_r2（绝对格数），
@@ -1020,6 +1042,34 @@ class Arbiter(Node):
         if f['comp_r2'] < self.gate_comp_min:
             return 'comp_r2=%d<%d' % (f['comp_r2'], self.gate_comp_min), f
         return None, f
+
+    def in_tail_window(self):
+        """是否处在"探索末段"窗口（决定要不要偏置停车友好）。"""
+        if not self.tail_park_enabled or self.explore_sec <= 0.0:
+            return False
+        if self._first_pub_t is None:
+            return False
+        remain = self.explore_sec - (time.monotonic() - self._first_pub_t)
+        return 0.0 <= remain <= self.tail_sec
+
+    def tail_penalty(self, gx, gy, f=None):
+        """末段偏置：不够开阔的候选加罚（不硬拒，避免把自己饿死）。"""
+        if not self.in_tail_window():
+            return 0.0
+        if f is None:
+            field = self.clearance_field()
+            if field is None:
+                return 0.0
+            try:
+                f = self.region_complexity(field, gx, gy)
+            except Exception:                   # noqa: BLE001
+                return 0.0
+        if not f:
+            return 0.0
+        if (f.get('esc_dirs', 0) >= self.tail_min_esc
+                and f.get('occ_frac_r2', 1.0) < self.gate_occ_soft):
+            return 0.0
+        return self.tail_penalty_value
 
     def gate_adjusted_penalty(self, f):
         """occ 复杂度 → 罚分（不硬拒，避免误杀 esc_dirs 高的安全点）。"""
@@ -1479,7 +1529,7 @@ class Arbiter(Node):
                 self.get_logger().info(
                     '候选闸门否决（%s）目标 (%.2f,%.2f)' % (reason, gx0, gy0))
                 continue
-            pen = self.gate_adjusted_penalty(f)
+            pen = self.gate_adjusted_penalty(f) + self.tail_penalty(gx0, gy0, f)
             if pen > 0:
                 self.stats['gate_penalized'] = self.stats.get('gate_penalized', 0) + 1
             top.append((u - pen, negd, x, y))
@@ -1605,7 +1655,7 @@ class Arbiter(Node):
                 self.get_logger().info(
                     '候选闸门否决（%s）目标 (%.2f,%.2f)' % (reason, gx0, gy0))
                 continue
-            pen = self.gate_adjusted_penalty(f)
+            pen = self.gate_adjusted_penalty(f) + self.tail_penalty(gx0, gy0, f)
             if pen > 0:
                 self.stats['gate_penalized'] = self.stats.get('gate_penalized', 0) + 1
                 r = dict(r); r['score'] = r.get('score', 0.0) - pen
@@ -1704,7 +1754,7 @@ class Arbiter(Node):
                 self.get_logger().info(
                     '候选闸门否决（%s）目标 (%.2f,%.2f)' % (reason, gx0, gy0))
                 continue
-            pen = self.gate_adjusted_penalty(f)
+            pen = self.gate_adjusted_penalty(f) + self.tail_penalty(gx0, gy0, f)
             if pen > 0:
                 self.stats['gate_penalized'] = self.stats.get('gate_penalized', 0) + 1
                 r = dict(r); r['score'] = r.get('score', 0.0) - pen
@@ -1761,6 +1811,8 @@ class Arbiter(Node):
         self.last_pub = time.monotonic()
         self.last_goal = (gx, gy)
         self.pub_history.append((gx, gy, self.last_pub))
+        if self._first_pub_t is None:
+            self._first_pub_t = self.last_pub
         self.stats['published'] += 1
         try:
             self.get_logger().info(

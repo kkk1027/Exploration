@@ -102,6 +102,8 @@ def generate_launch_description():
                                 'gate_enabled': LaunchConfiguration('gate'),
                                 'gate_esc_dirs_min': LaunchConfiguration('gate_min_esc'),
                                 'gate_occ_soft': LaunchConfiguration('gate_occ_soft'),
+                                # 探索末段"停车友好"偏置需要知道本轮总时长
+                                'explore_sec': LaunchConfiguration('explore_sec'),
                                 'probe_log': LaunchConfiguration('candidate_probe_log')}])
 
     # P0-1：撞障取证（只读）。与机器人层同时启动，覆盖整轮（含启动期）。
