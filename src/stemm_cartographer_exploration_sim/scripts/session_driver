@@ -83,11 +83,15 @@ class SessionDriver(Node):
         self.standoff_timeout = float(
             self.declare_parameter('standoff_timeout_sec', 8.0).value)
         self.standoff_max = int(self.declare_parameter('standoff_max', 2).value)
+        self.standoff_min_free = float(
+            self.declare_parameter('standoff_min_free_m', 0.55).value)
         self._standoff_pending = False
         self._standoff_target = None
         self._standoff_deadline = 0.0
         self._standoff_started = 0.0
         self._standoff_count = 0
+        self.pose_yaw = None
+        self.nav = {}
         self.nav_cli = ActionClient(self, NavigateToPose, 'navigate_to_pose')
         self._start_clock_resampler_for_return()   # 栈启动即启用（滞后插值，不会超前引擎时间）
         self.create_timer(1.0, self._tick)
@@ -156,6 +160,13 @@ class SessionDriver(Node):
 
     def _on_odom(self, msg):
         self.pose_xy = (msg.pose.pose.position.x, msg.pose.pose.position.y)
+        q = msg.pose.pose.orientation
+        # yaw（地图系）；接管点选方向要用
+        try:
+            self.pose_yaw = math.atan2(2.0 * (q.w * q.z + q.x * q.y),
+                                       1.0 - 2.0 * (q.y * q.y + q.z * q.z))
+        except Exception:                      # noqa: BLE001
+            pass
         # P0-返航兜底过度：记录最近若干秒的位置序列，用来判断"车是不是真没动"。
         # 背景：下面那段"返航未启动→重发 set_mapping_done→cancel-all"的兜底，
         # 原判据只有 return_home_ok is None —— 它不知道 manager 其实已经派出返航
@@ -260,20 +271,95 @@ class SessionDriver(Node):
                 best_len, best = reach, (cx, cy)
         return best
 
+    def _front_too_close(self):
+        """车是不是"停得太贴障"——优先用车端 nav_state 自己的判据。
+
+        车端 manager 拒派返航的原话是 `front obstacle too close` /
+        `current pose is too close to occupied /map cells`，它用的正是
+        front_min_range / front_blocked。而 /map 是 cartographer 画的，
+        桌子底座这类低矮障碍常常**没画进地图**（这正是视觉融合要补的盲区），
+        所以"只看 /map"会漏判 —— 实测 s1r1 就是地图净空够、激光却只有 0.28 m。
+        """
+        nav = self.nav or {}
+        try:
+            if nav.get('front_blocked'):
+                return 'front_blocked'
+        except Exception:                      # noqa: BLE001
+            pass
+        try:
+            fr = float(nav.get('front_min_range'))
+        except Exception:                      # noqa: BLE001
+            fr = None
+        if fr is not None and fr < self.standoff_trigger:
+            return 'front_min_range=%.2f' % fr
+        clr = self.map_clearance(self.pose_xy[0], self.pose_xy[1])
+        if clr is not None and clr < self.standoff_trigger:
+            return 'map_clearance=%.2f' % clr
+        return None
+
+    def _sensor_standoff(self):
+        """用四向测距挑方向：front/left/right 里挑最开阔的，**rear 绝不用**
+        （后向 110°~240° 是激光盲区，nav_state 里给的是 99=无数据）。"""
+        if self.pose_yaw is None:
+            return None
+        nav = self.nav or {}
+        try:
+            fr = float(nav.get('front_min_range'))
+            lr = float(nav.get('left_min_range'))
+            rr = float(nav.get('right_min_range'))
+        except Exception:                      # noqa: BLE001
+            return None
+        if nav.get('front_blocked'):
+            fr = -1.0
+        cands = [('front', self.pose_yaw, fr),
+                 ('left', self.pose_yaw + math.pi / 2.0, lr),
+                 ('right', self.pose_yaw - math.pi / 2.0, rr)]
+        cands.sort(key=lambda t: -t[2])
+        name, ang, rng = cands[0]
+        if rng < self.standoff_min_free:       # 最开阔的方向也不够 → 不挪
+            return None
+        reach = min(self.standoff_goal, max(0.35, rng * 0.6))
+        tx = self.pose_xy[0] + math.cos(ang) * reach
+        ty = self.pose_xy[1] + math.sin(ang) * reach
+        # 地图上确认落点是自由格（防止往未建图/占据格里送）
+        g = self._grid_params()
+        if g is not None:
+            _d, res, _w, _h, ox, oy = g
+            if not (0 <= self._cell(g, int((tx - ox) / res), int((ty - oy) / res)) < 50):
+                return None
+        return (tx, ty), name, rng
+
     def _pick_standoff_if_tight(self):
         if not self.standoff_enabled or self.pose_xy is None:
             return None
         if self._standoff_count >= self.standoff_max:
             return None
-        clr = self.map_clearance(self.pose_xy[0], self.pose_xy[1])
-        if clr is None or clr >= self.standoff_trigger:
+        why = self._front_too_close()
+        if why is None:
+            return None
+        got = self._sensor_standoff()
+        if got is not None:
+            (tx, ty), name, rng = got
+            self.get_logger().warn(
+                '探索结束时车停得太贴障（%s）；按四向测距把车挪向 %s 侧 '
+                '(range=%.2f m) → 接管点 (%.2f,%.2f)' % (why, name, rng, tx, ty))
+            return (tx, ty)
+        # 有车端测距数据、但三个可用方向都不够开阔 → **不挪**。
+        # 绝不能退回"按地图选点"：地图是 cartographer 画的，低矮障碍常常没画进去
+        # （正是视觉融合要补的盲区），按地图选点会把车直接顶到激光看得见、
+        # 地图看不见的障碍上。数据缺席（nav 为空）时才允许用地图像素兜底。
+        if self.nav and all(k in self.nav for k in
+                            ('front_min_range', 'left_min_range', 'right_min_range')):
+            self.get_logger().warn(
+                '探索结束时车贴障（%s），但 front/left/right 三向都 < %.2f m（rear 是盲区）'
+                ' → 不挪，直接结束建图' % (why, self.standoff_min_free))
             return None
         goal = self.pick_standoff(self.pose_xy[0], self.pose_xy[1], self.standoff_goal)
         if goal is None:
             return None
         self.get_logger().warn(
-            '探索结束时车停得太贴障（地图净空 %.2f m < %.2f m）→ 先挪到接管点 '
-            '(%.2f,%.2f) 再结束建图' % (clr, self.standoff_trigger, goal[0], goal[1]))
+            '探索结束时车停得太贴障（%s）；四向测距无合适方向，改用地图选点 → (%.2f,%.2f)'
+            % (why, goal[0], goal[1]))
         return goal
 
     def _send_standoff(self, goal):

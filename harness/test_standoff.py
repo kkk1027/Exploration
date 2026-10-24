@@ -69,6 +69,9 @@ class FakeSelf:
         self.standoff_goal = 0.60
         self.standoff_max = 2
         self._standoff_count = 0
+        self.pose_yaw = 0.0
+        self.nav = {}
+        self.standoff_min_free = 0.55
         self.log = Logger()
 
     def get_logger(self):
@@ -89,7 +92,7 @@ def extract(names):
 
 def build(cls):
     seg = extract({'map_clearance', 'pick_standoff', '_pick_standoff_if_tight',
-                   '_grid_params', '_cell'})
+                   '_grid_params', '_cell', '_front_too_close', '_sensor_standoff'})
     ns = {'math': math}
     for name, code in seg.items():
         exec(compile(code, f'<{name}>', 'exec'), ns)
@@ -181,12 +184,39 @@ def main():
     check('H 净空==阈值不挪（边界）', f._pick_standoff_if_tight() is None,
           f'阈值={f.standoff_trigger}')
 
+    # I 车端判据优先：front_blocked 时按四向测距往更开阔的一侧挪
+    f = FakeSelf(grid_open())
+    f.nav = {'front_blocked': True, 'front_min_range': 0.20,
+             'left_min_range': 1.20, 'right_min_range': 0.60,
+             'rear_min_range': 99.0}
+    goal = f._pick_standoff_if_tight()
+    ok = goal is not None and math.hypot(goal[0], goal[1]) <= 0.62
+    # left 侧 = yaw+90°，即 +y 方向
+    ok = ok and goal[1] > 0.2
+    check('I front_blocked 时向更开阔的 left 侧挪', ok,
+          f'目标={None if goal is None else (round(goal[0],2), round(goal[1],2))}')
+
+    # J 三向都不够开阔（rear 不能用）→ 不挪
+    f = FakeSelf(grid_open())
+    f.nav = {'front_blocked': True, 'front_min_range': 0.20,
+             'left_min_range': 0.30, 'right_min_range': 0.30,
+             'rear_min_range': 99.0}
+    check('J 三向皆窄且 rear 为盲区时不挪', f._pick_standoff_if_tight() is None)
+
+    # K rear 再开阔也绝不选（激光盲区 99 = 无数据）
+    f = FakeSelf(grid_open())
+    f.nav = {'front_blocked': True, 'front_min_range': 0.10,
+             'left_min_range': 0.20, 'right_min_range': 0.20,
+             'rear_min_range': 99.0}
+    # K 车端三向都 < 阈值时**绝不回落到地图选点**（地图可能没画那个障碍）
+    check('K 三向皆窄时不按地图瞎挪', f._pick_standoff_if_tight() is None)
+
     if fails:
         for x in fails:
             print(f'  ✗ {x}')
         print('结果：FAIL')
         return 1
-    print('结果：PASS（8 项断言全部通过）')
+    print('结果：PASS（11 项断言全部通过）')
     return 0
 
 
