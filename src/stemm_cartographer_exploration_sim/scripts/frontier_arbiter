@@ -368,11 +368,13 @@ class Arbiter(Node):
         # rrt_fallback_wait 之后自己采样（实测卡死 62% 来自那条路径）。
         # 做法：从前 max_cand 个候选里挑一个"开阔、连通、离车不远"的点当观察点。
         self.fallback_enabled = str(p('fallback_goal_enabled', 'true').value).lower() in ('true','1','yes')
-        self.fallback_min_esc = int(p('fallback_min_esc_dirs', 5).value)
+        # 收紧后的默认值：B0/V3 两组里各有一轮是在"保底观察点把车送去远角"之后
+        # 出现接触/硬倒车，所以把观察点限制在更近、更开阔的范围（宁可不派）。
+        self.fallback_min_esc = int(p('fallback_min_esc_dirs', 6).value)
         self.fallback_min_comp = int(p('fallback_min_comp_cells', 1000).value)
-        self.fallback_max_dist = float(p('fallback_max_dist_m', 3.0).value)
+        self.fallback_max_dist = float(p('fallback_max_dist_m', 2.0).value)
         self.fallback_cooldown = float(p('fallback_cooldown_sec', 10.0).value)
-        self.fallback_max_total = int(p('fallback_max_total', 30).value)
+        self.fallback_max_total = int(p('fallback_max_total', 10).value)
         self._fb_last = 0.0
         self._fb_count = 0
         self.corridor_stride = max(1, int(p('corridor_stride_cells', 2).value))
