@@ -25,6 +25,9 @@ SRC = re.compile(r'dispatched: source=([a-z_]+)')
 # 与 metrics.py 完全同口径：看门狗的 '静止超时'
 STALL = re.compile(r'静止超时')
 STATS = re.compile(r'统计 (\{[^}]*\})')
+# 更直接的"卡死"指标：规划失败次数、候选全灭次数（比"归因率"这种比值敏感得多）
+PLAN_FAIL = re.compile(r'failed to create plan')
+NO_CAND = re.compile(r'本轮候选全部被拒')
 
 
 def load_probe(d):
@@ -74,11 +77,17 @@ def load_launch(d):
     src = {}
     stalls = 0
     stats = {}
+    plan_fail = 0
+    no_cand = 0
     for line in open(p, encoding='utf-8', errors='ignore'):
         for m in SRC.finditer(line):
             src[m.group(1)] = src.get(m.group(1), 0) + 1
         if STALL.search(line):
             stalls += 1
+        if PLAN_FAIL.search(line):
+            plan_fail += 1
+        if NO_CAND.search(line):
+            no_cand += 1
         for m in STATS.finditer(line):
             try:
                 o = json.loads(m.group(1).replace("'", '"'))
@@ -91,7 +100,8 @@ def load_launch(d):
     ready = 'ready_guard_timing' in txt
     dispatched = 'navigation goal dispatched' in txt
     return {'src': src, 'stalls': stalls, 'stats': stats,
-            'ready': ready, 'dispatched': dispatched}
+            'ready': ready, 'dispatched': dispatched,
+            'plan_fail': plan_fail, 'no_cand': no_cand}
 
 
 def rounds_for(prefix):
@@ -122,6 +132,8 @@ def summarize(prefix, rows):
             src[k] = src.get(k, 0) + v
     tot_src = sum(src.values()) or 1
     st = [r['stalls'] for r in rows if r['stalls'] is not None]
+    pf = [r.get('plan_fail', 0) for r in rows]
+    nc = [r.get('no_cand', 0) for r in rows]
     gates = [r['stats'].get('gate_reject', 0) for r in rows]
     fb = [r['stats'].get('fallback_obs', 0) for r in rows]
     print(f'\n===== {prefix}（{n} 轮，有效 {len(eff)}） =====')
@@ -136,9 +148,12 @@ def summarize(prefix, rows):
         sorted(src.items(), key=lambda x: -x[1])))
     if st:
         print(f'  卡死次数    : 合计 {sum(st)}，中位 {statistics.median(st):.1f}/轮')
+    print(f'  规划失败    : 合计 {sum(pf)}（中位 {statistics.median(pf) if pf else 0:.0f}/轮）')
+    print(f'  候选全灭    : 合计 {sum(nc)}（中位 {statistics.median(nc) if nc else 0:.0f}/轮）')
     print(f'  闸门拒绝    : 合计 {sum(gates)}（中位 {statistics.median(gates) if gates else 0:.0f}/轮）')
     print(f'  保底观察点  : 合计 {sum(fb)}')
     return {'n': n, 'eff': len(eff), 'ok': len(ok), 'ret': len(ret),
+            'plan_fail': sum(pf), 'no_cand': sum(nc),
             'contact': len(contact), 'quiet': len(quiet), 'src': src,
             'stalls': sum(st) if st else 0, 'gate': sum(gates), 'fb': sum(fb)}
 
@@ -156,6 +171,7 @@ def main():
             v, fails = load_verdict(d)
             lg = load_launch(d)
             rows.append({'tag': tag, 'dir': d, 'verdict': v, 'fails': fails,
+                         'plan_fail': lg.get('plan_fail', 0), 'no_cand': lg.get('no_cand', 0),
                          'contact': (pr.get('contacts', 0) or 0) > 0,
                          'quiet': False, 'stalls': lg['stalls'],
                          'ready': lg['ready'], 'dispatched': lg['dispatched'],
