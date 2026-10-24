@@ -57,6 +57,9 @@ class ExploreWatchdog(Node):
         # P0-甲：脱困单元正在执行时，看门狗不得取消目标（否则和 supervisor 抢）
         d('defer_to_escape', True)
         d('escape_request_topic', '/escape_request')
+        # P0-甲 开关：默认关闭（2026-10-24 全量批次出现 1 接触 + 1 返航失败，
+        # 按"退化先回退"先关；要启用以 force_escape:=true 单独 A/B）
+        d('force_escape', False)
         d('odom_topic', '/odom_combined')
         d('cmd_topic', '/cmd_vel')
         d('nav_state_topic', '/stemm_cartographer/nav_state')
@@ -81,6 +84,7 @@ class ExploreWatchdog(Node):
         self._gate_state = None          # 上一次写入的 exploration_retreat_enabled
         self._gate_last = 0.0
         self._gate_stats = {'allow': 0, 'deny': 0}
+        self.force_escape = bool(g('force_escape').value)
 
         self.pose = None
         self.cmd = (0.0, 0.0)
@@ -311,10 +315,11 @@ class ExploreWatchdog(Node):
         self.stalls += 1
         self.last_fire = now
         self.ref = (now, self.pose[0], self.pose[1])
-        try:
-            self.pub_escape_req.publish(Bool(data=True))
-        except Exception:               # noqa: BLE001
-            pass
+        if self.force_escape:
+            try:
+                self.pub_escape_req.publish(Bool(data=True))
+            except Exception:           # noqa: BLE001
+                pass
         self.get_logger().warn(
             '静止超时 %.1fs @(%.2f,%.2f)：%s；cmd=(%.2f,%.2f) 前向=%.2fm mode=%s state=%s err=%s'
             % (now - t0, self.pose[0], self.pose[1], why, self.cmd[0], self.cmd[1],

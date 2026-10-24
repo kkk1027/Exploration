@@ -114,7 +114,8 @@ def generate_launch_description():
                                'self_filter_radius': LaunchConfiguration('vision_self_radius'),
                                'z_max': 1.80,
                                'low_z_max': 0.35,
-                               'dump_path': LaunchConfiguration('vision_dump')}])
+                               'dump_path': LaunchConfiguration('vision_dump'),
+                               'decay_sec': LaunchConfiguration('vision_decay_sec')}])
 
     # P1-2：静止看门狗 —— 车端前向安全闸会让 nav2 "在导航但不动"，这里 5 s 级识别并自愈
     watchdog = Node(package='stemm_cartographer_exploration_sim',
@@ -124,6 +125,7 @@ def generate_launch_description():
                     parameters=[{'use_sim_time': use_sim_time,
                                  'enabled': True,
                                  'stall_sec': LaunchConfiguration('watchdog_stall_sec'),
+                                 'force_escape': LaunchConfiguration('force_escape'),
                                  'log_path': LaunchConfiguration('watchdog_log')}])
 
     # ② nav2 生命周期 nudge：guard 的 90 s 超时是车端硬编码、不能改，
@@ -224,6 +226,8 @@ def generate_launch_description():
                         '用户 2026-10-24 批准）'),
         DeclareLaunchArgument('watchdog', default_value='true',
             description='是否启用静止看门狗（车端安全闸导致的"在导航但不动"）'),
+        DeclareLaunchArgument('force_escape', default_value='false',
+            description='P0-甲：静止时是否强制请求脱困单元（默认关闭，需单独 A/B）'),
         DeclareLaunchArgument('watchdog_stall_sec', default_value='5.0',
             description='静止多少秒判定卡死并自愈（取消目标+上报受阻区）'),
         DeclareLaunchArgument('watchdog_log', default_value='',
@@ -232,6 +236,8 @@ def generate_launch_description():
             description='生命周期 nudge 事件 JSONL 路径（空=只打日志）'),
         DeclareLaunchArgument('vision', default_value='false',
             description='是否启动视觉障碍源（方案A）。nav2 图层注入需同时 apply 参数补丁'),
+        DeclareLaunchArgument('vision_decay_sec', default_value='0.0',
+            description='P0-己：视觉累积格衰减秒数（0=关闭=保持旧的单调累积；>0 会淡出长期未观测的格）'),
         DeclareLaunchArgument('vision_dump', default_value='',
             description='视觉累积栅格的落盘前缀（空=不落盘；事故复盘用）'),
         DeclareLaunchArgument('vision_self_radius', default_value='0.38',
