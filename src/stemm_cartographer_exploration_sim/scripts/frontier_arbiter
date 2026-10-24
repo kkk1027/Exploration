@@ -23,7 +23,9 @@
   republish_sec      最小重发间隔（默认 8 s）
   path_timeout_sec   ComputePathToPose 超时（默认 4 s）
 """
+import json
 import math
+import os
 import time
 
 import rclpy
@@ -341,6 +343,12 @@ class Arbiter(Node):
         self.clearance_mode = str(p('clearance_mode', 'distance').value).lower()
         self.use_vision_obstacles = bool(p('corridor_use_vision', True).value)
         self.vision_grid_topic = str(p('vision_grid_topic', '/vision/obstacle_grid').value)
+        # 候选质量探针（2026-10-24）：记录每个"实际派发"的候选在**统一障碍图**
+        # （激光∪视觉）上的复杂度/可脱困性指标，供离线统计"哪类候选会导致卡死"。
+        self.probe_log = str(p('probe_log', '').value)
+        self.probe_escape_r = float(p('probe_escape_clear_m', 0.60).value)
+        self.probe_narrow_r = float(p('probe_narrow_clear_m', 0.35).value)
+        self.probe_radius = float(p('probe_radius_m', 2.0).value)
         self.corridor_stride = max(1, int(p('corridor_stride_cells', 2).value))
         self.narrow_penalty_sec = float(p('narrow_blacklist_sec', 45.0).value)
         # 物理接触区（撞过的地方）：强降权 + 长记忆，避免反复撞同一张桌子
@@ -646,6 +654,97 @@ class Arbiter(Node):
         self._clear_key = key
         self._clear_field = field
         return field
+
+    def region_complexity(self, field, wx, wy):
+        """候选点周围 2 m 的"复杂度/可脱困性"（基于激光∪视觉的统一净空场）。
+
+        指标（都在 probe_radius 内）：
+          vis_occ_r2   视觉障碍格数量（激光看不到的那类复杂源）
+          narrow_r2    净空 <0.35 m 的格数（"窄/挤"的量）
+          free_r2      净空 >=0.30 m 的格数（可走动空间）
+          comp_r2      与候选点连通的自由格数（BFS，封顶 4000）—— 太小=死角
+          esc_dirs     8 个方向里能"走出去 >=probe_escape_clear_m"的方向数（0=四向皆堵）
+        """
+        import numpy as np
+        dist_m, ox, oy, res, w, h, unknown = field
+        ci = int((wx - ox) / res); cj = int((wy - oy) / res)
+        if not (0 <= ci < w and 0 <= cj < h):
+            return {}
+        k = max(1, int(self.probe_radius / res))
+        i0, i1 = max(0, ci - k), min(w, ci + k + 1)
+        j0, j1 = max(0, cj - k), min(h, cj + k + 1)
+        win = dist_m[j0:j1, i0:i1]
+        narrow = int((win < self.probe_narrow_r).sum())
+        free = int((win >= 0.30).sum())
+        # 连通域（8 邻域，自由定义 dist>=0.30）
+        free_mask = win >= 0.30
+        comp = 0
+        if free_mask.size:
+            from collections import deque
+            si, sj = ci - i0, cj - j0
+            if 0 <= si < free_mask.shape[1] and 0 <= sj < free_mask.shape[0] and free_mask[sj, si]:
+                seen = np.zeros_like(free_mask, dtype=bool)
+                seen[sj, si] = True
+                q = deque([(sj, si)]); comp = 1
+                while q and comp < 4000:
+                    y, x = q.popleft()
+                    for dy in (-1, 0, 1):
+                        for dx in (-1, 0, 1):
+                            ny, nx = y + dy, x + dx
+                            if 0 <= ny < free_mask.shape[0] and 0 <= nx < free_mask.shape[1] \
+                                    and not seen[ny, nx] and free_mask[ny, nx]:
+                                seen[ny, nx] = True; q.append((ny, nx)); comp += 1
+        # 8 方向可逃逸性：沿该方向连续 probe_escape_clear_m 都保持 >=该净空
+        esc = 0
+        step = max(1, int(0.10 / res))
+        for ang in [i * math.pi / 4.0 for i in range(8)]:
+            ok = True
+            for d in range(step, int(self.probe_escape_clear_m / res) + 1, step):
+                x = ci + int(round(math.cos(ang) * d)); y = cj + int(round(math.sin(ang) * d))
+                if not (0 <= x < w and 0 <= y < h) or dist_m[y, x] < self.probe_narrow_r:
+                    ok = False
+                    break
+            esc += 1 if ok else 0
+        vis_occ = 0
+        vg = self.vision_grid
+        if self.use_vision_obstacles and vg is not None:
+            vr = vg.info.resolution
+            vox, voy = vg.info.origin.position.x, vg.info.origin.position.y
+            v = np.asarray(vg.data, dtype=np.int16).reshape(vg.info.height, vg.info.width)
+            occ = np.argwhere(v == 100)
+            if occ.size and vr > 0:
+                vwx = vox + (occ[:, 1] + 0.5) * vr
+                vwy = voy + (occ[:, 0] + 0.5) * vr
+                m = (np.hypot(vwx - wx, vwy - wy) <= self.probe_radius)
+                vis_occ = int(m.sum())
+        return {'vis_occ_r2': vis_occ, 'narrow_r2': narrow, 'free_r2': free,
+                'comp_r2': comp, 'esc_dirs': esc}
+
+    def probe_candidate(self, gx, gy, r, min_w, unk):
+        """把"本次派发的候选"的完整特征写一行 JSONL（离线统计用）。"""
+        if not self.probe_log:
+            return None
+        try:
+            field = self.clearance_field()
+            cx = self.region_complexity(field, gx, gy) if field is not None else {}
+        except Exception as exc:                       # noqa: BLE001
+            cx = {'error': f'{type(exc).__name__}: {exc}'}
+            self.get_logger().warn(f'候选探针失败（忽略）：{cx["error"]}')
+        row = {'t': round(time.time(), 3), 'goal': [round(gx, 3), round(gy, 3)],
+               'robot': [round(self.pose[0], 3), round(self.pose[1], 3)] if self.pose else None,
+               'min_w': None if min_w is None else round(float(min_w), 3),
+               'unknown': None if unk is None else unk,
+               'ahead': (r or {}).get('ahead'), 'near_ratio': (r or {}).get('near_ratio'),
+               'block': (r or {}).get('block'), 'penalty': (r or {}).get('penalty'),
+               'score': (r or {}).get('score')}
+        row.update(cx or {})
+        try:
+            os.makedirs(os.path.dirname(self.probe_log) or '.', exist_ok=True)
+            with open(self.probe_log, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(row, ensure_ascii=False) + '\n')
+        except Exception:                              # noqa: BLE001
+            pass
+        return row
 
     def clearance_at(self, field, wx, wy):
         """世界坐标 → (到最近障碍距离 m, 未知占比 0..1)；窗口按 0.5 m 统计未知占比。"""
@@ -1074,6 +1173,7 @@ class Arbiter(Node):
                     '前向净空预检否决：走廊 < %.2fm @(%.2f,%.2f)，目标 (%.2f,%.2f)'
                     % (self.corridor_width, narrow[0], narrow[1], gx, gy))
                 continue
+            self.probe_candidate(gx, gy, None, min_w, u)
             self.publish_goal(gx, gy, None, u)
             return
         if fallback is not None:
@@ -1176,6 +1276,7 @@ class Arbiter(Node):
                 r['min_w'] = min_w
             except Exception:                     # noqa: BLE001
                 pass
+            self.probe_candidate(gx, gy, r, min_w, r.get('unknown'))
             self.publish_goal(gx, gy, r)
             return
         if fallback is not None:
@@ -1255,6 +1356,7 @@ class Arbiter(Node):
                 r['min_w'] = min_w
             except Exception:                     # noqa: BLE001
                 pass
+            self.probe_candidate(gx, gy, r, min_w, r.get('unknown'))
             self.publish_goal(gx, gy, r)
             return
         if fallback is not None:

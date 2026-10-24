@@ -92,7 +92,8 @@ def generate_launch_description():
                                 # D0（2026-10-23 发现）：这个参数以前根本没传给仲裁节点，
                                 # 历史约 140 轮日志里 "[v3]" 出现 0 次 —— 一直是 v1 在跑。
                                 # 默认保持 v1（= 历史实测口径），要试 v3 必须显式 scoring:=v3。
-                                'scoring': LaunchConfiguration('scoring')}])
+                                'scoring': LaunchConfiguration('scoring'),
+                                'probe_log': LaunchConfiguration('candidate_probe_log')}])
 
     # P0-1：撞障取证（只读）。与机器人层同时启动，覆盖整轮（含启动期）。
     probe = Node(package='stemm_cartographer_exploration_sim',
@@ -210,6 +211,8 @@ def generate_launch_description():
             description='是否启用雷达引导的旋转+前进脱困（P0）'),
         DeclareLaunchArgument('corridor_width', default_value='1.05',
             description='前向净空预检的走廊净宽下限（m）；抬高可挡掉"看着能过、实际过不去"的口子'),
+        DeclareLaunchArgument('candidate_probe_log', default_value='',
+            description='候选质量探针 JSONL 路径（空=不记录）'),
         DeclareLaunchArgument('scoring', default_value='v1',
             description='前沿收益函数版本：v1=未知格数/就近（历史实测口径），v2=邻域未知占比，'
                         'v3=朝前未知+贴已知边界（此前从未真正生效，需单独 A/B）'),
