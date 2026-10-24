@@ -349,6 +349,17 @@ class Arbiter(Node):
         self.probe_escape_r = float(p('probe_escape_clear_m', 0.60).value)
         self.probe_narrow_r = float(p('probe_narrow_clear_m', 0.35).value)
         self.probe_radius = float(p('probe_radius_m', 2.0).value)
+        # ===== 候选闸门 V1（2026-10-24）=====
+        # 只治"能防住"的那类：落点是死口袋/过挤（激光∪视觉统一障碍图上的可脱困性）。
+        # 依据 10 轮 85 派发/13 卡死：esc_dirs=0 → 83% 卡死，5-8 → 4%；comp_r2<=100 → 83%。
+        # 硬拒仅用 esc_dirs/comp_r2（误杀率 10.6%）；occ 复杂度只重罚不硬拒
+        # （实测 esc_dirs=6 / occ=0.31 的安全点若硬拒会被误杀）。
+        self.gate_enabled = str(p('gate_enabled', 'true').value).lower() in ('true', '1', 'yes')
+        self.gate_esc_min = int(p('gate_esc_dirs_min', 3).value)
+        self.gate_comp_min = int(p('gate_comp_min_cells', 500).value)
+        self.gate_occ_soft = float(p('gate_occ_soft', 0.30).value)
+        self.gate_occ_penalty = float(p('gate_occ_penalty', 1200.0).value)
+        self.gate_esc_weights = (1.0, 0.70, 0.35, 0.10)   # esc_dirs 5-8 / 3-4 / 1-2 / 0
         self.corridor_stride = max(1, int(p('corridor_stride_cells', 2).value))
         self.narrow_penalty_sec = float(p('narrow_blacklist_sec', 45.0).value)
         # 物理接触区（撞过的地方）：强降权 + 长记忆，避免反复撞同一张桌子
@@ -432,6 +443,7 @@ class Arbiter(Node):
         self.stats = {'seen': 0, 'rejected_size': 0, 'rejected_path': 0,
                       'rejected_black': 0, 'published': 0,
                       'rejected_narrow': 0, 'narrow_fallback': 0, 'narrow_blocked_all': 0,
+                      'gate_reject': 0, 'gate_penalized': 0,
                       'escape_zones': 0}
 
         qmap = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
@@ -601,6 +613,36 @@ class Arbiter(Node):
         return pen
 
     # ---- D1/D2/D3：净空场 ----
+    def vision_occ_mask(self):
+        """视觉障碍在 **/map 栅格坐标** 下的 bool 掩码（按视觉栅格序号缓存）。"""
+        m = self.map
+        vg = self.vision_grid
+        if m is None or vg is None or not self.use_vision_obstacles:
+            return None
+        key = (self._vg_seq, self._map_seq)
+        if getattr(self, '_vis_key', None) == key:
+            return self._vis_mask
+        import numpy as np
+        info = m.info
+        w, h, res = info.width, info.height, info.resolution
+        ox, oy = info.origin.position.x, info.origin.position.y
+        mask = np.zeros((h, w), dtype=bool)
+        vr = vg.info.resolution
+        if vr > 0:
+            v = np.asarray(vg.data, dtype=np.int16).reshape(vg.info.height, vg.info.width)
+            occ = np.argwhere(v == 100)
+            if occ.size:
+                vwx = vg.info.origin.position.x + (occ[:, 1] + 0.5) * vr
+                vwy = vg.info.origin.position.y + (occ[:, 0] + 0.5) * vr
+                ci = ((vwx - ox) / res).astype(np.int32)
+                cj = ((vwy - oy) / res).astype(np.int32)
+                ok = (ci >= 0) & (ci < w) & (cj >= 0) & (cj < h)
+                if ok.any():
+                    mask[cj[ok], ci[ok]] = True
+        self._vis_key = key
+        self._vis_mask = mask
+        return mask
+
     def clearance_field(self):
         """返回 (dist_m, ox, oy, res, w, h, unknown) 或 None。
 
@@ -706,19 +748,48 @@ class Arbiter(Node):
                     break
             esc += 1 if ok else 0
         vis_occ = 0
-        vg = self.vision_grid
-        if self.use_vision_obstacles and vg is not None:
-            vr = vg.info.resolution
-            vox, voy = vg.info.origin.position.x, vg.info.origin.position.y
-            v = np.asarray(vg.data, dtype=np.int16).reshape(vg.info.height, vg.info.width)
-            occ = np.argwhere(v == 100)
-            if occ.size and vr > 0:
-                vwx = vox + (occ[:, 1] + 0.5) * vr
-                vwy = voy + (occ[:, 0] + 0.5) * vr
-                m = (np.hypot(vwx - wx, vwy - wy) <= self.probe_radius)
-                vis_occ = int(m.sum())
+        vmask = self.vision_occ_mask()
+        if vmask is not None:
+            vis_occ = int(vmask[j0:j1, i0:i1].sum())
         return {'vis_occ_r2': vis_occ, 'narrow_r2': narrow, 'free_r2': free,
                 'comp_r2': comp, 'esc_dirs': esc}
+
+    def candidate_gate(self, gx, gy):
+        """候选闸门 V1：返回 (reject_reason 或 None, features 或 None)。
+
+        只防"落点本身是死口袋/过挤"这一类（约占可治理卡死的多数）；
+        落点开阔但整片复杂、manager 自派、返航卡死不在本层范围。
+        """
+        if not self.gate_enabled:
+            return None, None
+        field = self.clearance_field()
+        if field is None:
+            return None, None
+        try:
+            f = self.region_complexity(field, gx, gy)
+        except Exception:                       # noqa: BLE001
+            return None, None
+        if not f:
+            return None, None
+        if f['esc_dirs'] < self.gate_esc_min:
+            return 'esc_dirs=%d<%d' % (f['esc_dirs'], self.gate_esc_min), f
+        if f['comp_r2'] < self.gate_comp_min:
+            return 'comp_r2=%d<%d' % (f['comp_r2'], self.gate_comp_min), f
+        return None, f
+
+    def gate_adjusted_penalty(self, f):
+        """occ 复杂度 → 罚分（不硬拒，避免误杀 esc_dirs 高的安全点）。"""
+        if not f:
+            return 0.0
+        pen = 0.0
+        if f.get('occ_frac_r2', 0.0) >= self.gate_occ_soft:
+            pen += self.gate_occ_penalty
+        esc = int(f.get('esc_dirs', 8))
+        w = self.gate_esc_weights[3] if esc == 0 else (
+            self.gate_esc_weights[2] if esc <= 2 else (
+                self.gate_esc_weights[1] if esc <= 4 else self.gate_esc_weights[0]))
+        # 把"可脱困性"折算成收益折扣：等价于扣掉 (1-w) 比例的未知收益
+        return pen + (1.0 - w) * 400.0
 
     def probe_candidate(self, gx, gy, r, min_w, unk):
         """把"本次派发的候选"的完整特征写一行 JSONL（离线统计用）。"""
@@ -1151,8 +1222,27 @@ class Arbiter(Node):
             u_eff = u - self._stuck_penalty(x, y, now)
             scored.append((u_eff, -math.hypot(x - self.pose[0], y - self.pose[1]), x, y))
         scored.sort(reverse=True)
-        fallback = None
+        # V1：对前 max_cand 个候选先算区域特征 → 闸门硬拒 + occ/esc 罚分重排
+        top, feats = [], {}
         for u, negd, x, y in scored[:self.max_cand]:
+            gx0, gy0 = self.pull_back(x, y)
+            reason, f = self.candidate_gate(gx0, gy0)
+            if reason:
+                self.stats['gate_reject'] = self.stats.get('gate_reject', 0) + 1
+                self._note_uniq('gate_reject', gx0, gy0)
+                self.blacklist.append((gx0, gy0, now + self.narrow_penalty_sec))
+                self.note_refusal(gx0, gy0)
+                self.get_logger().info(
+                    '候选闸门否决（%s）目标 (%.2f,%.2f)' % (reason, gx0, gy0))
+                continue
+            pen = self.gate_adjusted_penalty(f)
+            if pen > 0:
+                self.stats['gate_penalized'] = self.stats.get('gate_penalized', 0) + 1
+            top.append((u - pen, negd, x, y))
+            feats[(round(x, 2), round(y, 2))] = f
+        top.sort(reverse=True)
+        fallback = None
+        for u, negd, x, y in top:
             gx, gy = self.pull_back(x, y)
             ok, narrow, min_w, unk = self.path_and_width(gx, gy)
             if not ok:
@@ -1251,7 +1341,25 @@ class Arbiter(Node):
                 % (r['x'], r['y'], r['score'], r['ahead'], r['near_ratio'], r['penalty'])
                 for r in keep[:3]))
         fallback = None
+        gated = []
         for r in keep[:self.max_cand]:
+            gx0, gy0 = self.pull_back(r['x'], r['y'])
+            reason, f = self.candidate_gate(gx0, gy0)
+            if reason:
+                self.stats['gate_reject'] = self.stats.get('gate_reject', 0) + 1
+                self._note_uniq('gate_reject', gx0, gy0)
+                self.blacklist.append((gx0, gy0, now + self.narrow_penalty_sec))
+                self.note_refusal(gx0, gy0)
+                self.get_logger().info(
+                    '候选闸门否决（%s）目标 (%.2f,%.2f)' % (reason, gx0, gy0))
+                continue
+            pen = self.gate_adjusted_penalty(f)
+            if pen > 0:
+                self.stats['gate_penalized'] = self.stats.get('gate_penalized', 0) + 1
+                r = dict(r); r['score'] = r.get('score', 0.0) - pen
+            gated.append(r)
+        gated.sort(key=lambda q: q.get('score', 0.0), reverse=True)
+        for r in gated:
             gx, gy = self.pull_back(r['x'], r['y'])
             ok, narrow, min_w, unk = self.path_and_width(gx, gy)
             if not ok:
@@ -1332,7 +1440,25 @@ class Arbiter(Node):
                 % (r['x'], r['y'], r['score'], r['unknown'], r['block'],
                    r['width'], r['penalty']) for r in top))
         fallback = None
+        gated = []
         for r in keep[:self.max_cand]:
+            gx0, gy0 = self.pull_back(r['x'], r['y'])
+            reason, f = self.candidate_gate(gx0, gy0)
+            if reason:
+                self.stats['gate_reject'] = self.stats.get('gate_reject', 0) + 1
+                self._note_uniq('gate_reject', gx0, gy0)
+                self.blacklist.append((gx0, gy0, now + self.narrow_penalty_sec))
+                self.note_refusal(gx0, gy0)
+                self.get_logger().info(
+                    '候选闸门否决（%s）目标 (%.2f,%.2f)' % (reason, gx0, gy0))
+                continue
+            pen = self.gate_adjusted_penalty(f)
+            if pen > 0:
+                self.stats['gate_penalized'] = self.stats.get('gate_penalized', 0) + 1
+                r = dict(r); r['score'] = r.get('score', 0.0) - pen
+            gated.append(r)
+        gated.sort(key=lambda q: q.get('score', 0.0), reverse=True)
+        for r in gated:
             gx, gy = self.pull_back(r['x'], r['y'])
             ok, narrow, min_w, unk = self.path_and_width(gx, gy)
             if not ok:
