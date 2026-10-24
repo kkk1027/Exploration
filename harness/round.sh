@@ -95,8 +95,9 @@ rec "\"check\":\"variant\",\"disable_retreat\":$DISABLE_RETREAT,\"supervisor\":\
 # ---- 方案A：nav2 视觉图层注入（幂等、可回退；teardown 后自动撤销）----
 # ---- P0-1：返航姿态宽限注入（可回退；teardown 撤销）----
 if [ "$(python3 -c "print(1 if float('$GRACE_SEC')>0 else 0)")" = "1" ]; then
-  python3 harness/patch_car_launch.py --apply --grace "$GRACE_SEC" 2>&1 | tee -a "$OUT/harness.log"
-  say "返航姿态宽限：${GRACE_SEC}s（原厂 6 s；GRACE_SEC=0 可关）"
+  RRT_WAIT="${RRT_WAIT:-12.0}"
+  python3 harness/patch_car_launch.py --apply --grace "$GRACE_SEC" --rrt-wait "$RRT_WAIT" 2>&1 | tee -a "$OUT/harness.log"
+  say "返航姿态宽限：${GRACE_SEC}s（原厂 6 s；GRACE_SEC=0 可关）｜RRT 等待窗口：${RRT_WAIT:-0}s"
   trap 'python3 /home/kbf/stemm_exploration_sim_ws/harness/patch_car_launch.py --restore >/dev/null 2>&1; python3 /home/kbf/stemm_exploration_sim_ws/harness/vision_nav_params.py --restore >/dev/null 2>&1' EXIT INT TERM
 fi
 

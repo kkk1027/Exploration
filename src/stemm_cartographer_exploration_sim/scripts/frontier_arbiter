@@ -363,6 +363,18 @@ class Arbiter(Node):
         self.gate_occ_soft = float(p('gate_occ_soft', 0.30).value)
         self.gate_occ_penalty = float(p('gate_occ_penalty', 1200.0).value)
         self.gate_esc_weights = (1.0, 0.70, 0.35, 0.10)   # esc_dirs 5-8 / 3-4 / 1-2 / 0
+        # ===== V2-② 保底安全候选（2026-10-24）=====
+        # 目的：仲裁器"挑不出合格候选"时不再什么都不派 —— 否则 manager 会在
+        # rrt_fallback_wait 之后自己采样（实测卡死 62% 来自那条路径）。
+        # 做法：从前 max_cand 个候选里挑一个"开阔、连通、离车不远"的点当观察点。
+        self.fallback_enabled = str(p('fallback_goal_enabled', 'true').value).lower() in ('true','1','yes')
+        self.fallback_min_esc = int(p('fallback_min_esc_dirs', 5).value)
+        self.fallback_min_comp = int(p('fallback_min_comp_cells', 1000).value)
+        self.fallback_max_dist = float(p('fallback_max_dist_m', 3.0).value)
+        self.fallback_cooldown = float(p('fallback_cooldown_sec', 10.0).value)
+        self.fallback_max_total = int(p('fallback_max_total', 30).value)
+        self._fb_last = 0.0
+        self._fb_count = 0
         self.corridor_stride = max(1, int(p('corridor_stride_cells', 2).value))
         self.narrow_penalty_sec = float(p('narrow_blacklist_sec', 45.0).value)
         # 物理接触区（撞过的地方）：强降权 + 长记忆，避免反复撞同一张桌子
@@ -756,6 +768,46 @@ class Arbiter(Node):
             vis_occ = int(vmask[j0:j1, i0:i1].sum())
         return {'vis_occ_r2': vis_occ, 'narrow_r2': narrow, 'free_r2': free,
                 'comp_r2': comp, 'esc_dirs': esc}
+
+    def pick_safe_observation(self, cands):
+        """V2-②：从候选里挑一个"开阔、连通、离车不远"的观察点（作为保底目标）。
+
+        与闸门相反：闸门是"排除坏点"，这里是"在坏点之外找一个还能站的点"。
+        找不到就返回 None（宁可不派，也不派危险点）。
+        """
+        if not self.fallback_enabled or self.pose is None:
+            return None
+        if self._fb_count >= self.fallback_max_total:
+            return None
+        now = time.monotonic()
+        if now - self._fb_last < self.fallback_cooldown:
+            return None
+        field = self.clearance_field()
+        if field is None:
+            return None
+        best, best_score = None, -1e9
+        for (x, y) in cands[:max(8, self.max_cand * 2)]:
+            gx, gy = self.pull_back(x, y)
+            dist = math.hypot(gx - self.pose[0], gy - self.pose[1])
+            if dist > self.fallback_max_dist or dist < 0.8:
+                continue
+            try:
+                f = self.region_complexity(field, gx, gy)
+            except Exception:                      # noqa: BLE001
+                continue
+            if not f:
+                continue
+            if f['esc_dirs'] < self.fallback_min_esc or f['comp_r2'] < self.fallback_min_comp:
+                continue
+            # 开阔优先 + 近一点：esc_dirs 高、距离近、复杂度低
+            sc = f['esc_dirs'] * 10 - dist * 3 - f['occ_frac_r2'] * 20
+            if sc > best_score:
+                best_score, best = sc, (gx, gy)
+        if best is None:
+            return None
+        self._fb_last = now
+        self._fb_count += 1
+        return best
 
     def candidate_gate(self, gx, gy):
         """候选闸门 V1：返回 (reject_reason 或 None, features 或 None)。
@@ -1275,6 +1327,14 @@ class Arbiter(Node):
                 '候选全部需要穿窄缝，回退派发最优点 (%.2f,%.2f)；统计 %s'
                 % (fallback[0], fallback[1], self.stats))
             self.publish_goal(fallback[0], fallback[1], None, 0)
+            return
+        obs = self.pick_safe_observation([(x, y) for _, _, x, y in scored])
+        if obs is not None:
+            self.stats['fallback_obs'] = self.stats.get('fallback_obs', 0) + 1
+            self.get_logger().warn(
+                '本拍无可派候选 → 派保底观察点 (%.2f,%.2f)（第 %d 次）；统计 %s'
+                % (obs[0], obs[1], self._fb_count, self.stats))
+            self.publish_goal(obs[0], obs[1], None, 0)
             return
         self.get_logger().warn(f'本轮候选全部被拒：{self.stats}')
 
