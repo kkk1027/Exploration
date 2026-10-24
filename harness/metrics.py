@@ -12,6 +12,7 @@
 另附仲裁统计中位数：rejected_path / rejected_narrow / rejected_size。
 """
 import argparse
+import ast
 import glob
 import json
 import os
@@ -34,7 +35,8 @@ def load(d):
     for line in reversed(txt.splitlines()):
         if '统计 {' in line:
             try:
-                stats = json.loads(line[line.index('{'):])
+                # 仲裁器打的是 python dict 字面量（单引号），json 解析不了 → 用 literal_eval
+                stats = ast.literal_eval(line[line.index('{'):])
             except Exception:               # noqa: BLE001
                 pass
             break

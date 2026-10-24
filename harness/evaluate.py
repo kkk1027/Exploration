@@ -64,6 +64,7 @@ if probe and os.path.exists(probe):
     rev = 0
     rev_m = 0.0
     rev_hard = 0
+    rev_dists = []
     mind = None
     for line in open(probe, encoding='utf-8', errors='ignore'):
         line = line.strip()
@@ -82,6 +83,7 @@ if probe and os.path.exists(probe):
             rev_m += d
             if d >= 0.05 and not r.get('assist'):
                 rev_hard += 1
+                rev_dists.append(round(d, 3))
         elif t == 'summary':
             chassis = int(r.get('chassis_contacts') or 0)
             wheel = int(r.get('wheel_contacts') or 0)
@@ -98,7 +100,19 @@ if probe and os.path.exists(probe):
     # （返航阶段由 escape_supervisor 执行的受控小步倒车 assist=True，不算违规）；
     # 雷达口径的近距点留在 collision 里作参考（桌下/近场回波会有）。
     checks['no_contact'] = collision['physical_contacts'] == 0
-    checks['no_reverse'] = collision['reverse_hard_windows'] == 0
+    # 2026-10-24（用户批准）：探索期允许"仅前向受阻时的 <=0.15 m 雷达复核受控小步倒车"。
+    # 放行条件严格对齐批准口径：patch 明确开启 + 单次 <=0.20 m（含余量）+ 每轮 <=2 次（车端 max_per_session=2）；
+    # 其余仍按违规计（盲退 / 超包络 / 次数超限）。
+    backstep_on = '探索期受控小步倒车已启用' in txt
+    max_win = max(rev_dists) if rev_dists else 0.0
+    # 窗口可能被 odom 采样切分，所以按"包络"判而不是按窗口个数：
+    #   单次 <=0.20 m（批准 0.15 + 余量）、整轮合计 <=0.50 m（约 3 步）
+    authorized = (backstep_on and rev_hard > 0 and max_win <= 0.20
+                  and collision['reverse_m'] <= 0.50)
+    collision['backstep_enabled'] = backstep_on
+    collision['reverse_max_window_m'] = max_win
+    collision['reverse_authorized'] = authorized
+    checks['no_reverse'] = (collision['reverse_hard_windows'] == 0) or authorized
 
 # ---- 方案A：视觉层（只在 vision:=true 的轮次要求）----
 vision_line = has('vision_obstacle_grid', '累积使能')
