@@ -24,8 +24,12 @@ from action_msgs.msg import GoalInfo, GoalStatusArray
 from action_msgs.srv import CancelGoal
 from geometry_msgs.msg import PoseStamped, Twist
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import LaserScan
 from rclpy.node import Node
-from std_msgs.msg import String
+from rclpy.qos import qos_profile_sensor_data
+from rcl_interfaces.msg import Parameter, ParameterType
+from rcl_interfaces.srv import SetParameters
+from std_msgs.msg import Bool, String
 
 ACTIVE = (1, 2, 3)          # ACCEPTED / EXECUTING / CANCELING
 
@@ -43,6 +47,16 @@ class ExploreWatchdog(Node):
         # 表现为 nav_state 已进入 return 但车不动、也无新目标。这里主动 cancel-all 解锁。
         d('return_stall_sec', 8.0)
         d('return_cancel_max', 3)
+        # P0-戊：受控小步倒车的"四向无净空"联合判定（用户批准口径）。
+        # 只有当四个扇区的最小测距**都**小于 backstep_gate_m 时才允许车端 R1b 背退，
+        # 否则动态把 exploration_retreat_enabled 置 false —— 这样"背退"严格限定在楔死场景。
+        d('backstep_gate', True)
+        d('backstep_gate_m', 0.50)
+        d('scan_topic', '/scan')
+        d('escape_assist_topic', '/escape_assist_active')
+        # P0-甲：脱困单元正在执行时，看门狗不得取消目标（否则和 supervisor 抢）
+        d('defer_to_escape', True)
+        d('escape_request_topic', '/escape_request')
         d('odom_topic', '/odom_combined')
         d('cmd_topic', '/cmd_vel')
         d('nav_state_topic', '/stemm_cartographer/nav_state')
@@ -59,6 +73,14 @@ class ExploreWatchdog(Node):
         self.return_cancel_max = int(g('return_cancel_max').value)
         self._return_since = None
         self._return_cancels = 0
+        self.backstep_gate = bool(g('backstep_gate').value)
+        self.backstep_gate_m = float(g('backstep_gate_m').value)
+        self.defer_to_escape = bool(g('defer_to_escape').value)
+        self.sect = None                 # (front, left, right, rear) 扇区最小测距
+        self.escape_active = False
+        self._gate_state = None          # 上一次写入的 exploration_retreat_enabled
+        self._gate_last = 0.0
+        self._gate_stats = {'allow': 0, 'deny': 0}
 
         self.pose = None
         self.cmd = (0.0, 0.0)
@@ -76,6 +98,14 @@ class ExploreWatchdog(Node):
         self.pub_zone = self.create_publisher(PoseStamped, g('zone_topic').value, 10)
         self.cancel_cli = self.create_client(
             CancelGoal, g('status_topic').value.rsplit('/_action', 1)[0] + '/_action/cancel_goal')
+        self.create_subscription(LaserScan, g('scan_topic').value, self.on_scan,
+                                 qos_profile_sensor_data)
+        self.create_subscription(Bool, g('escape_assist_topic').value,
+                                 self.on_escape_active, 10)
+        # P0-甲：静止时主动请求逃逸（supervisor 会做"旋转+前进/受控小步倒车"）
+        self.pub_escape_req = self.create_publisher(Bool, g('escape_request_topic').value, 10)
+        self.mgr_param_cli = self.create_client(
+            SetParameters, '/stemm_cartographer_nav2_manager/set_parameters')
         self.create_timer(1.0, self.tick)
         self.get_logger().info(
             'explore_watchdog up: stall>=%.1fs disp<%.2fm cooldown=%.0fs enabled=%s'
@@ -91,6 +121,60 @@ class ExploreWatchdog(Node):
 
     def on_status(self, m):
         self.goals = {bytes(g.goal_info.goal_id.uuid).hex(): g.status for g in m.status_list}
+
+    def on_scan(self, m):
+        """把一圈按 4 个扇区取最小测距（front/left/right/rear）。"""
+        if not m.ranges:
+            return
+        n = len(m.ranges)
+        inc = m.angle_increment
+        a0 = m.angle_min
+
+        def sector_min(lo_deg, hi_deg):
+            lo = math.radians(lo_deg); hi = math.radians(hi_deg)
+            best = float('inf')
+            for i, r in enumerate(m.ranges):
+                a = a0 + i * inc
+                a = math.atan2(math.sin(a), math.cos(a))
+                if not (lo <= a <= hi):
+                    continue
+                if not math.isfinite(r) or r <= 0.02:
+                    continue
+                if r < best:
+                    best = r
+            return best if math.isfinite(best) else 99.0
+
+        self.sect = (sector_min(-30, 30), sector_min(30, 120),
+                     sector_min(-120, -30), sector_min(150, 210))
+
+    def on_escape_active(self, m):
+        self.escape_active = bool(m.data)
+
+    def backstep_gate_tick(self, now):
+        """P0-戊：四向都贴脸才允许背退；否则禁止。"""
+        if not self.backstep_gate or self.sect is None or now - self._gate_last < 3.0:
+            return
+        self._gate_last = now
+        all_narrow = max(self.sect) < self.backstep_gate_m
+        want = all_narrow
+        if want == self._gate_state:
+            return
+        if not self.mgr_param_cli.service_is_ready():
+            if not self.mgr_param_cli.wait_for_service(timeout_sec=0.5):
+                return
+        req = SetParameters.Request()
+        p = Parameter()
+        p.name = 'exploration_retreat_enabled'
+        p.value.type = ParameterType.PARAMETER_BOOL
+        p.value.bool_value = want
+        req.parameters = [p]
+        self.mgr_param_cli.call_async(req)
+        self._gate_state = want
+        self._gate_stats['allow' if want else 'deny'] += 1
+        self.get_logger().info(
+            '背退闸：%s（四向最小 front=%.2f left=%.2f right=%.2f rear=%.2f m，阈值 %.2f）'
+            % ('放行' if want else '禁止', self.sect[0], self.sect[1], self.sect[2],
+               self.sect[3], self.backstep_gate_m))
 
     def on_nav(self, m):
         try:
@@ -182,6 +266,7 @@ class ExploreWatchdog(Node):
     def tick(self):
         if not self.enabled or self.pose is None:
             return
+        self.backstep_gate_tick(time.monotonic())
         # 返航期一律由返航兜底接管：此时"不动"既可能是等精确终态、也可能是真卡住，
         # 但**普通 5 s 静止取消在这里是有害的**（会把 manager 等待终态的目标提前取消，
         # 实测直接把返航从 0/2 失败推到 6/8 失败）。
@@ -205,6 +290,15 @@ class ExploreWatchdog(Node):
         if now - t0 < self.stall_sec or now - self.last_fire < self.cooldown:
             return
 
+        if self.defer_to_escape and self.escape_active:
+            # P0-甲：supervisor 正在执行脱困单元（旋转+前进/受控小步倒车），此时取消目标只会打断它
+            self.get_logger().info('静止 %.0fs 但脱困单元在跑 → 让位给 escape_supervisor'
+                                   % (now - t0))
+            self.record({'type': 'stall_deferred', 'stall_sec': round(now - t0, 2),
+                         'pos': [round(self.pose[0], 3), round(self.pose[1], 3)],
+                         't': round(time.time(), 3)})
+            self.ref = (now, self.pose[0], self.pose[1])
+            return
         cmd_zero = abs(self.cmd[0]) < 0.02 and abs(self.cmd[1]) < 0.05
         why = ('指令为 0（车端安全闸/manager 让停）' if cmd_zero
                else '有指令但车不动（轮子打滑/被压住）')
@@ -215,6 +309,10 @@ class ExploreWatchdog(Node):
         self.stalls += 1
         self.last_fire = now
         self.ref = (now, self.pose[0], self.pose[1])
+        try:
+            self.pub_escape_req.publish(Bool(data=True))
+        except Exception:               # noqa: BLE001
+            pass
         self.get_logger().warn(
             '静止超时 %.1fs @(%.2f,%.2f)：%s；cmd=(%.2f,%.2f) 前向=%.2fm mode=%s state=%s err=%s'
             % (now - t0, self.pose[0], self.pose[1], why, self.cmd[0], self.cmd[1],

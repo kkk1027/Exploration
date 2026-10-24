@@ -51,6 +51,12 @@ for line in txt.splitlines():
     if any(re.search(p_, line) for p_ in POS):
         pos.append(line.strip()[:160])
 checks['return_home'] = pos[-1] if pos else None
+# P0-丁：把两种完成语义分开记账（只记录，不参与判定；等待产品决策）
+RET_KIND = {
+    'by_goal_reached': ('return-home goal reached' in txt),
+    'by_position': ('completed by position' in txt or 'position reached' in txt),
+    'orientation_exact': ('exact orientation' not in txt),
+}
 mapfile = os.path.expanduser('~/stemm_sim_ws/maps/explore_latest.pgm')
 checks['map_saved'] = f'{os.path.getsize(mapfile)} B' if os.path.exists(mapfile) else None
 
@@ -147,6 +153,7 @@ out = {'tag': tag, 'verdict': verdict,
        'evidence': {k: v for k, v in checks.items() if v}}
 if collision is not None:
     out['collision'] = collision
+out['return_home_kind'] = RET_KIND
 if vision is not None:
     out['vision'] = vision
 print(json.dumps(out, ensure_ascii=False, indent=1))

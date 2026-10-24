@@ -152,6 +152,7 @@ class EscapeSupervisor(Node):
         self.last_motion = time.monotonic()
         self._motion_anchor = None
         self.last_foreign_cmd = 0.0
+        self.force_request_at = 0.0
         self.own_cmd_at = 0.0
         self.nav_busy = False
         self.mode = ''
@@ -203,6 +204,10 @@ class EscapeSupervisor(Node):
         self.create_subscription(Odometry, self.odom_topic, self.on_odom, 20)
         self.create_subscription(Twist, self.cmd_topic, self.on_cmd, 20)
         self.create_subscription(String, self.nav_state_topic, self.on_nav_state, 10)
+        # P0-甲：看门狗检测到"静默静止"（车端安全闸把速度置零）时主动请求一次脱困单元，
+        # 不再依赖本节点自己从 cmd_vel 推断 —— 那条路在 cmd≡0 的场景里永远等不到。
+        self.create_subscription(Bool, str(p('escape_request_topic', '/escape_request').value),
+                                 self.on_escape_request, 10)
         self.create_subscription(GoalStatusArray, self.status_topic, self.on_status, 10)
         if Costmap is not None:
             costmap_qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
@@ -293,6 +298,10 @@ class EscapeSupervisor(Node):
         if busy and not self.nav_busy:
             self._busy_since = time.monotonic()
         self.nav_busy = busy
+
+    def on_escape_request(self, m):
+        if bool(m.data):
+            self.force_request_at = time.monotonic()
 
     def on_costmap(self, m):
         self.costmap = m
@@ -440,6 +449,8 @@ class EscapeSupervisor(Node):
         if self.phase == 'reverse':
             self.reverse_tick(now)
             return
+        if self.maybe_force_unit(now):
+            self.ref = None
         if self.maybe_reverse_assist(now):
             return
         self.maybe_arm(now)
@@ -538,6 +549,29 @@ class EscapeSupervisor(Node):
                  moved=round(self._rv_moved, 3), dur=round(now - self._rv_t0, 2),
                  pos=[round(v, 2) for v in (self.pose or (0, 0, 0))[:2]],
                  nav=self.nav_state, stats=dict(self.stats))
+
+    def maybe_force_unit(self, now):
+        """P0-甲：被看门狗点名时立刻起一个脱困单元（安全闸门一个都不放松）。"""
+        if not self.enabled or self.phase == 'reverse':
+            return False
+        if now - self.force_request_at > 2.0 or self.force_request_at <= 0.0:
+            return False
+        if now < self.disabled_until or now < self.spot_until:
+            return False
+        if now - self.points_stamp > self.scan_stale_sec:
+            return False
+        if self.pose is None:
+            return False
+        if self.require_near_obstacle > 0.0:
+            if self.min_range_all(stride=2) > self.require_near_obstacle:
+                return False            # 离障碍还远：不是楔死
+        if self.units_this_episode >= self.max_units_per_episode:
+            return False
+        self.force_request_at = 0.0
+        self.get_logger().warn('收到看门狗脱困请求 → 强制起一个脱困单元')
+        self.log(type='forced_unit_start', nav=self.nav_state)
+        self.start_unit(now)
+        return True
 
     def maybe_arm(self, now):
         if not self.enabled:

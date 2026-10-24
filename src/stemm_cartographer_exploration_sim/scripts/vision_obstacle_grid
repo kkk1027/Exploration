@@ -97,6 +97,9 @@ class VisionObstacleGrid(Node):
         # P1-1：累积障碍膨胀（格）。视觉看到的是物体表面，机器人有半宽；
         # 膨胀 1 格（5 cm）可覆盖"擦着边过去"的残余接触。
         d('dilate_cells', 1)
+        # P0-己：幽灵障碍——累积格若长期没被再次观测就淡出（0=永不衰减，维持旧行为）。
+        # 视觉看到的是物体表面，家具被挪走后旧格会永久堵路；默认 120 s 慢衰减。
+        d('decay_sec', 120.0)
 
         g = self.get_parameter
         self.cloud_topic = g('cloud_topic').value
@@ -117,9 +120,11 @@ class VisionObstacleGrid(Node):
         self.dump_path = str(g('dump_path').value or '')
         self.live_frame = str(g('live_frame').value or 'base_footprint')
         self.dilate = max(0, int(g('dilate_cells').value))
+        self.decay = float(g('decay_sec').value)
 
         self.cells = set()
         self.hits = {}          # 格 → 被观测到的帧数（跨帧持久化）
+        self.seen_at = {}       # 格 → 最后一次被观测的 monotonic 时间（衰减用）
         self.last_live = np.zeros((0, 3), dtype=np.float64)
         self.last_vox = np.zeros((0, 3), dtype=np.float64)
         self.last_low = np.zeros((0, 3), dtype=np.float64)
@@ -248,9 +253,12 @@ class VisionObstacleGrid(Node):
             gx = good // base - OFF
             gy = good % base - OFF
             hits = self.hits
+            import time as _time
+            now_t = _time.monotonic()
             for c in zip(gx.tolist(), gy.tolist()):
                 n = hits.get(c, 0) + 1
                 hits[c] = n if n < 10000 else 10000
+                self.seen_at[c] = now_t
                 if n >= self.min_frames:
                     self.cells.add(c)
         self.stats['filtered'] = int(uniq.size - good.size)
@@ -268,6 +276,15 @@ class VisionObstacleGrid(Node):
     def publish_accum(self):
         if not self.cells:
             return
+        if self.decay > 0.0:
+            import time as _time
+            now_t = _time.monotonic()
+            stale = [c for c in self.cells if now_t - self.seen_at.get(c, 0.0) > self.decay]
+            if stale:
+                for c in stale:
+                    self.cells.discard(c)
+                self.get_logger().info('衰减移除 %d 个长期未再观测的障碍格（%.0fs 窗口）'
+                                       % (len(stale), self.decay))
         stamp = self.get_clock().now().to_msg()
         arr = np.fromiter((v for c in self.cells for v in c), dtype=np.int64,
                           count=2 * len(self.cells)).reshape(-1, 2)

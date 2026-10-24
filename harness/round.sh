@@ -173,6 +173,17 @@ else
   done
 fi
 
+# ---- P0-乙：参数落地自检（栈还活着时做，防"看起来正常但参数没设上"）----
+BACKSTEP_EXPECT=$([ "${EXPLORE_BACKSTEP:-1}" = "1" ] && echo 1 || echo 0)
+bash harness/param_audit.sh "$OUT/param_audit.json" "$BACKSTEP_EXPECT" 2>&1 | tee -a "$OUT/harness.log"
+AUDIT_RC=${PIPESTATUS[0]}
+if [ "$AUDIT_RC" = "0" ]; then
+  rec '"check":"param_audit","ok":true'
+else
+  say "✗ 参数自检未全通过 → 本轮记为 invalid(param_audit)"
+  rec '"check":"param_audit","ok":false'
+fi
+
 # ---- 3) teardown（按 PGID） ----
 teardown() {
   [ -n "$PGID" ] && kill -TERM -- "-$PGID" 2>/dev/null
