@@ -31,7 +31,7 @@ import time
 import rclpy
 from action_msgs.msg import GoalStatusArray
 from geometry_msgs.msg import PoseStamped, Twist
-from nav_msgs.msg import OccupancyGrid, Odometry
+from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import String
@@ -377,6 +377,30 @@ class Arbiter(Node):
         self.fallback_max_total = int(p('fallback_max_total', 10).value)
         self._fb_last = 0.0
         self._fb_count = 0
+        # ===== V2-③ 后置 veto（2026-10-24）=====
+        # 目的：闸门只看"落点"，管不到"manager 在窗口之外自己采样的目标"。
+        # 做法：订阅 /plan，取末位点当"当前真正在执行的目标"；若它既不是本节点
+        # 最近派过的点、又命中硬闸门（esc_dirs 太小 / 复杂度过高），就取消它。
+        # 安全约束（吃过教训，见 docs/P7 第 4 节）：
+        #   * 只在探索期生效（nav_state 里 mapping_done=false 且无返航迹象）；
+        #   * 目标落在 map 原点近旁（返航终点）一律不碰；
+        #   * 每局限 2 次、30 s 冷却、同一目标 20 s 内不重复 veto；
+        #   * 只取消"当前 EXECUTING 的那个 goal_id"，绝不用 cancel-all。
+        self.veto_enabled = str(p('veto_enabled', 'false').value).lower() in ('true','1','yes')
+        self.veto_min_esc = int(p('veto_min_esc_dirs', 3).value)
+        self.veto_occ_max = float(p('veto_occ_frac_max', 0.30).value)
+        self.veto_self_r = float(p('veto_self_radius_m', 0.60).value)
+        self.veto_self_sec = float(p('veto_self_window_sec', 8.0).value)
+        self.veto_max = int(p('veto_max_per_session', 2).value)
+        self.veto_cooldown = float(p('veto_cooldown_sec', 30.0).value)
+        self.veto_home_guard = float(p('veto_home_guard_m', 0.80).value)
+        self._veto_last = 0.0
+        self._veto_count = 0
+        self._veto_prev = None         # (x, y, ts) 上一次 veto 的目标
+        self._nav_payload = None       # 最近一帧 nav_state 解析结果
+        self._nav_seen = False
+        self._active_uuid = []         # 当前 ACCEPTED/EXECUTING 的 goal uuid（bytes）
+        self._veto_detail = []
         self.corridor_stride = max(1, int(p('corridor_stride_cells', 2).value))
         self.narrow_penalty_sec = float(p('narrow_blacklist_sec', 45.0).value)
         # 物理接触区（撞过的地方）：强降权 + 长记忆，避免反复撞同一张桌子
@@ -475,6 +499,8 @@ class Arbiter(Node):
                                  self.on_nav_state, 10)
         self.create_subscription(GoalStatusArray, '/navigate_to_pose/_action/status',
                                  self.on_status, 10)
+        # V2-③：planner_server 的 /plan 末位点 = 正在执行的目标
+        self.create_subscription(Path, '/plan', self.on_plan, 5)
         self.pub = self.create_publisher(PoseStamped, '/validated_frontier_goal', 10)
         self.costmap = None
         self.create_subscription(OccupancyGrid, '/global_costmap/costmap', self.on_costmap, qmap)
@@ -507,13 +533,29 @@ class Arbiter(Node):
 
     def on_status(self, m):
         busy = False
+        uu = []
         for st in m.status_list:
             if st.status in (1, 2, 3):      # ACCEPTED / EXECUTING / CANCELING
                 busy = True
+                if st.status == 2:          # EXECUTING —— veto 只取消这一个
+                    try:
+                        uu.append(bytes(st.goal_info.goal_id.uuid))
+                    except Exception:       # noqa: BLE001
+                        pass
         self.mgr_busy = busy
+        self._active_uuid = uu
 
     def on_nav_state(self, m):
-        txt = (m.data or '').lower()
+        txt_raw = m.data or ''
+        txt = txt_raw.lower()
+        # V2-③ 阶段判定：nav_state 是车端 manager 发的 JSON（见 stemm_nav2_manager.manager）
+        try:
+            o = json.loads(txt_raw)
+            if isinstance(o, dict):
+                self._nav_payload = o
+                self._nav_seen = True
+        except Exception:                    # noqa: BLE001
+            pass
         # 只认真正处于 escape/blocked 的动作态；排除返航与 retry_recovery 这类常态字串
         hit = ('escape_' in txt or 'blocked_' in txt or '"escape' in txt or '"blocked' in txt)
         if hit and 'return' not in txt and 'retry_recovery' not in txt:
@@ -820,6 +862,129 @@ class Arbiter(Node):
         self._fb_last = now
         self._fb_count += 1
         return best
+
+    # ===== V2-③ 后置 veto ====================================================
+    def _explore_phase(self):
+        """现在是不是"探索期"（决定 veto 能不能动）。
+
+        保守到宁可不动作：没收到过 nav_state 就一律 false —— 车端状态流断了的时候
+        我们无从判断是不是已经在返航，此时去 cancel 就可能重演"自己人掐掉返航目标"。
+        """
+        if not self._nav_seen or self._nav_payload is None:
+            return False
+        p = self._nav_payload
+        try:
+            if p.get('mapping_done') is True:
+                return False
+            if p.get('pending_home_goal'):          # 已有返航目标在路上
+                return False
+            if int(p.get('return_home_retry_count') or 0) > 0:
+                return False
+        except Exception:                           # noqa: BLE001
+            return False
+        return True
+
+    def on_plan(self, m):
+        """V2-③：拿 /plan 的末位点当"正在执行的目标"，命中硬闸门就取消。
+
+        只处理"不是本节点派的"目标 —— 自己派的点在派发时已经过闸门，
+        再 veto 一次等于自己打自己，还会把派发节奏搞乱。
+        """
+        if not self.veto_enabled or not m.poses:
+            return
+        try:
+            pos = m.poses[-1].pose.position
+            gx, gy = float(pos.x), float(pos.y)
+        except Exception:                       # noqa: BLE001
+            return
+        self.veto_probe(gx, gy, tag='plan')
+
+    def veto_probe(self, gx, gy, tag=''):
+        """对一个外部目标做后置否决判定（拆出来便于离线自测）。"""
+        if not self.veto_enabled or self.pose is None:
+            return None
+        if not self._explore_phase():
+            return None
+        now = time.monotonic()
+        # 1) 自己派的点：最近 veto_self_sec 内、距离 < veto_self_r
+        for hx, hy, ts in reversed(self.pub_history[-25:]):
+            if now - ts <= self.veto_self_sec and math.hypot(gx - hx, gy - hy) < self.veto_self_r:
+                return None
+        # 2) 原点近旁（返航终点/原地观察）不碰
+        if math.hypot(gx, gy) < self.veto_home_guard:
+            return None
+        # 3) 额度与冷却
+        if self._veto_count >= self.veto_max:
+            return None
+        if now - self._veto_last < self.veto_cooldown:
+            return None
+        # 4) 同一目标 20 s 内不重复 veto（否则会跟 manager 拉锯）
+        pv = self._veto_prev
+        if pv is not None and now - pv[2] < 20.0 and math.hypot(gx - pv[0], gy - pv[1]) < 0.50:
+            return None
+        field = self.clearance_field()
+        if field is None:
+            return None
+        try:
+            f = self.region_complexity(field, gx, gy)
+        except Exception:                       # noqa: BLE001
+            return None
+        if not f:
+            return None
+        why = []
+        if f['esc_dirs'] < self.veto_min_esc:
+            why.append('esc_dirs=%d<%d' % (f['esc_dirs'], self.veto_min_esc))
+        if f['occ_frac_r2'] >= self.veto_occ_max:
+            why.append('occ=%.2f>=%.2f' % (f['occ_frac_r2'], self.veto_occ_max))
+        if not why:
+            return None
+        reason = ','.join(why)
+        ok = self._do_veto_cancel()
+        self._veto_last = now
+        self._veto_prev = (gx, gy, now)
+        if ok:
+            self._veto_count += 1
+            self.stats['veto'] = self.stats.get('veto', 0) + 1
+            self._veto_detail.append((round(now, 2), round(gx, 2), round(gy, 2), reason))
+            self.get_logger().warn(
+                'V2-③ 后置否决：外部目标 (%.2f,%.2f) 命中硬闸门 %s（%s）→ 已取消；'
+                '本轮第 %d/%d 次' % (gx, gy, reason, tag, self._veto_count, self.veto_max))
+        else:
+            self.get_logger().warn(
+                'V2-③ 后置否决判定命中 %s @(%.2f,%.2f)，但取消失败（无活跃目标或服务未就绪）'
+                % (reason, gx, gy))
+        return reason if ok else None
+
+    def _do_veto_cancel(self):
+        """只取消当前 EXECUTING 的那一个 goal_id（绝不用 cancel-all）。"""
+        if not self._active_uuid:
+            return False
+        try:
+            from action_msgs.srv import CancelGoal
+            from action_msgs.msg import GoalInfo
+            from unique_identifier_msgs.msg import UUID
+        except Exception:                       # noqa: BLE001
+            return False
+        cli = getattr(self, 'cancel_cli', None)
+        if cli is None:
+            try:
+                cli = self.cancel_cli = self.create_client(
+                    CancelGoal, '/navigate_to_pose/_action/cancel_goal')
+            except Exception:                   # noqa: BLE001
+                return False
+        if not cli.service_is_ready():
+            return False
+        req = CancelGoal.Request()
+        gi = GoalInfo()
+        uid = UUID()
+        uid.uuid = list(self._active_uuid[0])
+        gi.goal_id = uid
+        req.goal_info = gi
+        try:
+            cli.call_async(req)
+            return True
+        except Exception:                       # noqa: BLE001
+            return False
 
     def candidate_gate(self, gx, gy):
         """候选闸门 V1：返回 (reject_reason 或 None, features 或 None)。

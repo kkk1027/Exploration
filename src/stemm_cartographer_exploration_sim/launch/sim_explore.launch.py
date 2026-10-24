@@ -93,6 +93,11 @@ def generate_launch_description():
                                 # 历史约 140 轮日志里 "[v3]" 出现 0 次 —— 一直是 v1 在跑。
                                 # 默认保持 v1（= 历史实测口径），要试 v3 必须显式 scoring:=v3。
                                 'scoring': LaunchConfiguration('scoring'),
+                                # V2-③ 后置 veto：默认关，实验时 veto:=true
+                                'veto_enabled': LaunchConfiguration('veto'),
+                                'veto_min_esc_dirs': LaunchConfiguration('veto_min_esc'),
+                                'veto_occ_frac_max': LaunchConfiguration('veto_occ_max'),
+                                'veto_max_per_session': LaunchConfiguration('veto_max'),
                                 'probe_log': LaunchConfiguration('candidate_probe_log')}])
 
     # P0-1：撞障取证（只读）。与机器人层同时启动，覆盖整轮（含启动期）。
@@ -213,6 +218,14 @@ def generate_launch_description():
             description='前向净空预检的走廊净宽下限（m）；抬高可挡掉"看着能过、实际过不去"的口子'),
         DeclareLaunchArgument('candidate_probe_log', default_value='',
             description='候选质量探针 JSONL 路径（空=不记录）'),
+        DeclareLaunchArgument('veto', default_value='false',
+            description='V2-③ 后置 veto：对非本节点派发的目标做硬闸门否决（只在探索期，默认关）'),
+        DeclareLaunchArgument('veto_min_esc', default_value='3',
+            description='后置 veto 的可逃逸方向下限（低于该值即否决）'),
+        DeclareLaunchArgument('veto_occ_max', default_value='0.30',
+            description='后置 veto 的 2 m 内障碍占比上限（达到即否决）'),
+        DeclareLaunchArgument('veto_max', default_value='2',
+            description='后置 veto 每局最多否决次数'),
         DeclareLaunchArgument('scoring', default_value='v1',
             description='前沿收益函数版本：v1=未知格数/就近（历史实测口径），v2=邻域未知占比，'
                         'v3=朝前未知+贴已知边界（此前从未真正生效，需单独 A/B）'),
