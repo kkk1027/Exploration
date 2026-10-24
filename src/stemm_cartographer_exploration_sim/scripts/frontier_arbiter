@@ -414,7 +414,10 @@ class Arbiter(Node):
         # （272 轮历史里这条消息出现在 21 轮 = 7.7%，且新几组失败几乎全是它）。
         # 做法：最后 tail_sec 秒里给"四周不够开阔"的候选加罚，让车尽量停在空地；
         #       同时把保底观察点的门槛临时放宽，避免末段干脆没有目标。
-        self.tail_park_enabled = self._as_bool(p('tail_park_enabled', True).value)
+        # 2026-10-24 十轮实测：开着它反而更差（全绿 10/10→8/10、返航失败 0→2、
+        # 卡死 12→16）。末段把车往开阔处送，等于让它在收尾阶段多跑一段路，
+        # 反而更容易在截止那一刻卡在半路。⇒ 默认关闭，实现与参数保留备查。
+        self.tail_park_enabled = self._as_bool(p('tail_park_enabled', False).value)
         self.explore_sec = float(p('explore_sec', 180.0).value)
         self.tail_sec = float(p('tail_park_sec', 25.0).value)
         self.tail_min_esc = int(p('tail_park_min_esc_dirs', 5).value)
