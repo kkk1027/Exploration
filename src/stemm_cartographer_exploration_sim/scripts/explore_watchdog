@@ -155,7 +155,10 @@ class ExploreWatchdog(Node):
         if not self.backstep_gate or self.sect is None or now - self._gate_last < 3.0:
             return
         self._gate_last = now
-        all_narrow = max(self.sect) < self.backstep_gate_m
+        # 真机雷达后方是盲区（仿真用 scan_deadzone_relay 复刻），rear 会返回"无数据"。
+        # 所以闸门只看**前/左/右**三向；后方由车端 R1b 自己的 /map 条带复核（rear_margin=0.25）兜底。
+        front, left, right, rear = self.sect
+        all_narrow = max(front, left, right) < self.backstep_gate_m
         want = all_narrow
         if want == self._gate_state:
             return
@@ -172,9 +175,8 @@ class ExploreWatchdog(Node):
         self._gate_state = want
         self._gate_stats['allow' if want else 'deny'] += 1
         self.get_logger().info(
-            '背退闸：%s（四向最小 front=%.2f left=%.2f right=%.2f rear=%.2f m，阈值 %.2f）'
-            % ('放行' if want else '禁止', self.sect[0], self.sect[1], self.sect[2],
-               self.sect[3], self.backstep_gate_m))
+            '背退闸：%s（前 %.2f / 左 %.2f / 右 %.2f m < 阈值 %.2f；后方 %.2f 由车端 /map 条带复核）'
+            % ('放行' if want else '禁止', front, left, right, self.backstep_gate_m, rear))
 
     def on_nav(self, m):
         try:
