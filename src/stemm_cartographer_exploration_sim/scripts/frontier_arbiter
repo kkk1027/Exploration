@@ -767,7 +767,12 @@ class Arbiter(Node):
         if vmask is not None:
             vis_occ = int(vmask[j0:j1, i0:i1].sum())
         return {'vis_occ_r2': vis_occ, 'narrow_r2': narrow, 'free_r2': free,
-                'comp_r2': comp, 'esc_dirs': esc}
+                'comp_r2': comp, 'esc_dirs': esc,
+                # 口径与 harness/analyze_candidates.py 完全一致：
+                # occ_frac_r2 = 2m 窗口内"净空<0.30m"的格占比。
+                # 之前这里没返回该键，导致 gate_adjusted_penalty 里
+                # f.get('occ_frac_r2',0.0) 永远取默认 0 → 软惩罚形同虚设。
+                'occ_frac_r2': (1.0 - free / float(win.size)) if win.size else 0.0}
 
     def pick_safe_observation(self, cands):
         """V2-②：从候选里挑一个"开阔、连通、离车不远"的观察点（作为保底目标）。
@@ -799,8 +804,13 @@ class Arbiter(Node):
                 continue
             if f['esc_dirs'] < self.fallback_min_esc or f['comp_r2'] < self.fallback_min_comp:
                 continue
-            # 开阔优先 + 近一点：esc_dirs 高、距离近、复杂度低
-            sc = f['esc_dirs'] * 10 - dist * 3 - f['occ_frac_r2'] * 20
+            # 开阔优先 + 近一点：esc_dirs 高、距离近、窄格占比低。
+            # 注意 region_complexity 返回的是 narrow_r2/free_r2（绝对格数），
+            # 直接拿绝对格数当占比会把大面积开阔区误判成"挤"，所以先换算成占比。
+            tot = f['narrow_r2'] + f['free_r2'] + 1
+            narrow_frac = f['narrow_r2'] / tot
+            sc = (f['esc_dirs'] * 10 - dist * 3 - narrow_frac * 20
+                  - f['vis_occ_r2'] * 0.05)
             if sc > best_score:
                 best_score, best = sc, (gx, gy)
         if best is None:

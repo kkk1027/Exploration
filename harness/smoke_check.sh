@@ -77,5 +77,6 @@ W=/home/kbf/stemm_exploration_sim_ws
 if python3 "$W/harness/test_arbiter_static.py" >/dev/null 2>&1; then ok "仲裁 path_and_width 签名一致"; else bad "仲裁返回值/调用点签名不一致（会直接崩）"; fi
 if python3 "$W/harness/test_scoring.py" >/dev/null 2>&1; then ok "打分内核离线断言通过"; else bad "打分内核离线断言失败"; fi
 if python3 "$W/harness/test_launch_dryrun.py" >/dev/null 2>&1; then ok "launch 可构造（干跑）"; else bad "launch 构造失败（import/类型错）"; fi
+if python3 "$W/harness/test_fallback_obs.py" >/dev/null 2>&1; then ok "保底观察点逻辑（合成净空场）"; else bad "保底观察点逻辑异常（卡死那刻会崩）"; fi
 
 if [ "$FAIL" -eq 0 ]; then echo "[smoke] 结果：PASS"; exit 0; else echo "[smoke] 结果：FAIL（$FAIL 项）"; exit 1; fi
