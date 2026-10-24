@@ -79,5 +79,6 @@ if python3 "$W/harness/test_scoring.py" >/dev/null 2>&1; then ok "打分内核�
 if python3 "$W/harness/test_launch_dryrun.py" >/dev/null 2>&1; then ok "launch 可构造（干跑）"; else bad "launch 构造失败（import/类型错）"; fi
 if python3 "$W/harness/test_fallback_obs.py" >/dev/null 2>&1; then ok "保底观察点逻辑（合成净空场）"; else bad "保底观察点逻辑异常（卡死那刻会崩）"; fi
 if python3 "$W/harness/test_veto.py" >/dev/null 2>&1; then ok "后置 veto 判据（10 组约束）"; else bad "后置 veto 判据异常（可能误掐目标）"; fi
+if python3 "$W/harness/test_param_types.py" >/dev/null 2>&1; then ok "launch→节点 参数类型一致"; else bad "launch 传参类型与节点 declare 不一致（节点会当场崩）"; fi
 
 if [ "$FAIL" -eq 0 ]; then echo "[smoke] 结果：PASS"; exit 0; else echo "[smoke] 结果：FAIL（$FAIL 项）"; exit 1; fi

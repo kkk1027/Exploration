@@ -386,7 +386,11 @@ class Arbiter(Node):
         #   * 目标落在 map 原点近旁（返航终点）一律不碰；
         #   * 每局限 2 次、30 s 冷却、同一目标 20 s 内不重复 veto；
         #   * 只取消"当前 EXECUTING 的那个 goal_id"，绝不用 cancel-all。
-        self.veto_enabled = str(p('veto_enabled', 'false').value).lower() in ('true','1','yes')
+        # 注意：launch 传 veto:=true 时 ROS 会把它解析成 **bool**，
+        # 若这里用字符串默认值 declare，rclpy 会直接抛
+        # InvalidParameterTypeException 把整个仲裁节点打死（实测第 1 轮即崩）。
+        # 所以默认值用 bool，并同时容忍字符串/数字写法。
+        self.veto_enabled = self._as_bool(p('veto_enabled', False).value)
         self.veto_min_esc = int(p('veto_min_esc_dirs', 3).value)
         self.veto_occ_max = float(p('veto_occ_frac_max', 0.30).value)
         self.veto_self_r = float(p('veto_self_radius_m', 0.60).value)
@@ -864,6 +868,12 @@ class Arbiter(Node):
         return best
 
     # ===== V2-③ 后置 veto ====================================================
+    @staticmethod
+    def _as_bool(v):
+        if isinstance(v, bool):
+            return v
+        return str(v).strip().lower() in ('true', '1', 'yes', 'on')
+
     def _explore_phase(self):
         """现在是不是"探索期"（决定 veto 能不能动）。
 
