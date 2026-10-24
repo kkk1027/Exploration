@@ -87,7 +87,10 @@ def generate_launch_description():
     arbiter = Node(package='stemm_cartographer_exploration_sim', executable='frontier_arbiter',
                    name='frontier_arbiter', output='screen', condition=stack_on,
                    parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time'),
-                                'republish_sec': 1.5, 'max_candidates': 6,
+                                'republish_sec': 1.5,
+                                # 关键旋钮：每 tick 最多校验几个候选。设成 launch 参数后
+                                # 才能做"候选管线是否够宽"的 A/B（此前写死 6）。
+                                'max_candidates': LaunchConfiguration('max_candidates'),
                                 'blacklist_sec': 30.0, 'blacklist_radius': 0.5,
                                 # D0（2026-10-23 发现）：这个参数以前根本没传给仲裁节点，
                                 # 历史约 140 轮日志里 "[v3]" 出现 0 次 —— 一直是 v1 在跑。
@@ -228,6 +231,8 @@ def generate_launch_description():
             description='前向净空预检的走廊净宽下限（m）；抬高可挡掉"看着能过、实际过不去"的口子'),
         DeclareLaunchArgument('candidate_probe_log', default_value='',
             description='候选质量探针 JSONL 路径（空=不记录）'),
+        DeclareLaunchArgument('max_candidates', default_value='6',
+            description='每 tick 校验的候选数上限；越大越不容易"候选全灭"但更吃 CPU'),
         DeclareLaunchArgument('gate', default_value='false',
             description='V1 候选闸门（落点级硬闸门：esc_dirs/comp_r2 拒、occ 软惩罚）'),
         DeclareLaunchArgument('gate_min_esc', default_value='3',
