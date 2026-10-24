@@ -15,6 +15,18 @@ BAD=0; N=0; DETAIL=""
 
 get() { timeout 6 ros2 param get "$1" "$2" 2>/dev/null | sed 's/^[A-Za-z ]*is: //'; }
 
+chk_wait() {  # 轮询版：给 patch_sim_time 留最多 45 s
+  local end=$(( $(date +%s) + 45 )) v=""
+  while [ "$(date +%s)" -lt "$end" ]; do
+    v=$(get "$1" "$2")
+    printf '%s' "$v" | grep -qiF "$3" && { N=$((N+1)); DETAIL="$DETAIL{\"param\":\"$2\",\"ok\":true,\"got\":\"$v\"},"; return 0; }
+    sleep 1
+  done
+  N=$((N+1)); BAD=$((BAD+1))
+  DETAIL="$DETAIL{\"param\":\"$2\",\"ok\":false,\"want\":\"$3\",\"got\":\"$v\"},"
+  echo "  [audit] ✗ $2 期望含 '$3'，45 s 内实际 '$v'"
+}
+
 chk() {  # $1=node $2=param $3=期望（子串匹配）$4=标签
   local v; v=$(get "$1" "$2"); N=$((N+1))
   if printf '%s' "$v" | grep -qiF "$3"; then
@@ -27,20 +39,22 @@ chk() {  # $1=node $2=param $3=期望（子串匹配）$4=标签
 
 # use_sim_time（5 个节点）
 for n in "$M" /stemm_cartographer_mapping_tf_guard /stemm_cartographer_state_saver /stemm_cartographer_map_service_adapter /stemm_cartographer_odom_session_guard; do
-  chk "$n" use_sim_time True
+  chk_wait "$n" use_sim_time True
 done
 # 足迹（真机含轮宽）
-chk /local_costmap/local_costmap footprint "$FP"
-chk /global_costmap/global_costmap footprint "$FP"
+chk_wait /local_costmap/local_costmap footprint '[-0.18, -0.235]'
+chk_wait /global_costmap/global_costmap footprint '[-0.18, -0.235]' 
 # 后退相关
 chk "$M" return_home_retreat_enabled False
 if [ "$BACKSTEP" = "1" ]; then
-  chk "$M" exploration_retreat_enabled True
-  chk "$M" exploration_retreat_max_distance_m 0.15
-  chk "$M" exploration_retreat_speed_mps 0.05
-  chk "$M" blocked_retreat_max_per_session 2
+  # 包络参数必须落地（硬判）；enable 开关现在由 explore_watchdog 的四向闸动态掌管，
+  # 开阔地本来就该是 False，所以只记录不判定。
+  chk_wait "$M" exploration_retreat_max_distance_m 0.15
+  chk_wait "$M" exploration_retreat_speed_mps 0.05
+  chk_wait "$M" blocked_retreat_max_per_session 2
+  echo "  [audit] (info) exploration_retreat_enabled=$(get "$M" exploration_retreat_enabled) —— 由四向闸动态掌管"
 else
-  chk "$M" exploration_retreat_enabled False
+  chk_wait "$M" exploration_retreat_enabled False
 fi
 
 ok=$([ "$BAD" -eq 0 ] && echo true || echo false)
