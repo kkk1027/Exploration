@@ -16,6 +16,10 @@ export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-42}"
 
 MGR=/stemm_cartographer_nav2_manager
 DISABLE_RETREAT="${1:-1}"   # 1=P0（默认）；0=保留车端盲退，做对照基线用
+# 阶段2（用户 2026-10-24 批准）：允许"仅当前向受阻时的 ≤0.15 m 雷达复核受控小步倒车"。
+# 车端 R1b 探索后退本来就是"前向持续 <0.45 m 且后方条带在 /map 上复核过"才动，
+# 所以这里只是把它重新打开并把包络收窄到 0.15 m / 0.05 m/s，不新增任何代码路径。
+EXPLORE_BACKSTEP="${2:-1}"  # 1=启用受控小步倒车（默认，用户已批准）；0=维持 P0 的绝对禁止
 
 set_param() {   # $1=node $2=name $3=value → 成功返回 0
   ros2 param set "$1" "$2" "$3" >/dev/null 2>&1
@@ -35,10 +39,24 @@ retry_until 15 /stemm_cartographer_mapping_tf_guard use_sim_time true
 
 # ---------------- 1) P0：关闭车端盲退 ----------------
 if [ "$DISABLE_RETREAT" = "1" ]; then
-  retry_until 12 "$MGR" exploration_retreat_enabled false
+  if [ "$EXPLORE_BACKSTEP" = "1" ]; then
+    # 阶段2：探索期只允许"受控小步倒车"——包络 0.15 m / 0.05 m/s，每次会话最多 2 步，
+    # 触发条件仍是车端自己的 R1b（前向 blocked_retreat_after_sec 秒内持续 <0.45 m，
+    # 且后方条带在 /map 上先复核过 rear_margin=0.25 m）。返航倒车仍保持关闭。
+    retry_until 12 "$MGR" exploration_retreat_enabled true
+    retry_until 6  "$MGR" exploration_retreat_max_distance_m 0.15
+    retry_until 6  "$MGR" exploration_retreat_speed_mps 0.05
+    retry_until 6  "$MGR" blocked_retreat_max_per_session 2
+    retry_until 6  "$MGR" exploration_retreat_rear_margin_m 0.25
+    retry_until 6  "$MGR" exploration_retreat_max_sec 2.0
+    echo "[patch] 阶段2 探索期受控小步倒车已启用（<=0.15m @0.05m/s，雷达复核后方）"
+  else
+    retry_until 12 "$MGR" exploration_retreat_enabled false
+    retry_until 4  "$MGR" blocked_retreat_max_per_session 0
+    echo "[patch] 探索期倒车保持绝对禁止（EXPLORE_BACKSTEP=0）"
+  fi
   retry_until 4  "$MGR" return_home_retreat_enabled false
   retry_until 4  "$MGR" return_home_failure_retreat_enabled false
-  retry_until 4  "$MGR" blocked_retreat_max_per_session 0
   # 车端 stemm_escape_controller 只会"原地转到底"，仿真侧 escape_supervisor 是它的超集
   # （同样只用雷达、同样绝不后退，但会转向最空旷方向并前进一小段）；两者同跑会抢 /cmd_vel。
   if [ "${DISABLE_CAR_ESCAPE:-1}" = "1" ]; then

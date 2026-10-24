@@ -40,7 +40,9 @@ NEG = ('未走到返航到位', '未返航', '返航未启动', '返航失败', 
        'return-home failed', 'stuck after', 'return_home_failed')
 POS = (r'返航(?:到位|完成)',
        r'return-home completed',
-       r'return-home position reached')
+       r'return-home position reached',
+       # 2026-10-24：manager 的"到点即成功"分支用的是这句，之前没认导致真实成功的轮被判失败
+       r'return-home goal reached')
 pos = []
 for line in txt.splitlines():
     low = line.lower()

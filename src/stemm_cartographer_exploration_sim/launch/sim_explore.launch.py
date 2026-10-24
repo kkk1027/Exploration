@@ -75,7 +75,8 @@ def generate_launch_description():
     patch_sim_time = ExecuteProcess(
         cmd=[os.path.join(get_package_prefix('stemm_cartographer_exploration_sim'),
                           'lib', 'stemm_cartographer_exploration_sim', 'patch_sim_time'),
-             LaunchConfiguration('disable_retreat')],
+             LaunchConfiguration('disable_retreat'),
+             LaunchConfiguration('explore_backstep')],
         output='screen', condition=stack_on)
 
     rviz = Node(package='rviz2', executable='rviz2', name='rviz2', output='screen',
@@ -218,6 +219,9 @@ def generate_launch_description():
             description='脱困前进时前向 ±45° 的最小测距门槛'),
         DeclareLaunchArgument('supervisor_recovery_timeout', default_value='40.0',
             description='累计受阻多少秒后退出脱困（用户要求的 40 s 兜底）'),
+        DeclareLaunchArgument('explore_backstep', default_value='1',
+            description='阶段2：探索期是否允许受控小步倒车（<=0.15 m @0.05 m/s，雷达复核后方；'
+                        '用户 2026-10-24 批准）'),
         DeclareLaunchArgument('watchdog', default_value='true',
             description='是否启用静止看门狗（车端安全闸导致的"在导航但不动"）'),
         DeclareLaunchArgument('watchdog_stall_sec', default_value='5.0',

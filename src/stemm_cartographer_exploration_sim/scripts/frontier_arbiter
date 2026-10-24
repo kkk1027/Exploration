@@ -315,6 +315,9 @@ class Arbiter(Node):
         self.bl_sec = float(p('blacklist_sec', 60.0).value)
         self.bl_r = float(p('blacklist_radius', 0.8).value)
         self.max_cand = int(p('max_candidates', 5).value)
+        # D8：候选 30 s 太陈旧（地图早变了）、池 400 且同片多点重复竞争
+        self.cand_max_age = float(p('candidate_max_age_sec', 15.0).value)
+        self.cand_pool = int(p('cand_pool_size', 800).value)
         self.repub = float(p('republish_sec', 8.0).value)
         self.path_timeout = float(p('path_timeout_sec', 4.0).value)
         self.frame = str(p('frame_id', 'map').value)
@@ -348,7 +351,7 @@ class Arbiter(Node):
         self.contact_zone_penalty = float(p('contact_zone_penalty', 1500.0).value)
         # D7：把"撞过的地方"从软降权升级为**近半径内等效硬拒**（1e5 远高于主项上限 3000），
         # 但仍是罚分而非硬 skip —— 万一所有候选都在禁区，也要能派出最不坏的那个，不许饿死。
-        self.contact_hard_radius = float(p('contact_hard_radius_m', 1.2).value)
+        self.contact_hard_radius = float(p('contact_hard_radius_m', 1.5).value)
         self.contact_hard_penalty = float(p('contact_hard_penalty', 1e5).value)
         # 收益函数 v2（S3+S2）：大块未知优先、碎角降权、已探完区域降权
         self.cfg = {
@@ -380,6 +383,9 @@ class Arbiter(Node):
         self.prefilter_n = int(p('prefilter_n', 12).value)
         # 与 manager 的 80° 转向门对齐（留 5° 余量），避免"派发了但被拒 → 原地转 → 再派发"
         self.turn_limit_deg = float(p('turn_limit_deg', 75.0).value)
+        # D12：全部候选都在机头外时，不再"回退派发最优者"（manager 的 80° 门必拒 → 空转 5~10 s），
+        # 改为本拍不派、让 RRT 重新采样；turn_hard_skip=0 可退回旧行为。
+        self.turn_hard_skip = str(p('turn_hard_skip', 'true').value).lower() in ('true', '1', 'yes')
         # 收益函数 v2 开关：实测在 2026-10-23 的整轮里明显退化（两轮都出现 200+ 次物理接触、
         # 返航失败），按"出现退化先回退"的约定默认关闭；内核与离线测试保留，供后续做同种子 A/B。
         self.scoring = str(p('scoring', 'v1').value).lower()
@@ -404,7 +410,8 @@ class Arbiter(Node):
         self.map = None
         self.pose = None
         self.yaw = 0.0
-        self.cands = []          # [(x,y)]
+        self.cands = []          # [(x, y, ts)]
+        self._cand_cells = {}    # 1 m 网格 → (x, y, ts)：同格只留最新，抑制重复竞争
         self.blacklist = []      # [(x, y, expire_ts)]
         self.last_pub = 0.0
         self.last_goal = None
@@ -832,11 +839,20 @@ class Arbiter(Node):
 
     def on_cands(self, m):
         now = time.monotonic()
+        cells = self._cand_cells
         for pt in m.points:
-            self.cands.append((pt.x, pt.y, now))
+            key = (int(math.floor(pt.x)), int(math.floor(pt.y)))
+            cells[key] = (pt.x, pt.y, now)       # 同格覆盖 ⇒ 只留最新采样
         self.stats['seen'] += len(m.points)
-        if len(self.cands) > 400:            # 只保留最近的候选
-            self.cands = self.cands[-400:]
+        # 过期清理 + 容量限制（按时间保留最新的 cand_pool 个）
+        fresh = [(k, v) for k, v in cells.items() if now - v[2] <= self.cand_max_age]
+        if len(fresh) > self.cand_pool:
+            fresh.sort(key=lambda kv: kv[1][2], reverse=True)
+            fresh = fresh[:self.cand_pool]
+            self._cand_cells = dict(fresh)
+        else:
+            self._cand_cells = dict(fresh)
+        self.cands = list(self._cand_cells.values())
 
     # ---- 工具 ----
     def unknown_cells(self, x, y):
@@ -1021,7 +1037,7 @@ class Arbiter(Node):
             return
         if self.mgr_busy and now - self.last_pub < self.repub:
             return
-        cands = [c for c in self.cands if now - c[2] < 30.0]
+        cands = [c for c in self.cands if now - c[2] < self.cand_max_age]
         if not cands:
             return
         scored = []
@@ -1076,7 +1092,7 @@ class Arbiter(Node):
             return
         if self.mgr_busy and now - self.last_pub < self.repub:
             return
-        cands = [(x, y) for x, y, t in self.cands if now - t < 30.0]
+        cands = [(x, y) for x, y, t in self.cands if now - t < self.cand_max_age]
         if not cands:
             return
         g = self.grid()
@@ -1097,8 +1113,16 @@ class Arbiter(Node):
         if dropped_turn:
             self.stats['turn_dropped'] = self.stats.get('turn_dropped', 0) + dropped_turn
         if not filtered:
-            # 全部在机头之外：不要让探索停摆 —— 派发最优的那个，manager 自己的 80° 门
-            # 会做最终裁决（它会先原地转再发目标，虽然慢但不至于完全卡住）。
+            if self.turn_hard_skip:
+                # D12：本拍不派 —— manager 的 80° 门会先原地转再拒，实测白烧 5~10 s。
+                # 空一拍让 RRT 重新采样（republish 1.5 s 会很快给新候选）。
+                self.stats['turn_skip_all'] = self.stats.get('turn_skip_all', 0) + 1
+                if now - getattr(self, '_last_turn_skip_log', 0.0) > 10.0:
+                    self._last_turn_skip_log = now
+                    self.get_logger().info(
+                        '本拍全部候选都在机头 %.0f° 之外（%d 个）→ 跳过派发，等 RRT 重新采样'
+                        % (self.turn_limit_deg, dropped_turn))
+                return
             self.stats['turn_fallback'] = self.stats.get('turn_fallback', 0) + 1
             self.get_logger().info(
                 f'[v3] 全部候选都在机头 {self.turn_limit_deg:.0f}° 之外（{dropped_turn} 个），'
@@ -1176,7 +1200,7 @@ class Arbiter(Node):
             return
         if self.mgr_busy and now - self.last_pub < self.repub:
             return                      # 目标执行中才限速；空闲时立刻补一个新候选（S2）
-        cands = [(x, y) for x, y, t in self.cands if now - t < 30.0]
+        cands = [(x, y) for x, y, t in self.cands if now - t < self.cand_max_age]
         if not cands:
             return
         g = self.grid()

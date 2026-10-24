@@ -94,6 +94,9 @@ class VisionObstacleGrid(Node):
         # 局部体素层的源必须发在**传感器/车体**帧：nav2 用 cloud 的 frame 原点当"传感器原点"
         # 做射线清除，若发在 map 帧，射线就从地图原点打出去、会把真实障碍擦掉。
         d('live_frame', 'base_footprint')
+        # P1-1：累积障碍膨胀（格）。视觉看到的是物体表面，机器人有半宽；
+        # 膨胀 1 格（5 cm）可覆盖"擦着边过去"的残余接触。
+        d('dilate_cells', 1)
 
         g = self.get_parameter
         self.cloud_topic = g('cloud_topic').value
@@ -113,6 +116,7 @@ class VisionObstacleGrid(Node):
         self.live_voxel = max(0.01, float(g('live_voxel').value))
         self.dump_path = str(g('dump_path').value or '')
         self.live_frame = str(g('live_frame').value or 'base_footprint')
+        self.dilate = max(0, int(g('dilate_cells').value))
 
         self.cells = set()
         self.hits = {}          # 格 → 被观测到的帧数（跨帧持久化）
@@ -267,6 +271,17 @@ class VisionObstacleGrid(Node):
         stamp = self.get_clock().now().to_msg()
         arr = np.fromiter((v for c in self.cells for v in c), dtype=np.int64,
                           count=2 * len(self.cells)).reshape(-1, 2)
+        if self.dilate > 0 and arr.size:
+            # 4/8 邻域膨胀：让"视觉看到的表面"向外长 dilate 格，吃掉擦边接触
+            offs = []
+            for dx in range(-self.dilate, self.dilate + 1):
+                for dy in range(-self.dilate, self.dilate + 1):
+                    if dx or dy:
+                        offs.append((dx, dy))
+            parts = [arr]
+            for dx, dy in offs:
+                parts.append(arr + np.array([[dx, dy]], dtype=np.int64))
+            arr = np.unique(np.vstack(parts), axis=0)
         pts = np.empty((arr.shape[0], 3), dtype=np.float32)
         pts[:, 0] = (arr[:, 0] + 0.5) * self.res
         pts[:, 1] = (arr[:, 1] + 0.5) * self.res
@@ -304,6 +319,17 @@ class VisionObstacleGrid(Node):
             return
         arr = np.fromiter((v for c in self.cells for v in c), dtype=np.int64,
                           count=2 * len(self.cells)).reshape(-1, 2)
+        if self.dilate > 0 and arr.size:
+            # 4/8 邻域膨胀：让"视觉看到的表面"向外长 dilate 格，吃掉擦边接触
+            offs = []
+            for dx in range(-self.dilate, self.dilate + 1):
+                for dy in range(-self.dilate, self.dilate + 1):
+                    if dx or dy:
+                        offs.append((dx, dy))
+            parts = [arr]
+            for dx, dy in offs:
+                parts.append(arr + np.array([[dx, dy]], dtype=np.int64))
+            arr = np.unique(np.vstack(parts), axis=0)
         minx, miny = int(arr[:, 0].min()), int(arr[:, 1].min())
         maxx, maxy = int(arr[:, 0].max()), int(arr[:, 1].max())
         w, h = maxx - minx + 1, maxy - miny + 1
