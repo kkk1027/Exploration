@@ -98,6 +98,10 @@ def generate_launch_description():
                                 'veto_min_esc_dirs': LaunchConfiguration('veto_min_esc'),
                                 'veto_occ_frac_max': LaunchConfiguration('veto_occ_max'),
                                 'veto_max_per_session': LaunchConfiguration('veto_max'),
+                                # V1 闸门（落点级）：与 veto 搭配才覆盖全部派发通道
+                                'gate_enabled': LaunchConfiguration('gate'),
+                                'gate_esc_dirs_min': LaunchConfiguration('gate_min_esc'),
+                                'gate_occ_soft': LaunchConfiguration('gate_occ_soft'),
                                 'probe_log': LaunchConfiguration('candidate_probe_log')}])
 
     # P0-1：撞障取证（只读）。与机器人层同时启动，覆盖整轮（含启动期）。
@@ -218,6 +222,12 @@ def generate_launch_description():
             description='前向净空预检的走廊净宽下限（m）；抬高可挡掉"看着能过、实际过不去"的口子'),
         DeclareLaunchArgument('candidate_probe_log', default_value='',
             description='候选质量探针 JSONL 路径（空=不记录）'),
+        DeclareLaunchArgument('gate', default_value='false',
+            description='V1 候选闸门（落点级硬闸门：esc_dirs/comp_r2 拒、occ 软惩罚）'),
+        DeclareLaunchArgument('gate_min_esc', default_value='3',
+            description='闸门可逃逸方向下限'),
+        DeclareLaunchArgument('gate_occ_soft', default_value='0.30',
+            description='闸门复杂区软惩罚阈值（2 m 内障碍占比）'),
         DeclareLaunchArgument('veto', default_value='false',
             description='V2-③ 后置 veto：对非本节点派发的目标做硬闸门否决（只在探索期，默认关）'),
         DeclareLaunchArgument('veto_min_esc', default_value='3',
