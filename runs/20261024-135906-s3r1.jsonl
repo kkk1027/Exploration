@@ -1,0 +1,5 @@
+{"ts":"2026-10-24T13:59:06+08:00","tag":"s3r1",""check":"pre_launch","nodes":0,"gzserver":0,"residue":"""}
+{"ts":"2026-10-24T13:59:06+08:00","tag":"s3r1",""check":"pose","x":0.0,"y":0.0,"yaw":0.0"}
+{"ts":"2026-10-24T13:59:06+08:00","tag":"s3r1",""check":"variant","disable_retreat":1,"supervisor":"true""}
+{"ts":"2026-10-24T13:59:06+08:00","tag":"s3r1",""check":"vision","enabled":1"}
+{"ts":"2026-10-24T13:59:10+08:00","tag":"s3r1",""check":"launch","pgid":"125239""}
