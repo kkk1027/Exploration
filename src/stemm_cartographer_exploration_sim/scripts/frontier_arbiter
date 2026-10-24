@@ -354,7 +354,10 @@ class Arbiter(Node):
         # 依据 10 轮 85 派发/13 卡死：esc_dirs=0 → 83% 卡死，5-8 → 4%；comp_r2<=100 → 83%。
         # 硬拒仅用 esc_dirs/comp_r2（误杀率 10.6%）；occ 复杂度只重罚不硬拒
         # （实测 esc_dirs=6 / occ=0.31 的安全点若硬拒会被误杀）。
-        self.gate_enabled = str(p('gate_enabled', 'true').value).lower() in ('true', '1', 'yes')
+        # 2026-10-24 V1 实测退化（10 轮 PASS 100%→70%、返航失败 0→3、接触 0→1，而静止 12→12 没改善）
+        # ⇒ 按"退化先回退"默认关闭。原因见 P6 报告：卡死 62% 来自 manager 绕过仲裁，
+        # 只查仲裁候选的闸门对总量无效，反而带来 442 次/轮的拒绝 churn。
+        self.gate_enabled = str(p('gate_enabled', 'false').value).lower() in ('true', '1', 'yes')
         self.gate_esc_min = int(p('gate_esc_dirs_min', 3).value)
         self.gate_comp_min = int(p('gate_comp_min_cells', 500).value)
         self.gate_occ_soft = float(p('gate_occ_soft', 0.30).value)
