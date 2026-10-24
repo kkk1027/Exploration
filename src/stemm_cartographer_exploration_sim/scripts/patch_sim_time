@@ -22,7 +22,9 @@ DISABLE_RETREAT="${1:-1}"   # 1=P0（默认）；0=保留车端盲退，做对�
 EXPLORE_BACKSTEP="${2:-1}"  # 1=启用受控小步倒车（默认，用户已批准）；0=维持 P0 的绝对禁止
 
 set_param() {   # $1=node $2=name $3=value → 成功返回 0
-  ros2 param set "$1" "$2" "$3" >/dev/null 2>&1
+  # 2026-10-24：ros2 param set 偶发**永久阻塞**（daemon/负载），曾把阶段2 第一条之后的
+  # 全部参数卡死（倒车包络没生效且无人知道）。加硬超时保证脚本一定能往下走。
+  timeout 4 ros2 param set "$1" "$2" "$3" >/dev/null 2>&1
 }
 
 retry_until() {   # $1=seconds $2=node $3=param $4=value
