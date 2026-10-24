@@ -699,7 +699,7 @@ class Arbiter(Node):
         step = max(1, int(0.10 / res))
         for ang in [i * math.pi / 4.0 for i in range(8)]:
             ok = True
-            for d in range(step, int(self.probe_escape_clear_m / res) + 1, step):
+            for d in range(step, int(self.probe_escape_r / res) + 1, step):
                 x = ci + int(round(math.cos(ang) * d)); y = cj + int(round(math.sin(ang) * d))
                 if not (0 <= x < w and 0 <= y < h) or dist_m[y, x] < self.probe_narrow_r:
                     ok = False
