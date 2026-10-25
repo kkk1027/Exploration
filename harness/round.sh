@@ -123,7 +123,7 @@ if [ "$(python3 -c "print(1 if float('$GRACE_SEC')>0 else 0)")" = "1" ]; then
   RRT_WAIT="${RRT_WAIT:-4}"
   python3 harness/patch_car_launch.py --apply --grace "$GRACE_SEC" --rrt-wait "$RRT_WAIT" --front-stop "${FRONT_STOP:-0}" 2>&1 | tee -a "$OUT/harness.log"
   say "返航姿态宽限：${GRACE_SEC}s（原厂 6 s；GRACE_SEC=0 可关）｜RRT 等待窗口：${RRT_WAIT:-0}s｜front_stop=${FRONT_STOP:-原厂0.65}"
-  trap 'python3 /home/kbf/stemm_exploration_sim_ws/harness/patch_car_launch.py --restore >/dev/null 2>&1; python3 /home/kbf/stemm_exploration_sim_ws/harness/vision_nav_params.py --restore >/dev/null 2>&1' EXIT INT TERM
+  trap 'python3 /home/kbf/stemm_exploration_sim_ws/harness/patch_car_launch.py --restore >/dev/null 2>&1; python3 /home/kbf/stemm_exploration_sim_ws/harness/patch_nav_speed.py --restore >/dev/null 2>&1; python3 /home/kbf/stemm_exploration_sim_ws/harness/vision_nav_params.py --restore >/dev/null 2>&1' EXIT INT TERM
 fi
 
 say "视觉层 VISION=$VISION"
@@ -131,6 +131,10 @@ rec "\"check\":\"vision\",\"enabled\":$VISION"
 trap 'python3 /home/kbf/stemm_exploration_sim_ws/harness/vision_nav_params.py --restore >/dev/null 2>&1' EXIT INT TERM
 if [ "$VISION" = "1" ]; then
   python3 harness/vision_nav_params.py --apply 2>&1 | tee -a "$OUT/harness.log"
+  # 一次性固定参数决策：速度上限（VX_MAX=0 表示不注入，用车端原值 0.5）
+  if [ -n "${VX_MAX:-}" ] && [ "${VX_MAX}" != "0" ]; then
+    python3 harness/patch_nav_speed.py --apply --vx-max "$(as_float "$VX_MAX")" 2>&1 | tee -a "$OUT/harness.log"
+  fi
   if [ "${PIPESTATUS[0]}" != "0" ]; then
     say "✗ 视觉图层注入失败，放弃本轮（参数文件未被改动）"
     rec '"verdict":"FAIL_vision_params"'
