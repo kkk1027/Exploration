@@ -29,6 +29,9 @@ ANCHOR = "            'return_home_max_retries': 3,\n"
 # 343 行 'rrt_fallback_wait_sec': 0.0），Python 字典字面量重复键是**后者覆盖前者**，
 # 所以新插一个 12.0 会被后面的 0.0 静默覆盖 —— 实测就是"注入成功但完全不生效"。
 # 因此这里改成：把**最后一个**出现的那一行整行替换，原行记进 journal，restore 时放回。
+TFGUARD_ANCHOR = "            'stable_sec': 1.5,\n"
+SENT4_B = "            # ---- sim_patch(tf_guard_use_sim_time) ----\n"
+SENT4_E = "            # ---- sim_patch(end4) ----\n"
 FRONT_KEY = "'front_stop_distance':"
 SENT3_B = "            # ---- sim_patch(front_stop_distance) ----\n"
 SENT3_E = "            # ---- sim_patch(end3) ----\n"
@@ -68,6 +71,11 @@ def main():
     ap.add_argument('--grace', type=float, default=22.0)
     ap.add_argument('--rrt-wait', type=float, default=12.0,
                     help='V2：manager 等仲裁合格候选的窗口秒数（0=不注入）')
+    ap.add_argument('--tf-guard-simtime', type=float, default=1.0,
+                    help='给 mapping_tf_guard 补 use_sim_time（1=补，0=不补）。'
+                         'cax 车端 launch 的这个参数块里没有 use_sim_time，'
+                         '只能靠运行期 ros2 param set 补；那条路在 DDS 变脏时会超时，'
+                         'guard 于是用墙钟比仿真 TF，age≈1.8e9 → 判定不健康 → 整栈放弃')
     ap.add_argument('--front-stop', type=float, default=0.0,
                     help='车端 front_stop_distance（0=不注入；原厂 0.65）。'
                          '它决定"前向多近就判 blocked 并停住"，是静止卡死的主要触发线')
@@ -75,7 +83,7 @@ def main():
     path = target()
     txt = open(path, encoding='utf-8').read()
     injected = SENT_B in txt
-    injected2 = SENT2_B in txt or SENT3_B in txt
+    injected2 = SENT2_B in txt or SENT3_B in txt or SENT4_B in txt
     print(f'[patch_car_launch] 目标: {path}')
     print(f'  当前: 已注入(grace)={injected} 已注入(rrt_wait)={injected2}')
     if a.check or not (a.apply or a.restore):
@@ -107,6 +115,14 @@ def main():
                           + SENT2_E)
                 new = new[:ls] + block2 + new[le:]
                 print(f'  生效行原样（将记入 journal）: {dup_orig.strip()}')
+        if a.tf_guard_simtime > 0 and SENT4_B not in new:
+            if TFGUARD_ANCHOR not in new:
+                print('  ✗ 找不到 mapping_tf_guard 参数块锚点；跳过该项')
+            else:
+                new = new.replace(TFGUARD_ANCHOR,
+                                  TFGUARD_ANCHOR + SENT4_B
+                                  + "            'use_sim_time': True,\n"
+                                  + SENT4_E, 1)
         if a.front_stop > 0 and SENT3_B not in new:
             if FRONT_KEY not in new:
                 print('  ✗ 车端 launch 里没有 front_stop_distance 键；跳过该项')
@@ -159,6 +175,10 @@ def main():
     dup_orig = j.get('dup_orig_line')
     new = txt
     front_orig = j.get('front_orig_line')
+    while SENT4_B in new:
+        i = new.index(SENT4_B)
+        k = new.index(SENT4_E, i) + len(SENT4_E)
+        new = new[:i] + new[k:]
     while SENT3_B in new:
         i = new.index(SENT3_B)
         k = new.index(SENT3_E, i) + len(SENT3_E)
