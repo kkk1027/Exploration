@@ -5,7 +5,7 @@
 set +u
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy ROS_LOCALHOST_ONLY
 source /opt/ros/humble/setup.bash >/dev/null 2>&1
-OUT="${1:-/dev/null}"; BACKSTEP="${2:-1}"
+OUT="${1:-/dev/null}"; BACKSTEP="${2:-1}"; RRTW="${3:-0}"
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-42}"
 M=/stemm_cartographer_nav2_manager
 DUMP=""
@@ -49,10 +49,12 @@ chk() {  # $1=参数名 $2=期望值（子串，忽略大小写/空格）$3=可�
 chk use_sim_time True
 chk footprint '[[-0.18,-0.235]'
 chk return_home_retreat_enabled False
-# V2-① 通道窗口：这两个参数车端在 __init__ 里一次性缓存，只能 launch 级注入；
-# 这里核对"运行期真的读到了 22 / 12"，否则等于没注入（踩过重复键覆盖的坑）。
+# 这两个参数车端在 __init__ 里一次性缓存，只能 launch 级注入；
+# 这里核对"运行期真的读到了期望值"，否则等于没注入（踩过重复键覆盖的坑）。
+# 注意 rrt_fallback_wait_sec 的期望值随实验变（V2-① 默认已回退成 0），
+# 原来写死 12.0 会让每一轮 param_audit 都失败 → 必须从调用方拿。
 chk return_home_orientation_grace_sec 22.0
-chk rrt_fallback_wait_sec 12.0
+chk rrt_fallback_wait_sec "$RRTW"
 if [ "$BACKSTEP" = "1" ]; then
   chk exploration_retreat_max_distance_m 0.15
   chk exploration_retreat_speed_mps 0.05

@@ -172,7 +172,7 @@ else
     # P0-乙：起栈就绪后立刻做参数落地自检（此时 patch_sim_time 已跑完、栈还活着）
     if [ "$AUDIT_DONE" = "0" ] && grep -q "ready_guard_timing" "$OUT/launch.log" 2>/dev/null \
        && grep -q "全部阶段完成" "$OUT/launch.log" 2>/dev/null; then
-      bash harness/param_audit.sh "$OUT/param_audit.json" "$BACKSTEP_EXPECT" 2>&1 | tee -a "$OUT/harness.log"
+      bash harness/param_audit.sh "$OUT/param_audit.json" "$BACKSTEP_EXPECT" "${RRT_WAIT:-0}" 2>&1 | tee -a "$OUT/harness.log"
       if [ "${PIPESTATUS[0]}" = "0" ]; then rec '"check":"param_audit","ok":true'
       else say "✗ 参数自检未全通过 → 本轮 invalid(param_audit)"; rec '"check":"param_audit","ok":false'; fi
       AUDIT_DONE=1
