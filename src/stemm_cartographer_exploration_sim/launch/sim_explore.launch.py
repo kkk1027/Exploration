@@ -112,7 +112,8 @@ def generate_launch_description():
                                 'gate_occ_soft': LaunchConfiguration('gate_occ_soft'),
                                 # 探索末段"停车友好"偏置需要知道本轮总时长
                                 'explore_sec': LaunchConfiguration('explore_sec'),
-                                'probe_log': LaunchConfiguration('candidate_probe_log')}])
+                                'probe_log': LaunchConfiguration('candidate_probe_log'),
+                                'timeline_log': LaunchConfiguration('timeline_log')}])
 
     # P0-1：撞障取证（只读）。与机器人层同时启动，覆盖整轮（含启动期）。
     probe = Node(package='stemm_cartographer_exploration_sim',
@@ -230,6 +231,8 @@ def generate_launch_description():
             description='是否启用雷达引导的旋转+前进脱困（P0）'),
         DeclareLaunchArgument('corridor_width', default_value='1.05',
             description='前向净空预检的走廊净宽下限（m）；抬高可挡掉"看着能过、实际过不去"的口子'),
+        DeclareLaunchArgument('timeline_log', default_value='',
+            description='观测工作流 v2：仲裁器每拍一行时间线 JSONL（空=不写）'),
         DeclareLaunchArgument('candidate_probe_log', default_value='',
             description='候选质量探针 JSONL 路径（空=不记录）'),
         # 2026-10-25 十轮实测：6 → 14 后 manager 自派占比 55% → 41%（仲裁派发 28% → 43%），

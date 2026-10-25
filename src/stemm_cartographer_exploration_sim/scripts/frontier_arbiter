@@ -346,6 +346,12 @@ class Arbiter(Node):
         # 候选质量探针（2026-10-24）：记录每个"实际派发"的候选在**统一障碍图**
         # （激光∪视觉）上的复杂度/可脱困性指标，供离线统计"哪类候选会导致卡死"。
         self.probe_log = str(p('probe_log', '').value)
+        # 观测工作流 v2：每拍一行时间线（1 Hz），供 round_digest 画轨迹图并和
+        # probe / supervisor / launch.log 做秒级交叉核对。
+        self.timeline_log = str(p('timeline_log', '').value)
+        self._tl_fh = None
+        self._tl_n = 0
+        self._tl_last_wall = 0.0
         self.probe_escape_r = float(p('probe_escape_clear_m', 0.60).value)
         self.probe_narrow_r = float(p('probe_narrow_clear_m', 0.35).value)
         self.probe_radius = float(p('probe_radius_m', 2.0).value)
@@ -1191,6 +1197,55 @@ class Arbiter(Node):
         # 把"可脱困性"折算成收益折扣：等价于扣掉 (1-w) 比例的未知收益
         return pen + (1.0 - w) * 400.0
 
+    def write_timeline(self, extra=None):
+        """每拍落一行时间线（若配置了 timeline_log）。"""
+        if not self.timeline_log:
+            return
+        try:
+            now_wall = time.time()
+            if now_wall - self._tl_last_wall < 0.9:      # 限 1 Hz
+                return
+            self._tl_last_wall = now_wall
+            if self._tl_fh is None:
+                os.makedirs(os.path.dirname(self.timeline_log) or '.', exist_ok=True)
+                self._tl_fh = open(self.timeline_log, 'a', encoding='utf-8')
+            sim_t = None
+            try:
+                sim_t = self.get_clock().now().nanoseconds / 1e9
+            except Exception:                            # noqa: BLE001
+                pass
+            row = {
+                't': round(now_wall, 3), 'sim': None if sim_t is None else round(sim_t, 3),
+                'x': None if self.pose is None else round(self.pose[0], 3),
+                'y': None if self.pose is None else round(self.pose[1], 3),
+                'yaw': None if getattr(self, 'yaw', None) is None else round(self.yaw, 3),
+                'cmd': [None if self.cmd is None else round(self.cmd[0], 3),
+                        None if self.cmd is None else round(self.cmd[1], 3)],
+                'busy': bool(getattr(self, 'mgr_busy', False)),
+                'n_cands': len(getattr(self, 'cands', []) or []),
+                'mode': (self._nav_payload or {}).get('mode') if getattr(self, '_nav_payload', None) else None,
+                'nav': (self._nav_payload or {}).get('navigation_state') if getattr(self, '_nav_payload', None) else None,
+                'front': (self._nav_payload or {}).get('front_min_range') if getattr(self, '_nav_payload', None) else None,
+                'last_goal': None if self.last_goal is None else [round(self.last_goal[0], 3), round(self.last_goal[1], 3)],
+                'published': self.stats.get('published', 0),
+                'veto': self.stats.get('veto', 0),
+                'escape_goal': self.stats.get('escape_goal', 0),
+                'fallback_obs': self.stats.get('fallback_obs', 0),
+                'rejected_narrow': self.stats.get('rejected_narrow', 0),
+                'rejected_oneway': self.stats.get('rejected_oneway', 0),
+            }
+            if extra:
+                row.update(extra)
+            self._tl_fh.write(json.dumps(row) + '\n')
+            self._tl_fh.flush()
+            self._tl_n += 1
+        except Exception as exc:                          # noqa: BLE001
+            try:
+                self.get_logger().warn(f'timeline 写入失败（忽略）：{type(exc).__name__}: {exc}')
+                self.timeline_log = ''
+            except Exception:                             # noqa: BLE001
+                pass
+
     def probe_candidate(self, gx, gy, r, min_w, unk):
         """把"本次派发的候选"的完整特征写一行 JSONL（离线统计用）。"""
         if not self.probe_log:
@@ -1594,6 +1649,7 @@ class Arbiter(Node):
 
     def tick(self):
         self._tick_uniq = set()
+        self.write_timeline()
         if self.scoring == 'v3':
             return self._tick_v3()
         if self.scoring == 'v2':
