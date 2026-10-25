@@ -9,6 +9,16 @@ source /opt/ros/humble/setup.bash
 source /home/kbf/stemm_sim_ws/install/setup.bash
 source /home/kbf/stemm_explore_ws/install/setup.bash
 source /home/kbf/stemm_exploration_sim_ws/install/setup.bash
+# ---- 并发保护（2026-10-26）：同一时刻只允许一轮仿真 ----
+# 事故：手动启动的轮次和批次轮次撞在一起（同一 ROS_DOMAIN_ID / 同一个 gzserver），
+# 两边的指标都会变脏。拿不到锁就直接退出，且不改动任何文件。
+LOCK=/tmp/stemm_round.lock
+exec 9>"$LOCK"
+if ! flock -n 9; then
+  echo "✗ 已有另一轮仿真在跑（lock=$LOCK）；本轮放弃，避免数据互相污染" >&2
+  exit 11
+fi
+
 
 TAG="${1:-run}"; HOLD="${3:-0}"
 # 探索秒数必须是 DOUBLE（session_driver 把 explore_sec 声明成 double，传 120 会 InvalidParameterType）
