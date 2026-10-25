@@ -107,10 +107,12 @@ rec "\"check\":\"variant\",\"disable_retreat\":$DISABLE_RETREAT,\"supervisor\":\
 # ---- 方案A：nav2 视觉图层注入（幂等、可回退；teardown 后自动撤销）----
 # ---- P0-1：返航姿态宽限注入（可回退；teardown 撤销）----
 if [ "$(python3 -c "print(1 if float('$GRACE_SEC')>0 else 0)")" = "1" ]; then
-  # V2-① 实测结论（见 docs/P7）：rrt_fallback_wait=12 让 manager 空等 12 s，
-  # 全绿率 90%→80%、返航失败 0→1、控制器硬倒车显著变多 ⇒ 默认回退为 0（不注入）。
-  # 仍保留注入能力（RRT_WAIT=12 可复现实验）。
-  RRT_WAIT="${RRT_WAIT:-0}"
+  # V2-① 的最终形态（2026-10-25，docs/P7 第 27/28 节）：
+  # 12 s 太长（manager 空等、车静止、返航退化），但在 max_candidates=14 + veto 之后
+  # **4 s** 恰好够仲裁在同一拍里多试十几个候选：
+  #   20 轮对照：manager 自派 42%→11%、静止超时 1.45→0.55 次/轮、归因率 22%→9%，
+  #   全绿 19/20=95% 与基线完全相同、返航失败 0。
+  RRT_WAIT="${RRT_WAIT:-4}"
   python3 harness/patch_car_launch.py --apply --grace "$GRACE_SEC" --rrt-wait "$RRT_WAIT" --front-stop "${FRONT_STOP:-0}" 2>&1 | tee -a "$OUT/harness.log"
   say "返航姿态宽限：${GRACE_SEC}s（原厂 6 s；GRACE_SEC=0 可关）｜RRT 等待窗口：${RRT_WAIT:-0}s｜front_stop=${FRONT_STOP:-原厂0.65}"
   trap 'python3 /home/kbf/stemm_exploration_sim_ws/harness/patch_car_launch.py --restore >/dev/null 2>&1; python3 /home/kbf/stemm_exploration_sim_ws/harness/vision_nav_params.py --restore >/dev/null 2>&1' EXIT INT TERM
