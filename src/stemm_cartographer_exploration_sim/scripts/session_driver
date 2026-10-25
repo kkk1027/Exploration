@@ -81,7 +81,12 @@ class SessionDriver(Node):
         # 车端 launch 里 front_stop_distance=0.65、front_emergency_distance=0.45，
         # front_blocked = 连续 5 拍 front_min_range < 0.65 → 于是 0.56/0.57 m 也会被拒
         # （rrt2r4/rrt2r7 的返航失败正是这样）。原来取 0.45 太晚，车已经"贴住"了才想挪。
-        self.standoff_trigger = float(self.declare_parameter('standoff_trigger_m', 0.70).value)
+        # 2026-10-25 实测（sd1 组：阈值 0.70）反而更差：8/10、2 轮返航失败，
+        # 而且两轮都是"返航途中 front 掉到 0.35~0.38 m 被拒"——说明这一档失败
+        # 不是"停在贴障处"（接管点管得到），而是"返航路上才顶住"（接管点管不到）。
+        # 触发太早还会在截止那一刻把车挪 0.6 m，反而给了它一个更差的出发姿态。
+        # ⇒ 回到 0.45（只在真正贴住时才动），并在文档里写清它治不了"返航途中"那一档。
+        self.standoff_trigger = float(self.declare_parameter('standoff_trigger_m', 0.45).value)
         self.standoff_goal = float(self.declare_parameter('standoff_goal_m', 0.60).value)
         self.standoff_timeout = float(
             self.declare_parameter('standoff_timeout_sec', 8.0).value)
