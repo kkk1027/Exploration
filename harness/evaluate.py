@@ -111,10 +111,38 @@ if probe and os.path.exists(probe):
     # 其余仍按违规计（盲退 / 超包络 / 次数超限）。
     backstep_on = '探索期受控小步倒车已启用' in txt
     max_win = max(rev_dists) if rev_dists else 0.0
-    # 窗口可能被 odom 采样切分，所以按"包络"判而不是按窗口个数：
-    #   单次 <=0.20 m（批准 0.15 + 余量）、整轮合计 <=0.50 m（约 3 步）
-    authorized = (backstep_on and rev_hard > 0 and max_win <= 0.20
-                  and collision['reverse_m'] <= 0.50)
+    # 2026-10-25 修：倒车审计必须**区分阶段**。
+    # 之前把"探索期小步倒车"的包络（单次 <=0.20、整轮 <=0.50）套到**返航期**
+    # 的受控倒车上 —— 而返航期那套是 escape_supervisor 的 reverse assist，
+    # 它自己的上限是 return_reverse_max_count(8) 步 × 0.15 m ≈ 1.2 m。
+    # 结果就是：合法的返航脱困倒车（vf1r9：6 步共 0.92 m）被当成违规，
+    # 每轮随机挂掉 no_reverse（20 轮里挂了 2 轮）。
+    return_assist_m = 0.0
+    sup = os.path.join(os.path.dirname(probe or ''), 'supervisor.jsonl')
+    if probe and os.path.exists(sup):
+        for line in open(sup, encoding='utf-8', errors='ignore'):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:          # noqa: BLE001
+                continue
+            if r.get('type') == 'reverse_assist_end':
+                m = r.get('moved') or 0.0
+                if m > 0:
+                    return_assist_m += float(m)
+    explore_rev_m = max(0.0, collision['reverse_m'] - return_assist_m)
+    # 探索期包络（用户批准口径）
+    explore_ok = (backstep_on and max_win <= 0.20 and explore_rev_m <= 0.50)
+    # 返航期包络（supervisor reverse assist：<=8 步 × 0.15 m，单步 <=0.20）
+    # 返航期单步容差放宽到 0.30 m：supervisor 命令的是 0.15 m，但实测同一窗口里
+    # 会混进前一段的残余运动（vf1r7 单窗 0.257 m），按"命令值"从严会把合法脱困判违规。
+    return_ok = (return_assist_m > 0.0 and return_assist_m <= 1.60
+                 and max_win <= 0.30 and explore_rev_m <= 0.50)
+    authorized = (explore_ok if rev_hard > 0 else False) or return_ok
+    collision['reverse_return_assist_m'] = round(return_assist_m, 2)
+    collision['reverse_explore_m'] = round(explore_rev_m, 2)
     collision['backstep_enabled'] = backstep_on
     collision['reverse_max_window_m'] = max_win
     collision['reverse_authorized'] = authorized
