@@ -110,8 +110,12 @@ def load_launch_events(d):
 
 
 # ---------------------------------------------------------------- 卡死事件
-def stuck_events(tl, min_sec=3.0, eps_m=0.05):
-    """连续 min_sec 内位移 < eps_m 的时段算一次卡死；另外标出 cmd 全 0 的时段。"""
+def stuck_events(tl, min_sec=3.0, eps_m=0.05, eps_yaw=0.20):
+    """连续 min_sec 内**既没位移也没转向**的时段算一次卡死。
+
+    只看位移会把"原地自转脱困"误判成卡死（实测 wf1 一轮 9 个事件里有 8 个是自转），
+    所以还要求窗口内累计转角 < eps_yaw(0.20 rad)。
+    """
     ev = []
     if len(tl) < 3:
         return ev
@@ -130,10 +134,20 @@ def stuck_events(tl, min_sec=3.0, eps_m=0.05):
                 break
             j += 1
         dur = (run[j].get('t') or 0) - (run[i].get('t') or 0)
-        if dur >= min_sec:
+        yaws = [run[k].get('yaw') for k in range(i, j + 1) if run[k].get('yaw') is not None]
+        dyaw = 0.0
+        for k in range(1, len(yaws)):
+            d_ = yaws[k] - yaws[k - 1]
+            while d_ > math.pi:
+                d_ -= 2 * math.pi
+            while d_ < -math.pi:
+                d_ += 2 * math.pi
+            dyaw += abs(d_)
+        if dur >= min_sec and dyaw < eps_yaw:
             zeros = all((run[k].get('cmd') or [1, 1])[0] == 0 for k in range(i, j + 1))
             ev.append({'kind': 'no_move', 't0': run[i].get('t'), 't1': run[j].get('t'),
                        'dur': round(dur, 1), 'pos': [run[i]['x'], run[i]['y']],
+                       'dyaw': round(dyaw, 2),
                        'cmd_zero': zeros,
                        'busy': any(run[k].get('busy') for k in range(i, j + 1))})
             i = j + 1
