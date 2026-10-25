@@ -423,6 +423,25 @@ class Arbiter(Node):
         self.tail_min_esc = int(p('tail_park_min_esc_dirs', 5).value)
         self.tail_penalty_value = float(p('tail_park_penalty', 900.0).value)
         self._first_pub_t = None
+        # ===== "可达但不可返回"检查 + 脱困目标（2026-10-25）=====
+        # myrun 事故：车在 (-1.05,3.82) 死角里停了 100 秒 —— 每个前沿候选的路径都要
+        # 过同一个窄口（走廊预检不过），仲裁于是每拍"全部被拒"，一个目标都不派；
+        # manager 自己的采样也过不去，车就一直原地待着，脱困单元也失败。
+        # 两处补齐：
+        #  1) return_check：派发前要求目标附近**有掉头空间**（车对角线 ~0.81 m），
+        #     否则这地方"进得去出不来"；
+        #  2) escape_goal：真的所有前沿都派不出去时，从一个**本地环**里挑
+        #     "净空最大、当前能到"的点先派出去，把车挪出死角，而不是什么都不做。
+        self.return_check = self._as_bool(p('return_check_enabled', True).value)
+        self.return_turn_width = float(p('return_turn_width_m', 0.85).value)
+        self.return_scan_radius = float(p('return_scan_radius_m', 1.20).value)
+        self.escape_goal_enabled = self._as_bool(p('escape_goal_enabled', True).value)
+        self.escape_min_clearance = float(p('escape_min_clearance_m', 0.55).value)
+        self.escape_max_dist = float(p('escape_max_dist_m', 1.60).value)
+        self.escape_cooldown = float(p('escape_cooldown_sec', 8.0).value)
+        self.escape_max_total = int(p('escape_max_total', 20).value)
+        self._esc_last = 0.0
+        self._esc_count = 0
         self.corridor_stride = max(1, int(p('corridor_stride_cells', 2).value))
         self.narrow_penalty_sec = float(p('narrow_blacklist_sec', 45.0).value)
         # 物理接触区（撞过的地方）：强降权 + 长记忆，避免反复撞同一张桌子
@@ -1023,6 +1042,88 @@ class Arbiter(Node):
         except Exception:                       # noqa: BLE001
             return False
 
+    def turn_space_near(self, gx, gy):
+        """目标附近**最大可掉头净空**（= 2×到最近障碍的距离，单位 m）。
+
+        "可达但不可返回"的物理含义：差速车开进一条比自身对角线还窄的通道后，
+        既转不过身、又不允许长距离倒车（我们只批了 0.15 m 小步），于是**出不来**。
+        车体对角线 sqrt(0.47² + 0.66²) ≈ 0.81 m，所以这里要找一个
+        "直径 ≥ return_turn_width" 的空地。
+        """
+        field = self.clearance_field()
+        if field is None:
+            return None
+        dist_m, ox, oy, res, w, h, _unknown = field
+        ci = int((gx - ox) / res); cj = int((gy - oy) / res)
+        if not (0 <= ci < w and 0 <= cj < h):
+            return None
+        k = max(1, int(self.return_scan_radius / res))
+        i0, i1 = max(0, ci - k), min(w, ci + k + 1)
+        j0, j1 = max(0, cj - k), min(h, cj + k + 1)
+        win = dist_m[j0:j1, i0:i1]
+        if not win.size:
+            return None
+        return 2.0 * float(win.max())
+
+    def return_infeasible(self, gx, gy):
+        """返回 (是否"进得去出不来", 掉头空间)。"""
+        if not self.return_check:
+            return False, None
+        turn = self.turn_space_near(gx, gy)
+        if turn is None:
+            return False, None
+        return (turn < self.return_turn_width), turn
+
+    def pick_escape_goal(self):
+        """所有前沿候选都派不出去时，挑一个"先把车挪出去"的本地目标。
+
+        只在**车周围 escape_max_dist 内的自由格**里找，要求：
+          * 当前能到（costmap BFS，与前沿用同一套通行规则，但路径短得多）；
+          * 落点附近掉头空间 >= return_turn_width（挪过去之后能转过身）；
+          * 按"净空大、距离近"打分。
+        宁可不派也不乱派：找不到就返回 None。
+        """
+        if not self.escape_goal_enabled or self.pose is None:
+            return None
+        if self._esc_count >= self.escape_max_total:
+            return None
+        now = time.monotonic()
+        if now - self._esc_last < self.escape_cooldown:
+            return None
+        field = self.clearance_field()
+        if field is None:
+            return None
+        dist_m, ox, oy, res, w, h, _unknown = field
+        best, best_score = None, -1e9
+        r = 0.5
+        while r <= self.escape_max_dist + 1e-6:
+            for k in range(16):
+                ang = 2.0 * math.pi * k / 16.0
+                gx = self.pose[0] + math.cos(ang) * r
+                gy = self.pose[1] + math.sin(ang) * r
+                ci = int((gx - ox) / res); cj = int((gy - oy) / res)
+                if not (0 <= ci < w and 0 <= cj < h):
+                    continue
+                d_here = float(dist_m[cj, ci])
+                if 2.0 * d_here < self.escape_min_clearance:
+                    continue
+                ok, narrow, _min_w, _unk = self.path_and_width(gx, gy)
+                if not ok or narrow is not None:
+                    continue
+                sc = 2.0 * d_here - 0.6 * r
+                if sc > best_score:
+                    best_score, best = sc, (gx, gy, d_here, r)
+            r += 0.25
+        if best is None:
+            return None
+        self._esc_last = now
+        self._esc_count += 1
+        self.stats['escape_goal'] = self.stats.get('escape_goal', 0) + 1
+        self.get_logger().warn(
+            '前沿全部派不出去 → 派脱困目标 (%.2f,%.2f)（净空 %.2f m、距车 %.2f m）；第 %d 次'
+            % (best[0], best[1], best[2], best[3], self._esc_count))
+        return (best[0], best[1])
+
     def candidate_gate(self, gx, gy):
         """候选闸门 V1：返回 (reject_reason 或 None, features 或 None)。
 
@@ -1560,6 +1661,17 @@ class Arbiter(Node):
                     '前向净空预检否决：走廊 < %.2fm @(%.2f,%.2f)，目标 (%.2f,%.2f)'
                     % (self.corridor_width, narrow[0], narrow[1], gx, gy))
                 continue
+            # 可达但不可返回：目标附近没有掉头空间 → 派过去就出不来
+            oneway, turn = self.return_infeasible(gx, gy)
+            if oneway:
+                self.stats['rejected_oneway'] = self.stats.get('rejected_oneway', 0) + 1
+                self._note_uniq('rejected_oneway', gx, gy)
+                self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
+                self.note_refusal(gx, gy)
+                self.get_logger().info(
+                    '可达但不可返回否决：目标 (%.2f,%.2f) 附近掉头空间仅 %.2f m < %.2f m'
+                    % (gx, gy, turn, self.return_turn_width))
+                continue
             self.probe_candidate(gx, gy, None, min_w, u)
             self.publish_goal(gx, gy, None, u)
             return
@@ -1577,6 +1689,12 @@ class Arbiter(Node):
                 '本拍无可派候选 → 派保底观察点 (%.2f,%.2f)（第 %d 次）；统计 %s'
                 % (obs[0], obs[1], self._fb_count, self.stats))
             self.publish_goal(obs[0], obs[1], None, 0)
+            return
+        # 最后一道：前沿全都派不出去（比如车正卡在"进得去出不来"的角落），
+        # 与其什么都不派、让车在那儿待着，不如派一个本地脱困目标把车挪出来。
+        esc = self.pick_escape_goal()
+        if esc is not None:
+            self.publish_goal(esc[0], esc[1], None, 0)
             return
         self.get_logger().warn(f'本轮候选全部被拒：{self.stats}')
 
