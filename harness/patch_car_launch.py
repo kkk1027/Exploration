@@ -117,7 +117,7 @@ def main():
                 dup3 = new[ls:le]
                 ind = dup3[:len(dup3) - len(dup3.lstrip())]
                 new = (new[:ls] + SENT3_B
-                       + f'{ind}front_stop_distance: {a.front_stop},\n'
+                       + f"{ind}'front_stop_distance': {a.front_stop},\n"
                        + SENT3_E + new[le:])
                 print(f'  front_stop 生效行原样: {dup3.strip()}')
         if new == txt:
