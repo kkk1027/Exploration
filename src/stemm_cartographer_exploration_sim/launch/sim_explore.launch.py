@@ -52,7 +52,8 @@ def generate_launch_description():
     robot = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(model, 'launch', '_t_classic.launch.py')),
-        launch_arguments=[('gui', 'false'), ('world', world_cfg),
+        # gazebo 客户端（界面）由 GUI 开关控制：GUI=true 时起 gzclient
+        launch_arguments=[('gui', LaunchConfiguration('gazebo_gui')), ('world', world_cfg),
                           ('use_sim_time', use_sim_time),
                           ('spawn_x', LaunchConfiguration('spawn_x')),
                           ('spawn_y', LaunchConfiguration('spawn_y')),
@@ -216,6 +217,8 @@ def generate_launch_description():
             description='仿真世界（默认 2 ms 步长版）'),
         DeclareLaunchArgument('rviz_config', default_value=default_rviz_cfg,
             description='rviz2 配置：默认仿真包��� sim_vision.rviz（含视觉层显示）'),
+        DeclareLaunchArgument('gazebo_gui', default_value='false',
+            description='是否启动 gazebo 客户端界面（gzclient）'),
         DeclareLaunchArgument('rviz', default_value='true',
             description='是否启动 rviz2（地图/激光/机器人模型可视化）'),
         DeclareLaunchArgument('spawn_x', default_value='0.0'),
