@@ -111,8 +111,8 @@ if [ "$(python3 -c "print(1 if float('$GRACE_SEC')>0 else 0)")" = "1" ]; then
   # 全绿率 90%→80%、返航失败 0→1、控制器硬倒车显著变多 ⇒ 默认回退为 0（不注入）。
   # 仍保留注入能力（RRT_WAIT=12 可复现实验）。
   RRT_WAIT="${RRT_WAIT:-0}"
-  python3 harness/patch_car_launch.py --apply --grace "$GRACE_SEC" --rrt-wait "$RRT_WAIT" 2>&1 | tee -a "$OUT/harness.log"
-  say "返航姿态宽限：${GRACE_SEC}s（原厂 6 s；GRACE_SEC=0 可关）｜RRT 等待窗口：${RRT_WAIT:-0}s"
+  python3 harness/patch_car_launch.py --apply --grace "$GRACE_SEC" --rrt-wait "$RRT_WAIT" --front-stop "${FRONT_STOP:-0}" 2>&1 | tee -a "$OUT/harness.log"
+  say "返航姿态宽限：${GRACE_SEC}s（原厂 6 s；GRACE_SEC=0 可关）｜RRT 等待窗口：${RRT_WAIT:-0}s｜front_stop=${FRONT_STOP:-原厂0.65}"
   trap 'python3 /home/kbf/stemm_exploration_sim_ws/harness/patch_car_launch.py --restore >/dev/null 2>&1; python3 /home/kbf/stemm_exploration_sim_ws/harness/vision_nav_params.py --restore >/dev/null 2>&1' EXIT INT TERM
 fi
 
@@ -183,7 +183,7 @@ else
     # P0-乙：起栈就绪后立刻做参数落地自检（此时 patch_sim_time 已跑完、栈还活着）
     if [ "$AUDIT_DONE" = "0" ] && grep -q "ready_guard_timing" "$OUT/launch.log" 2>/dev/null \
        && grep -q "全部阶段完成" "$OUT/launch.log" 2>/dev/null; then
-      bash harness/param_audit.sh "$OUT/param_audit.json" "$BACKSTEP_EXPECT" "${RRT_WAIT:-0}" 2>&1 | tee -a "$OUT/harness.log"
+      bash harness/param_audit.sh "$OUT/param_audit.json" "$BACKSTEP_EXPECT" "${RRT_WAIT:-0}" "${FRONT_STOP:-0}" 2>&1 | tee -a "$OUT/harness.log"
       if [ "${PIPESTATUS[0]}" = "0" ]; then rec '"check":"param_audit","ok":true'
       else say "✗ 参数自检未全通过 → 本轮 invalid(param_audit)"; rec '"check":"param_audit","ok":false'; fi
       AUDIT_DONE=1

@@ -29,6 +29,9 @@ ANCHOR = "            'return_home_max_retries': 3,\n"
 # 343 行 'rrt_fallback_wait_sec': 0.0），Python 字典字面量重复键是**后者覆盖前者**，
 # 所以新插一个 12.0 会被后面的 0.0 静默覆盖 —— 实测就是"注入成功但完全不生效"。
 # 因此这里改成：把**最后一个**出现的那一行整行替换，原行记进 journal，restore 时放回。
+FRONT_KEY = "'front_stop_distance':"
+SENT3_B = "            # ---- sim_patch(front_stop_distance) ----\n"
+SENT3_E = "            # ---- sim_patch(end3) ----\n"
 RRT_KEY = "'rrt_fallback_wait_sec':"
 SENT2_B = "            # ---- sim_patch(rrt_fallback_wait) ----\n"
 SENT2_E = "            # ---- sim_patch(end2) ----\n"
@@ -65,11 +68,14 @@ def main():
     ap.add_argument('--grace', type=float, default=22.0)
     ap.add_argument('--rrt-wait', type=float, default=12.0,
                     help='V2：manager 等仲裁合格候选的窗口秒数（0=不注入）')
+    ap.add_argument('--front-stop', type=float, default=0.0,
+                    help='车端 front_stop_distance（0=不注入；原厂 0.65）。'
+                         '它决定"前向多近就判 blocked 并停住"，是静止卡死的主要触发线')
     a = ap.parse_args()
     path = target()
     txt = open(path, encoding='utf-8').read()
     injected = SENT_B in txt
-    injected2 = SENT2_B in txt
+    injected2 = SENT2_B in txt or SENT3_B in txt
     print(f'[patch_car_launch] 目标: {path}')
     print(f'  当前: 已注入(grace)={injected} 已注入(rrt_wait)={injected2}')
     if a.check or not (a.apply or a.restore):
@@ -101,6 +107,19 @@ def main():
                           + SENT2_E)
                 new = new[:ls] + block2 + new[le:]
                 print(f'  生效行原样（将记入 journal）: {dup_orig.strip()}')
+        if a.front_stop > 0 and SENT3_B not in new:
+            if FRONT_KEY not in new:
+                print('  ✗ 车端 launch 里没有 front_stop_distance 键；跳过该项')
+            else:
+                i = new.rindex(FRONT_KEY)
+                ls = new.rfind('\n', 0, i) + 1
+                le = new.index('\n', i) + 1
+                dup3 = new[ls:le]
+                ind = dup3[:len(dup3) - len(dup3.lstrip())]
+                new = (new[:ls] + SENT3_B
+                       + f'{ind}front_stop_distance: {a.front_stop},\n'
+                       + SENT3_E + new[le:])
+                print(f'  front_stop 生效行原样: {dup3.strip()}')
         if new == txt:
             print('  已注入，跳过')
             return 0
@@ -119,6 +138,7 @@ def main():
         except Exception:                  # noqa: BLE001
             jold = {}
         j = {'anchor': ANCHOR, 'grace': a.grace, 'rrt_wait': a.rrt_wait,
+             'front_stop': a.front_stop, 'front_orig_line': locals().get('dup3'),
              'dup_orig_line': dup_orig if dup_orig is not None
                               else jold.get('dup_orig_line')}
         json.dump(j, open(journal_path(), 'w', encoding='utf-8'),
@@ -138,6 +158,12 @@ def main():
         j = {}
     dup_orig = j.get('dup_orig_line')
     new = txt
+    front_orig = j.get('front_orig_line')
+    while SENT3_B in new:
+        i = new.index(SENT3_B)
+        k = new.index(SENT3_E, i) + len(SENT3_E)
+        new = new[:i] + (front_orig or '') + new[k:]
+        front_orig = None
     while SENT2_B in new:
         i = new.index(SENT2_B)
         k = new.index(SENT2_E, i) + len(SENT2_E)

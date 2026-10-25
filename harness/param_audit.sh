@@ -5,7 +5,7 @@
 set +u
 unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy ROS_LOCALHOST_ONLY
 source /opt/ros/humble/setup.bash >/dev/null 2>&1
-OUT="${1:-/dev/null}"; BACKSTEP="${2:-1}"; RRTW="${3:-0}"
+OUT="${1:-/dev/null}"; BACKSTEP="${2:-1}"; RRTW="${3:-0}"; FSTOP="${4:-0}"
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-42}"
 M=/stemm_cartographer_nav2_manager
 DUMP=""
@@ -55,6 +55,7 @@ chk return_home_retreat_enabled False
 # 原来写死 12.0 会让每一轮 param_audit 都失败 → 必须从调用方拿。
 chk return_home_orientation_grace_sec 22.0
 chk rrt_fallback_wait_sec "$RRTW"
+if [ "$FSTOP" != "0" ]; then chk front_stop_distance "$FSTOP"; fi
 if [ "$BACKSTEP" = "1" ]; then
   chk exploration_retreat_max_distance_m 0.15
   chk exploration_retreat_speed_mps 0.05
