@@ -16,6 +16,7 @@
 """
 import ast
 import os
+import re
 import sys
 
 WS = '/home/kbf/stemm_exploration_sim_ws'
@@ -163,6 +164,37 @@ def main():
     for name in sorted(argtypes):
         if "LaunchConfiguration('%s')" % name not in text:
             dead.append(name)
+    # 第三类陷阱：浮点参数。launch_ros 把 "10" 解析成 **int**，而节点 declare 的
+    # 默认值是 30.0(float) → rclpy 抛 InvalidParameterTypeException 打死节点。
+    # 实测：VETO_CD=10 直接把仲裁节点打死，前 7 轮全部作废。
+    # 规则：凡是 round.sh 传给 launch 的"浮点型 launch 参数"，实参必须是
+    # 经 as_float 格式化后的 * _F 变量。
+    round_sh = os.path.join(WS, 'harness', 'round.sh')
+    rtxt = open(round_sh, encoding='utf-8').read()
+    float_args = []
+    for n in ast.walk(tree):
+        if isinstance(n, ast.Call) and getattr(n.func, 'id', None) == 'DeclareLaunchArgument' \
+                and n.args and isinstance(n.args[0], ast.Constant):
+            dv = None
+            for kw in n.keywords:
+                if kw.arg == 'default_value' and isinstance(kw.value, ast.Constant):
+                    dv = kw.value.value
+            if dv is not None and infer_type(dv) is float:   # infer_type 返回的是类型对象
+                float_args.append(n.args[0].value)
+    bad_fmt = []
+    for name in float_args:
+        m = re.search(r'\b%s:=\$(\{[A-Z_]+:-[0-9.]+\}|[A-Z_]+)' % re.escape(name), rtxt)
+        if m:
+            arg = m.group(1)
+            var = re.sub(r'^\$\{|}$', '', arg).split(':-')[0]
+            # 已格式化 = 传的是 *_F 变量，或该变量在 round.sh 里用 as_float 赋过值
+            ok = arg.endswith('_F}') or arg.endswith('_F') \
+                or re.search(r'\b%s=\$\(as_float' % re.escape(var), rtxt) is not None
+            if not ok:
+                bad_fmt.append((name, arg))
+    print(f'  （浮点型 launch 参数 {len(float_args)} 个，其中 round.sh 直接传的 {len(bad_fmt)} 个未格式化）')
+    for name, arg in bad_fmt:
+        bad.append(('round.sh', name, f'传了未格式化的 {arg}（可能被解析成 int，节点会崩）', '—'))
     print(f'  （另有 {len(dead)} 个 launch 参数声明了但从未被引用）')
     for name in dead:
         bad.append(('launch', name, '已声明但无人引用（空旋钮）', '—'))

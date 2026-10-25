@@ -13,6 +13,7 @@ source /home/kbf/stemm_exploration_sim_ws/install/setup.bash
 TAG="${1:-run}"; HOLD="${3:-0}"
 # 探索秒数必须是 DOUBLE（session_driver 把 explore_sec 声明成 double，传 120 会 InvalidParameterType）
 EXPLORE=$(python3 -c "print(float('${2:-120.0}'))")
+EXPLORE_F=$(awk -v v="$EXPLORE" 'BEGIN{printf "%.4f", v}')
 BASE=/home/kbf/stemm_exploration_sim_ws
 TS=$(date +%Y%m%d-%H%M%S)
 OUT="$BASE/logs/round_${TS}_${TAG}"; mkdir -p "$OUT"
@@ -79,9 +80,19 @@ T_START=$(date +%s)
 
 # 随机起点（5 个候选，房间原点附近的安全偏移位姿）
 POSES=("0.0 0.0 0.0" "0.4 0.3 1.5708" "-0.3 0.4 3.1416" "0.3 -0.4 -1.5708" "-0.4 -0.3 0.7854")
+# 浮点参数统一格式化成 "x.y"：launch_ros 会把 "10" 解析成 int，
+# 而节点 declare 的默认值是 float → 类型不匹配会让节点当场崩（vx1 就这么废了 7 轮）。
+as_float() { awk -v v="$1" 'BEGIN{printf "%.4f", v}'; }
+VETO_CD_F=$(as_float "${VETO_CD:-30.0}")
+CORRIDOR_W_F=$(as_float "${CORRIDOR_W:-1.05}")
+GATE_OCC_F=$(as_float "${GATE_OCC:-0.30}")
+VETO_OCC_F=$(as_float "${VETO_OCC:-0.30}")
 DEFAULT_WORLD=$(ros2 pkg prefix wheeltec_two_wheel_model 2>/dev/null)/share/wheeltec_two_wheel_model/world/custom_room_2ms.world
 POSE=${POSE_OVERRIDE:-${POSES[$((RANDOM % ${#POSES[@]}))]}}
-set -- $POSE; SX=$1; SY=$2; SYAW=$3
+set -- $POSE
+# 三个 spawn 值必须带小数点：POSE_OVERRIDE="0 0 0" 会被 launch_ros 解析成 int，
+# 而 launch 里它们声明的默认值是 0.0(float) → 类型不匹配会让节点当场崩。
+SX=$(as_float "$1"); SY=$(as_float "$2"); SYAW=$(as_float "$3")
 say "本轮随机起点：x=$SX y=$SY yaw=$SYAW"
 rec "\"check\":\"pose\",\"x\":$SX,\"y\":$SY,\"yaw\":$SYAW"
 
@@ -119,7 +130,7 @@ else
   python3 harness/vision_nav_params.py --restore 2>&1 | tee -a "$OUT/harness.log" || true
 python3 harness/patch_car_launch.py --restore 2>&1 | tee -a "$OUT/harness.log" || true
 fi
-setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE world:=${WORLD:-$DEFAULT_WORLD} spawn_x:=$SX spawn_y:=$SY spawn_yaw:=$SYAW disable_retreat:=$DISABLE_RETREAT escape_supervisor:=$SUPERVISOR car_escape:=$CAR_ESCAPE rviz:=${RVIZ:-false} stack_delay:=${STACK_DELAY:-0.0} scoring:=${SCORING:-v1} veto:=${VETO:-false} veto_max:=${VETO_MAX:-2} veto_cooldown:=${VETO_CD:-30.0} gate:=${GATE:-false} corridor_width:=${CORRIDOR_W:-1.05} max_candidates:=${MAX_CAND:-14} supervisor_rotate_min_range:=${SUP_ROT_MIN:-0.34} supervisor_advance_stop_range:=${SUP_ADV_STOP:-0.34} probe_log:=$OUT/probe.jsonl supervisor_log:=$OUT/supervisor.jsonl vision:=$VISION vision_dump:=$([ "$VISION" = "1" ] && echo "$OUT/vision_grid" || echo '') watchdog_log:=$OUT/watchdog.jsonl nudge_log:=$OUT/nudge.jsonl candidate_probe_log:=$OUT/candidate_probe.jsonl" \
+setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE_F world:=${WORLD:-$DEFAULT_WORLD} spawn_x:=$SX spawn_y:=$SY spawn_yaw:=$SYAW disable_retreat:=$DISABLE_RETREAT escape_supervisor:=$SUPERVISOR car_escape:=$CAR_ESCAPE rviz:=${RVIZ:-false} stack_delay:=$(as_float "${STACK_DELAY:-0.0}") scoring:=${SCORING:-v1} veto:=${VETO:-false} veto_max:=${VETO_MAX:-2} veto_cooldown:=$VETO_CD_F gate:=${GATE:-false} corridor_width:=$CORRIDOR_W_F max_candidates:=${MAX_CAND:-14} supervisor_rotate_min_range:=$(as_float "${SUP_ROT_MIN:-0.34}") supervisor_advance_stop_range:=$(as_float "${SUP_ADV_STOP:-0.34}") probe_log:=$OUT/probe.jsonl supervisor_log:=$OUT/supervisor.jsonl vision:=$VISION vision_dump:=$([ "$VISION" = "1" ] && echo "$OUT/vision_grid" || echo '') watchdog_log:=$OUT/watchdog.jsonl nudge_log:=$OUT/nudge.jsonl candidate_probe_log:=$OUT/candidate_probe.jsonl" \
   > "$OUT/launch.log" 2>&1 < /dev/null &
 sleep 3; PGID=$(cat "$OUT/pgid" 2>/dev/null || echo "")
 say "已启动：PGID=$PGID  日志 $OUT/launch.log"
