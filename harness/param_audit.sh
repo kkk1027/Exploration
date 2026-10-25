@@ -38,7 +38,14 @@ chk() {  # $1=参数名 $2=期望值（子串，忽略大小写/空格）$3=可�
   line=$(printf '%s\n' "$DUMP" | grep -E "^\s*$1:" | head -1)
   v=$(printf '%s' "$line" | sed 's/^[^:]*: *//' | tr -d ' ')
   local want; want=$(printf '%s' "$2" | tr -d ' ')
-  if printf '%s' "$v" | tr -d ' ' | grep -qiF "$want"; then
+  # 数值型优先按数值比（"0.50" 与 "0.5" 必须算相等，否则每轮都误判成没落地）
+  local vv ww numok=0
+  vv=$(printf '%s' "$v" | tr -d ' '); ww=$want
+  if printf '%s' "$vv" | grep -qE '^-?[0-9]+(\.[0-9]+)?$' && \
+     printf '%s' "$ww" | grep -qE '^-?[0-9]+(\.[0-9]+)?$'; then
+    numok=$(awk -v a="$vv" -v b="$ww" 'BEGIN{d=a-b; if(d<0)d=-d; print (d<=1e-6)?1:0}')
+  fi
+  if [ "$numok" = "1" ] || printf '%s' "$vv" | grep -qiF "$ww"; then
     DETAIL="$DETAIL{\"param\":\"$1\",\"ok\":true,\"got\":\"$v\"},"
   else
     BAD=$((BAD+1)); DETAIL="$DETAIL{\"param\":\"$1\",\"ok\":false,\"want\":\"$2\",\"got\":\"$v\"},"
