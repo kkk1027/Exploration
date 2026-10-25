@@ -213,9 +213,10 @@ class CollisionProbe(Node):
         # 之后地面是一块 mesh（名字里没有 ground_plane），于是车轮压地每一帧都算
         # 一次"撞障"——实测单轮 23426 次 wheel_contacts 而 chassis_contacts=0。
         # 这里把常见地面/地毯名也一并过滤掉。
-        FLOOR_HINTS = ('ground_plane', 'floor', 'carpet', 'rug', 'Ground_')
+        # 注意大小写：house world 的楼板链接叫 FloorB_01_001，小写 'floor' 匹配不到
+        FLOOR_HINTS = ('ground_plane', 'floor', 'carpet', 'rug')
         pairs = [st.collision1_name + '|' + st.collision2_name for st in m.states]
-        real = [p for p in pairs if not any(k in p for k in FLOOR_HINTS)]
+        real = [p for p in pairs if not any(k in p.lower() for k in FLOOR_HINTS)]
         if not real:
             self.stats['ground_contacts'] = self.stats.get('ground_contacts', 0) + 1
             return
