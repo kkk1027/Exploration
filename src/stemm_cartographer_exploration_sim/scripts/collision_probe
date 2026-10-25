@@ -208,9 +208,14 @@ class CollisionProbe(Node):
         if not m.states:
             return
         now = time.monotonic()
-        # 车轮始终与地面接触：地面相关的接触必须过滤，只把"碰到墙/家具"算撞障
+        # 车轮始终与地面接触：地面相关的接触必须过滤，只把"碰到墙/家具"算撞障。
+        # 注意：原来只过滤名为 ground_plane 的平面。换成 aws_robomaker_small_house
+        # 之后地面是一块 mesh（名字里没有 ground_plane），于是车轮压地每一帧都算
+        # 一次"撞障"——实测单轮 23426 次 wheel_contacts 而 chassis_contacts=0。
+        # 这里把常见地面/地毯名也一并过滤掉。
+        FLOOR_HINTS = ('ground_plane', 'floor', 'carpet', 'rug', 'Ground_')
         pairs = [st.collision1_name + '|' + st.collision2_name for st in m.states]
-        real = [p for p in pairs if 'ground_plane' not in p]
+        real = [p for p in pairs if not any(k in p for k in FLOOR_HINTS)]
         if not real:
             self.stats['ground_contacts'] = self.stats.get('ground_contacts', 0) + 1
             return
