@@ -100,6 +100,10 @@ def generate_launch_description():
                                 # （声明了 corridor_width，但节点参数里没有映射），
                                 # 所以 CORRIDOR_W=0.85 一直是空操作（实测日志仍打 1.05）。
                                 'corridor_width_m': LaunchConfiguration('corridor_width'),
+                                # 通行保证式判据（与场景无关；A/B 用）
+                                'pass_width_m': LaunchConfiguration('pass_width'),
+                                'narrow_len_max_m': LaunchConfiguration('narrow_len_max'),
+                                'unknown_span_max_m': LaunchConfiguration('unknown_span_max'),
                                 # V2-③ 后置 veto：默认关，实验时 veto:=true
                                 'veto_enabled': LaunchConfiguration('veto'),
                                 'veto_min_esc_dirs': LaunchConfiguration('veto_min_esc'),
@@ -229,6 +233,12 @@ def generate_launch_description():
             description='是否启动车端 stemm_escape_controller（P0 默认 false，由 escape_supervisor 取代）'),
         DeclareLaunchArgument('escape_supervisor', default_value='true',
             description='是否启用雷达引导的旋转+前进脱困（P0）'),
+        DeclareLaunchArgument('pass_width', default_value='0.90',
+            description='通行保证带宽下限（车宽 0.47 + 2×0.215 ≈ 0.90，与场景无关）'),
+        DeclareLaunchArgument('narrow_len_max', default_value='1.00',
+            description='窄段累计长度上限（超过即否决：不允许"勉强能过"）'),
+        DeclareLaunchArgument('unknown_span_max', default_value='0.35',
+            description='连续未知段长度上限（未知按障碍算，只允许短跨度例外）'),
         DeclareLaunchArgument('corridor_width', default_value='1.05',
             description='前向净空预检的走廊净宽下限（m）；抬高可挡掉"看着能过、实际过不去"的口子'),
         DeclareLaunchArgument('timeline_log', default_value='',
