@@ -244,15 +244,19 @@ def generate_launch_description():
             description='闸门可逃逸方向下限'),
         DeclareLaunchArgument('gate_occ_soft', default_value='0.30',
             description='闸门复杂区软惩罚阈值（2 m 内障碍占比）'),
-        DeclareLaunchArgument('veto', default_value='false',
+        # 2026-10-25 20 轮 vs 20 轮 A/B（docs/P7 第 24 节）：
+        #   基线（无 veto）∶静止超时 28（1.40/轮）、归因率 24%
+        #   有 veto（额度 6、冷却 10 s）∶静止超时 19（0.95/轮，−32%）、归因率 11.5%
+        #   两组全绿率同为 19/20 —— 也就是说这是三步里唯一"既降卡死又不退化"的改动。
+        DeclareLaunchArgument('veto', default_value='true',
             description='V2-③ 后置 veto：对非本节点派发的目标做硬闸门否决（只在探索期，默认关）'),
         DeclareLaunchArgument('veto_min_esc', default_value='3',
             description='后置 veto 的可逃逸方向下限（低于该值即否决）'),
         DeclareLaunchArgument('veto_occ_max', default_value='0.30',
             description='后置 veto 的 2 m 内障碍占比上限（达到即否决）'),
-        DeclareLaunchArgument('veto_max', default_value='2',
+        DeclareLaunchArgument('veto_max', default_value='6',
             description='后置 veto 每局最多否决次数'),
-        DeclareLaunchArgument('veto_cooldown', default_value='30.0',
+        DeclareLaunchArgument('veto_cooldown', default_value='10.0',
             description='后置 veto 冷却秒数（两次否决之间的最小间隔）'),
         DeclareLaunchArgument('scoring', default_value='v1',
             description='前沿收益函数版本：v1=未知格数/就近（历史实测口径），v2=邻域未知占比，'

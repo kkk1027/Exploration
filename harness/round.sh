@@ -83,7 +83,7 @@ POSES=("0.0 0.0 0.0" "0.4 0.3 1.5708" "-0.3 0.4 3.1416" "0.3 -0.4 -1.5708" "-0.4
 # 浮点参数统一格式化成 "x.y"：launch_ros 会把 "10" 解析成 int，
 # 而节点 declare 的默认值是 float → 类型不匹配会让节点当场崩（vx1 就这么废了 7 轮）。
 as_float() { awk -v v="$1" 'BEGIN{printf "%.4f", v}'; }
-VETO_CD_F=$(as_float "${VETO_CD:-30.0}")
+VETO_CD_F=$(as_float "${VETO_CD:-10.0}")
 CORRIDOR_W_F=$(as_float "${CORRIDOR_W:-1.05}")
 GATE_OCC_F=$(as_float "${GATE_OCC:-0.30}")
 VETO_OCC_F=$(as_float "${VETO_OCC:-0.30}")
@@ -130,7 +130,7 @@ else
   python3 harness/vision_nav_params.py --restore 2>&1 | tee -a "$OUT/harness.log" || true
 python3 harness/patch_car_launch.py --restore 2>&1 | tee -a "$OUT/harness.log" || true
 fi
-setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE_F world:=${WORLD:-$DEFAULT_WORLD} spawn_x:=$SX spawn_y:=$SY spawn_yaw:=$SYAW disable_retreat:=$DISABLE_RETREAT escape_supervisor:=$SUPERVISOR car_escape:=$CAR_ESCAPE rviz:=${RVIZ:-false} stack_delay:=$(as_float "${STACK_DELAY:-0.0}") scoring:=${SCORING:-v1} veto:=${VETO:-false} veto_max:=${VETO_MAX:-2} veto_cooldown:=$VETO_CD_F gate:=${GATE:-false} corridor_width:=$CORRIDOR_W_F max_candidates:=${MAX_CAND:-14} supervisor_rotate_min_range:=$(as_float "${SUP_ROT_MIN:-0.34}") supervisor_advance_stop_range:=$(as_float "${SUP_ADV_STOP:-0.34}") probe_log:=$OUT/probe.jsonl supervisor_log:=$OUT/supervisor.jsonl vision:=$VISION vision_dump:=$([ "$VISION" = "1" ] && echo "$OUT/vision_grid" || echo '') watchdog_log:=$OUT/watchdog.jsonl nudge_log:=$OUT/nudge.jsonl candidate_probe_log:=$OUT/candidate_probe.jsonl" \
+setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE_F world:=${WORLD:-$DEFAULT_WORLD} spawn_x:=$SX spawn_y:=$SY spawn_yaw:=$SYAW disable_retreat:=$DISABLE_RETREAT escape_supervisor:=$SUPERVISOR car_escape:=$CAR_ESCAPE rviz:=${RVIZ:-false} stack_delay:=$(as_float "${STACK_DELAY:-0.0}") scoring:=${SCORING:-v1} veto:=${VETO:-true} veto_max:=${VETO_MAX:-6} veto_cooldown:=$VETO_CD_F gate:=${GATE:-false} corridor_width:=$CORRIDOR_W_F max_candidates:=${MAX_CAND:-14} supervisor_rotate_min_range:=$(as_float "${SUP_ROT_MIN:-0.34}") supervisor_advance_stop_range:=$(as_float "${SUP_ADV_STOP:-0.34}") probe_log:=$OUT/probe.jsonl supervisor_log:=$OUT/supervisor.jsonl vision:=$VISION vision_dump:=$([ "$VISION" = "1" ] && echo "$OUT/vision_grid" || echo '') watchdog_log:=$OUT/watchdog.jsonl nudge_log:=$OUT/nudge.jsonl candidate_probe_log:=$OUT/candidate_probe.jsonl" \
   > "$OUT/launch.log" 2>&1 < /dev/null &
 sleep 3; PGID=$(cat "$OUT/pgid" 2>/dev/null || echo "")
 say "已启动：PGID=$PGID  日志 $OUT/launch.log"
