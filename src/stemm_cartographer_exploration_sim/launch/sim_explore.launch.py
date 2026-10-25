@@ -105,6 +105,7 @@ def generate_launch_description():
                                 'veto_min_esc_dirs': LaunchConfiguration('veto_min_esc'),
                                 'veto_occ_frac_max': LaunchConfiguration('veto_occ_max'),
                                 'veto_max_per_session': LaunchConfiguration('veto_max'),
+                                'veto_cooldown_sec': LaunchConfiguration('veto_cooldown'),
                                 # V1 闸门（落点级）：与 veto 搭配才覆盖全部派发通道
                                 'gate_enabled': LaunchConfiguration('gate'),
                                 'gate_esc_dirs_min': LaunchConfiguration('gate_min_esc'),
@@ -251,6 +252,8 @@ def generate_launch_description():
             description='后置 veto 的 2 m 内障碍占比上限（达到即否决）'),
         DeclareLaunchArgument('veto_max', default_value='2',
             description='后置 veto 每局最多否决次数'),
+        DeclareLaunchArgument('veto_cooldown', default_value='30.0',
+            description='后置 veto 冷却秒数（两次否决之间的最小间隔）'),
         DeclareLaunchArgument('scoring', default_value='v1',
             description='前沿收益函数版本：v1=未知格数/就近（历史实测口径），v2=邻域未知占比，'
                         'v3=朝前未知+贴已知边界（此前从未真正生效，需单独 A/B）'),
