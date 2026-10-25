@@ -110,7 +110,7 @@ def load_launch_events(d):
 
 
 # ---------------------------------------------------------------- 卡死事件
-def stuck_events(tl, min_sec=3.0, eps_m=0.05, eps_yaw=0.20):
+def stuck_events(tl, min_sec=3.0, eps_m=0.05, eps_yaw=0.20, t_lo=None, t_hi=None):
     """连续 min_sec 内**既没位移也没转向**的时段算一次卡死。
 
     只看位移会把"原地自转脱困"误判成卡死（实测 wf1 一轮 9 个事件里有 8 个是自转），
@@ -122,6 +122,13 @@ def stuck_events(tl, min_sec=3.0, eps_m=0.05, eps_yaw=0.20):
     run = []
     for r in tl:
         if r.get('x') is None or r.get('y') is None:
+            continue
+        t = r.get('t') or 0
+        # 只看"探索已开始、还没开始返航"的区间：起栈预热期车本来就不动，
+        # 把它算进卡死会让指标失去意义（p0ar2 的第一个事件就是 21 s 预热）
+        if t_lo is not None and t < t_lo:
+            continue
+        if t_hi is not None and t > t_hi:
             continue
         run.append(r)
     # 位移判据
@@ -145,10 +152,11 @@ def stuck_events(tl, min_sec=3.0, eps_m=0.05, eps_yaw=0.20):
             dyaw += abs(d_)
         if dur >= min_sec and dyaw < eps_yaw:
             zeros = all((run[k].get('cmd') or [1, 1])[0] == 0 for k in range(i, j + 1))
+            # 想动却动不了（cmd 非 0 但没位移）= 真正"卡住"；cmd 全 0 = 在等/在发呆
             ev.append({'kind': 'no_move', 't0': run[i].get('t'), 't1': run[j].get('t'),
                        'dur': round(dur, 1), 'pos': [run[i]['x'], run[i]['y']],
                        'dyaw': round(dyaw, 2),
-                       'cmd_zero': zeros,
+                       'cmd_zero': zeros, 'wedged': (not zeros),
                        'busy': any(run[k].get('busy') for k in range(i, j + 1))})
             i = j + 1
         else:
@@ -273,7 +281,11 @@ def main():
         degraded = bool(tl)
         tl.sort(key=lambda r: r.get('t') or 0)
     coll = ev.get('collision') or {}
-    stuck = stuck_events(tl)
+    disp_ts = [e['t'] for e in lev if e['kind'] == 'dispatch']
+    ret_ts = [e['t'] for e in lev if e['kind'] == 'return_start']
+    t_lo = min(disp_ts) if disp_ts else None
+    t_hi = min([t for t in ret_ts if t_lo is None or t > t_lo], default=None)
+    stuck = stuck_events(tl, t_lo=t_lo, t_hi=t_hi)
     probe_events = []
     for r in probe:
         k = r.get('type')
@@ -324,21 +336,24 @@ def main():
     lines.append(f'- 物理接触: {coll.get("physical_contacts")}　'
                  f'倒车: {coll.get("reverse_m")} m（探索段 {coll.get("reverse_explore_m")} / '
                  f'返航受控 {coll.get("reverse_return_assist_m")}）')
-    lines.append(f'- 卡死事件（无位移≥3 s）: **{len(stuck)}**　'
-                 f'其中 cmd 全 0: {sum(1 for s in stuck if s.get("cmd_zero"))}')
+    n_wedged = sum(1 for s in stuck if s.get('wedged'))
+    lines.append(f'- 卡死事件（探索区间内无位移≥3 s）: **{len(stuck)}**　'
+                 f'其中"想动却动不了(cmd非0)": **{n_wedged}**　'
+                 f'最长 {max([s["dur"] for s in stuck], default=0):.0f} s')
     lines.append(f'- 派发来源: ' + '　'.join(
         f'{k}={v}({100*v//total_src}%)' for k, v in src.most_common()) if src else '- 派发: 无记录')
     lines.append('')
     lines += ['## 1. 分级验收（逐级加严）', '',
               '| 级别 | 判据 | 本轮 | 通过 |', '| --- | --- | --- | --- |']
     s0 = (coll.get('physical_contacts') or 0) == 0
-    s1 = len(stuck) == 0
+    s1 = sum(1 for x in stuck if x.get('wedged')) == 0
     esc_goals = sum(1 for e in lev if e['kind'] == 'escape_goal')
     wd_stalls = sum(1 for e in lev if e['kind'] == 'watchdog_stall')
     s2 = wd_stalls == 0
     s3 = bool(checks.get('return_home'))
     lines += [f'| S0 | 零物理接触 | {coll.get("physical_contacts")} | {"✅" if s0 else "❌"} |',
-              f'| S1 | 零卡死事件（无位移≥3 s） | {len(stuck)} | {"✅" if s1 else "❌"} |',
+              f'| S1 | 零"卡住"事件（cmd 非 0 但无位移 ≥3 s） | '
+              f'{sum(1 for x in stuck if x.get("wedged"))} | {"✅" if s1 else "❌"} |',
               f'| S2 | 零看门狗静止超时 | {wd_stalls} | {"✅" if s2 else "❌"} |',
               f'| S3 | 返航完成（仅记录，不阻塞） | {checks.get("return_home")} | '
               f'{"✅" if s3 else "❌"} |']
@@ -347,10 +362,12 @@ def main():
                   f'probe.jsonl / launch.log）', '']
     lines += ['## 2. 卡死事件清单', '']
     if stuck:
-        lines += ['| # | 起(s) | 止(s) | 时长(s) | 位置 | cmd全0 | 有活跃目标 |', '| --- | --- | --- | --- | --- | --- | --- |']
+        lines += ['| # | 起(s) | 止(s) | 时长(s) | 位置 | 类型 | 有活跃目标 |',
+                  '| --- | --- | --- | --- | --- | --- | --- |']
         for i, s in enumerate(stuck, 1):
+            typ = '卡住(cmd非0)' if s.get('wedged') else '空等(cmd=0)'
             lines.append(f'| {i} | {s["t0"]:.0f} | {s["t1"]:.0f} | {s["dur"]:.0f} | '
-                         f'({s["pos"][0]:.2f},{s["pos"][1]:.2f}) | {"是" if s["cmd_zero"] else "否"} | '
+                         f'({s["pos"][0]:.2f},{s["pos"][1]:.2f}) | {typ} | '
                          f'{"是" if s["busy"] else "否"} |')
     else:
         lines.append('- 无')
