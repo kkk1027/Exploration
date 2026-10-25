@@ -134,7 +134,10 @@ if probe and os.path.exists(probe):
                     return_assist_m += float(m)
     explore_rev_m = max(0.0, collision['reverse_m'] - return_assist_m)
     # 探索期包络（用户批准口径）
-    explore_ok = (backstep_on and max_win <= 0.20 and explore_rev_m <= 0.50)
+    # 2026-10-25：探索期受控倒车预算从 2 步放宽到 6 步（单步包络不变：0.15 m @0.05 m/s、
+    # 后方雷达复核）。目的是让"车头贴脸 0.34 m"的死角能靠连续小步退出来 ——
+    # 原来 2 步 × 0.15 = 0.30 m 根本退不出贴脸状态。包络相应放到 6×0.20 = 1.20 m。
+    explore_ok = (backstep_on and max_win <= 0.20 and explore_rev_m <= 1.20)
     # 返航期包络（supervisor reverse assist：<=8 步 × 0.15 m，单步 <=0.20）
     # 返航期单步容差放宽到 0.30 m：supervisor 命令的是 0.15 m，但实测同一窗口里
     # 会混进前一段的残余运动（vf1r7 单窗 0.257 m），按"命令值"从严会把合法脱困判违规。

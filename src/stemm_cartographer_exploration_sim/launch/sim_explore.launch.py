@@ -76,7 +76,9 @@ def generate_launch_description():
         cmd=[os.path.join(get_package_prefix('stemm_cartographer_exploration_sim'),
                           'lib', 'stemm_cartographer_exploration_sim', 'patch_sim_time'),
              LaunchConfiguration('disable_retreat'),
-             LaunchConfiguration('explore_backstep')],
+             LaunchConfiguration('explore_backstep'),
+             LaunchConfiguration('retreat_max'),
+             LaunchConfiguration('retreat_interval')],
         output='screen', condition=stack_on)
 
     rviz = Node(package='rviz2', executable='rviz2', name='rviz2', output='screen',
@@ -233,6 +235,10 @@ def generate_launch_description():
             description='是否启动车端 stemm_escape_controller（P0 默认 false，由 escape_supervisor 取代）'),
         DeclareLaunchArgument('escape_supervisor', default_value='true',
             description='是否启用雷达引导的旋转+前进脱困（P0）'),
+        DeclareLaunchArgument('retreat_max', default_value='6',
+            description='探索期受控倒车每局步数上限（原 2 步对 0.34 m 贴脸不够用）'),
+        DeclareLaunchArgument('retreat_interval', default_value='4.0',
+            description='探索期受控倒车最小间隔秒数（原 8 s 太慢）'),
         DeclareLaunchArgument('pass_width', default_value='0.90',
             description='通行保证带宽下限（车宽 0.47 + 2×0.215 ≈ 0.90，与场景无关）'),
         DeclareLaunchArgument('narrow_len_max', default_value='1.00',

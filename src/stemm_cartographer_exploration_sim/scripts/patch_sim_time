@@ -20,6 +20,11 @@ DISABLE_RETREAT="${1:-1}"   # 1=P0（默认）；0=保留车端盲退，做对�
 # 车端 R1b 探索后退本来就是"前向持续 <0.45 m 且后方条带在 /map 上复核过"才动，
 # 所以这里只是把它重新打开并把包络收窄到 0.15 m / 0.05 m/s，不新增任何代码路径。
 EXPLORE_BACKSTEP="${2:-1}"  # 1=启用受控小步倒车（默认，用户已批准）；0=维持 P0 的绝对禁止
+# 2026-10-25 P0：单次 0.15 m、每次会话 2 步、间隔 8 s 的预算，对"车头贴脸 0.34 m"的
+# 死角不够用（实测卡 3~13 s、外加等下一个目标）。放宽到 6 步 / 4 s 间隔，
+# 单步包络（0.15 m @0.05 m/s、后方雷达复核）不变。
+RETREAT_MAX="${3:-6}"
+RETREAT_IVL="${4:-4.0}"
 
 set_param() {   # $1=node $2=name $3=value → 成功返回 0
   # 2026-10-24：ros2 param set 偶发**永久阻塞**（daemon/负载），曾把阶段2 第一条之后的
@@ -48,10 +53,11 @@ if [ "$DISABLE_RETREAT" = "1" ]; then
     retry_until 12 "$MGR" exploration_retreat_enabled true
     retry_until 6  "$MGR" exploration_retreat_max_distance_m 0.15
     retry_until 6  "$MGR" exploration_retreat_speed_mps 0.05
-    retry_until 6  "$MGR" blocked_retreat_max_per_session 2
+    retry_until 6  "$MGR" blocked_retreat_max_per_session "$RETREAT_MAX"
+    retry_until 6  "$MGR" blocked_retreat_min_interval_sec "$RETREAT_IVL"
     retry_until 6  "$MGR" exploration_retreat_rear_margin_m 0.25
     retry_until 6  "$MGR" exploration_retreat_max_sec 2.0
-    echo "[patch] 阶段2 探索期受控小步倒车已启用（<=0.15m @0.05m/s，雷达复核后方）"
+    echo "[patch] 阶段2 探索期受控小步倒车已启用（<=0.15m @0.05m/s，雷达复核后方；每局 $RETREAT_MAX 步 / 间隔 ${RETREAT_IVL}s）"
   else
     retry_until 12 "$MGR" exploration_retreat_enabled false
     retry_until 4  "$MGR" blocked_retreat_max_per_session 0
