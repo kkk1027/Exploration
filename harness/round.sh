@@ -79,7 +79,9 @@ rm -f /home/kbf/stemm_sim_ws/maps/explore_latest.pgm /home/kbf/stemm_sim_ws/maps
 T_START=$(date +%s)
 
 # 随机起点（5 个候选，房间原点附近的安全偏移位姿）
-POSES=("0.0 0.0 0.0" "0.4 0.3 1.5708" "-0.3 0.4 3.1416" "0.3 -0.4 -1.5708" "-0.4 -0.3 0.7854")
+# 出生点：house world 里"略靠墙"的点（离最近墙面 0.40 m、周围 1 m 自由率 0.67、
+# 四个方向里 3 个能直行 1.2 m 以上）。原房间的坐标在这里是"屋子外面"，所以换掉。
+POSES=("1.00 5.10 -1.5708" "0.80 5.10 -1.5708" "1.20 5.10 -1.5708" "1.00 5.05 -1.5708" "0.90 5.15 -1.5708")
 # 浮点参数统一格式化成 "x.y"：launch_ros 会把 "10" 解析成 int，
 # 而节点 declare 的默认值是 float → 类型不匹配会让节点当场崩（vx1 就这么废了 7 轮）。
 as_float() { awk -v v="$1" 'BEGIN{printf "%.4f", v}'; }
@@ -87,7 +89,9 @@ VETO_CD_F=$(as_float "${VETO_CD:-10.0}")
 CORRIDOR_W_F=$(as_float "${CORRIDOR_W:-1.05}")
 GATE_OCC_F=$(as_float "${GATE_OCC:-0.30}")
 VETO_OCC_F=$(as_float "${VETO_OCC:-0.30}")
-DEFAULT_WORLD=$(ros2 pkg prefix wheeltec_two_wheel_model 2>/dev/null)/share/wheeltec_two_wheel_model/world/custom_room_2ms.world
+# 默认世界：aws_robomaker_small_house（2026-10-25 起替代原开阔房间）
+# 要回到原房间：WORLD=<...>/custom_room_2ms.world bash harness/round.sh ...
+DEFAULT_WORLD=$(ros2 pkg prefix wheeltec_two_wheel_model 2>/dev/null)/share/wheeltec_two_wheel_model/world/aws_small_house.world
 POSE=${POSE_OVERRIDE:-${POSES[$((RANDOM % ${#POSES[@]}))]}}
 set -- $POSE
 # 三个 spawn 值必须带小数点：POSE_OVERRIDE="0 0 0" 会被 launch_ros 解析成 int，
