@@ -330,7 +330,18 @@ class Arbiter(Node):
         # 机器人在此判据下会钻进去，而它们 0.56 m 见方的贴地底座实际只有 0.36 m 净距
         # （雷达 0.225 m 高度看不见）→ f2 轮 690 次轮子接触全在这里。抬高净宽下限后这类
         # "看着能过、实际过不去"的口子会被前向净空预检直接否掉。
-        self.corridor_width = float(p('corridor_width_m', 1.05).value)
+        # ===== 通行保证式判据（2026-10-25 P0，替代"走廊阈值随场景调"的做法）=====
+        # 判据只由车体尺寸 + 误差决定，不允许按房间/世界切换：
+        #   要求整条路径上"垂直自由带宽" >= 车宽 + 2×安全余量
+        #   = 0.47 + 2×0.215 ≈ 0.90 m（车宽取运行时补丁后的 0.47 m）
+        # 另加两条硬约束（这次 P0 的核心：不再允许"勉强能过"）：
+        #   * 窄段（带宽 < pass_width）累计长度 > narrow_len_max → 否决；
+        #   * 连续未知段 > unknown_span_max → 否决（未知一律按障碍算，只允许短跨度例外）。
+        self.pass_width = float(p('pass_width_m', 0.90).value)
+        self.narrow_len_max = float(p('narrow_len_max_m', 1.00).value)
+        self.unknown_span_max = float(p('unknown_span_max_m', 0.35).value)
+        # 兼容旧参数：corridor_width 不再按世界给默认值，统一取 pass_width
+        self.corridor_width = float(p('corridor_width_m', self.pass_width).value)
         # 硬下限：低于这个净宽一律不派（车宽 0.40 + 车端前向安全闸 0.45 的几何下界 0.90，
         # 取 0.92 留 2 cm 余地）；未知占比过高说明"这块还没探"，同样不派。
         self.corridor_hard = float(p('corridor_hard_m', 0.92).value)
@@ -1371,28 +1382,49 @@ class Arbiter(Node):
         # ---- D1/D2/D3：优先用"到最近障碍的距离场"（含视觉障碍，且整条路径到末端都查）----
         field = self.clearance_field() if self.clearance_mode == 'distance' else None
         if field is not None:
-            step = max(1, self.corridor_stride)
-            idxs = list(range(0, len(path), step))
-            tail = int(self.corridor_tail_dense / res)
-            if tail > 0 and len(path) > 1:
-                idxs = sorted(set(idxs) | set(range(max(0, len(path) - tail), len(path))))
-                if idxs[-1] != len(path) - 1:
-                    idxs.append(len(path) - 1)      # 目标格本身必须查（D1）
+            # 逐格扫描（不再 stride 跳点：跳点会漏掉只有一两格宽的"勉强能过"的坎）
+            idxs = list(range(len(path)))
+            if len(idxs) > 4000:               # 极端长路径上限保护
+                idxs = idxs[:2000] + idxs[-2000:]
             min_w = float('inf')
             min_unk = 0.0
             min_at = None
+            narrow_len = 0.0
+            narrow_len_max_run = 0.0
+            unknown_run = 0.0
+            unknown_run_max = 0.0
+            step_m = res
             for i in idxs:
                 idx = path[i]
                 cx_, cy_ = idx % w, idx // w
                 wxp_ = cx_ * res + ox
                 wyp_ = cy_ * res + oy
                 d, unk_ = self.clearance_at(field, wxp_, wyp_)
-                width_ = 2.0 * d                    # 净宽 ≈ 2×到最近障碍的距离
+                width_ = 2.0 * d                    # 自由带宽 ≈ 2×到最近障碍的距离
                 if width_ < min_w:
                     min_w, min_unk, min_at = width_, unk_, (wxp_, wyp_)
+                if width_ < self.pass_width:
+                    narrow_len += step_m
+                    narrow_len_max_run = max(narrow_len_max_run, narrow_len)
+                else:
+                    narrow_len = 0.0
+                # 未知占比高 = 这一段其实"没看清"，按障碍算；只允许短跨度
+                if unk_ > 0.5:
+                    unknown_run += step_m
+                    unknown_run_max = max(unknown_run_max, unknown_run)
+                else:
+                    unknown_run = 0.0
+            self.stats['pass_narrow_len_max'] = round(
+                max(self.stats.get('pass_narrow_len_max', 0.0), narrow_len_max_run), 2)
+            self.stats['pass_unknown_max'] = round(
+                max(self.stats.get('pass_unknown_max', 0.0), unknown_run_max), 2)
             if min_at is None:
                 return True, None, None, 0.0
-            if min_w < self.corridor_width:
+            if narrow_len_max_run > self.narrow_len_max:
+                return True, min_at, min_w, min_unk      # 窄段太长 → 否决
+            if unknown_run_max > self.unknown_span_max:
+                return True, min_at, min_w, min_unk      # 未知段太长 → 否决
+            if min_w < self.pass_width:
                 return True, min_at, min_w, min_unk
             return True, None, min_w, min_unk
 

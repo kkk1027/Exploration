@@ -198,6 +198,17 @@ def main():
     print(f'  （另有 {len(dead)} 个 launch 参数声明了但从未被引用）')
     for name in dead:
         bad.append(('launch', name, '已声明但无人引用（空旋钮）', '—'))
+    # 第四类：导航参数**不允许按场景/世界切换**（2026-10-25 用户要求）
+    rtxt2 = open(os.path.join(WS, 'harness', 'round.sh'), encoding='utf-8').read()
+    scoped = []
+    for name in ('CORRIDOR_W', 'pass_width', 'MAX_VEL', 'SPEED'):
+        if re.search(r'case\s+.*(WORLD|world).*\n(?:.*\n){0,12}.*%s=' % name, rtxt2):
+            scoped.append(name)
+    if re.search(r'\)\s*CORRIDOR_W=0\.85', rtxt2) or re.search(r'\*house\*\)\s*CORRIDOR_W', rtxt2):
+        scoped.append('CORRIDOR_W(世界分支)')
+    for name in scoped:
+        bad.append(('round.sh', name, '导航参数按世界分支取值（应当与场景无关）', '—'))
+    print(f'  （导航参数按世界切换的项：{len(scoped)}）')
     print(f'launch 传参 -> 节点 declare 类型一致性：检查 {checked} 处')
     for node, pname, want, got in bad:
         print(f'  ✗ {node}.{pname}: launch 会传 {want}，节点 declare 的是 {got}')

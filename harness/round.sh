@@ -88,15 +88,10 @@ POSES=("1.00 5.10 -1.5708" "0.80 5.10 -1.5708" "1.20 5.10 -1.5708" "1.00 5.05 -1
 # 而节点 declare 的默认值是 float → 类型不匹配会让节点当场崩（vx1 就这么废了 7 轮）。
 as_float() { awk -v v="$1" 'BEGIN{printf "%.4f", v}'; }
 VETO_CD_F=$(as_float "${VETO_CD:-10.0}")
-# 走廊净宽阈值随世界给默认值：house world 的门洞约 0.9~1.0 m，用 1.05 会把
-# 所有路线都判成"必须穿窄缝"（实测 141 次/轮"候选全部被拒"）。原开阔房间仍用 1.05。
-if [ -z "${CORRIDOR_W:-}" ]; then
-  case "$(basename "${WORLD:-$DEFAULT_WORLD}")" in
-    *house*) CORRIDOR_W=0.85 ;;
-    *)       CORRIDOR_W=1.05 ;;
-  esac
-fi
-CORRIDOR_W_F=$(as_float "$CORRIDOR_W")
+# 通行判据**不随场景切换**（2026-10-25 用户要求）：阈值只由车体尺寸+误差决定，
+# 由仲裁器内部的 pass_width_m 给出（车宽 0.47 + 2×0.215 ≈ 0.90 m）。
+# CORRIDOR_W 仅作为旧接口保留（默认等于 pass_width），不再按 World 分支取值。
+CORRIDOR_W_F=$(as_float "${CORRIDOR_W:-0.90}")
 GATE_OCC_F=$(as_float "${GATE_OCC:-0.30}")
 VETO_OCC_F=$(as_float "${VETO_OCC:-0.30}")
 # 默认世界：aws_robomaker_small_house（2026-10-25 起替代原开阔房间）
