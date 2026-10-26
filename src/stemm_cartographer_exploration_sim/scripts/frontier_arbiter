@@ -1056,18 +1056,27 @@ class Arbiter(Node):
         field = self.clearance_field()
         if field is None or not poses:
             return None
-        res = field[3]
+        res, ox_, oy_, fw_, fh_ = field[3], field[1], field[2], field[4], field[5]
         step = max(1, int(round(0.05 / res)))
         min_w = 9.9
         min_i = -1
         min_xy = None
         first_w = None
+        oob = 0
         narrow_len = narrow_max = 0.0
         unk_max = 0.0
         for i, ps in enumerate(poses):
             if i % step:
                 continue
             px_, py_ = float(ps.pose.position.x), float(ps.pose.position.y)
+            # 2026-10-27：**地图范围外必须跳过**。clearance_at 对越界点返回 0.0（保守设计），
+            # 而规划的目标常常指向尚未建图的 frontier —— 越界点会被当成"净宽 0 的穿障"，
+            # 把"往未知区规划"误报成"横穿障碍"（实测 v8ar1 的 5 条最差计划全属此类）。
+            ci = (px_ - ox_) / res
+            cj = (py_ - oy_) / res
+            if not (0 <= ci < fw_ and 0 <= cj < fh_):
+                oob += 1
+                continue
             d, unk = self.clearance_at(field, px_, py_)
             wd = 2.0 * d
             if first_w is None:
@@ -1084,7 +1093,7 @@ class Arbiter(Node):
             if unk > 0.5:
                 unk_max = max(unk_max, unk)
         return (min_w, narrow_max, unk_max, min_i, min_xy, len(poses),
-                -1.0 if first_w is None else first_w)
+                -1.0 if first_w is None else first_w, oob)
 
     def on_plan(self, m):
         """V2-③：拿 /plan 的末位点当"正在执行的目标"，命中硬闸门就取消。
@@ -1099,7 +1108,7 @@ class Arbiter(Node):
             prof = self.plan_width_profile(m.poses)
             if prof is not None:
                 (min_w, narrow_run, unk_share, min_i, min_xy, n_pts,
-                 first_w) = prof
+                 first_w, oob) = prof
                 key = (round(min_w, 2), len(m.poses))
                 if key != self._pg_logged_plan:
                     self._pg_logged_plan = key
@@ -1111,8 +1120,9 @@ class Arbiter(Node):
                     xy = ('%.2f,%.2f' % min_xy) if min_xy else '?'
                     self.get_logger().info(
                         '计划窄处体检：/plan %d 点，最小净宽 %.2f m@#%d(%s)，起点净宽 %.2f m，'
-                        '最长窄段 %.2f m（pass_width=%.2f / narrow_len_max=%.2f）→ %s'
-                        % (n_pts, min_w, min_i, xy, first_w, narrow_run,
+                        '最长窄段 %.2f m，越界(未建图)点 %d 个'
+                        '（pass_width=%.2f / narrow_len_max=%.2f）→ %s'
+                        % (n_pts, min_w, min_i, xy, first_w, narrow_run, oob,
                            self.pass_width, self.narrow_len_max,
                            '穿窄处' if bad else 'OK'))
                     if bad and self.plan_guard_veto \
