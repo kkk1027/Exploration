@@ -82,7 +82,14 @@ for i in $(seq "$START" "$(( START + N - 1 ))") ; do
   if grep -qE "sensor preflight timed out|Core sensor preflight failed|nav2 生命周期未在 guard 超时内激活" "$D/launch.log" 2>/dev/null \
      || ! python3 harness/check_node_health.py "$D/launch.log" --quiet \
      || ! [ -s "$D/timeline.jsonl" ] || ! [ -s "$D/digest.md" ]; then
-    echo "  ↻ $TAG 起栈失败/节点真崩，重跑一次" >> "$PROG"
+    echo "  ↻ $TAG 无效轮（起栈失败或节点真崩），重跑一次" >> "$PROG"
+    # 2026-10-27：无效轮的证据不再随目录一起删掉（base2r1 首轮因此无法归因）。
+    # 留下体检结论 + launch.log 摘要到 /tmp，便于事后判断是"真崩"还是"起栈期偶发"。
+    mkdir -p /tmp/invalid_rounds 2>/dev/null
+    { echo "== $TAG $(date '+%F %T') dir=$D";
+      grep -E "sensor preflight timed out|Core sensor preflight failed|nav2 生命周期未在 guard 超时内激活" "$D/launch.log" 2>/dev/null | head -3;
+      python3 harness/check_node_health.py "$D/launch.log" 2>&1 | head -10;
+      tail -20 "$D/launch.log" 2>/dev/null; } > "/tmp/invalid_rounds/${TAG}_$(date +%H%M%S).txt" 2>&1
     rm -rf "$D"
     pkill -x gzserver 2>/dev/null; rm -f /dev/shm/fastrtps_* 2>/dev/null; sleep 5
     RVIZ=true GUI=false VISION=1 POSE_OVERRIDE="0.0 0.0 0.0" ROUND_MARGIN="${ROUND_MARGIN:-90}" RECOVERY_BT="${RECOVERY_BT:-none}" \
