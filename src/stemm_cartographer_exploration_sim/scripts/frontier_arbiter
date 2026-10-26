@@ -1047,23 +1047,35 @@ class Arbiter(Node):
         return True
 
     def plan_width_profile(self, poses):
-        """沿 nav2 规划出的 /plan 逐点查净宽 → (min_w, 最长窄段 m, 未知占比最大值)。"""
+        """沿 nav2 规划出的 /plan 逐点查净宽。
+
+        返回 (min_w, 最长窄段 m, 未知占比最大值, 最窄点序号, 最窄点世界坐标, 点数,
+        起点净宽)。2026-10-27 增补后四项：用户报"地图上有红障碍、路径却横穿"，需要区分
+        **起点就在障碍里**（车贴着障碍的假象）与**中途真的穿过障碍**（真 bug）。
+        """
         field = self.clearance_field()
         if field is None or not poses:
             return None
         res = field[3]
         step = max(1, int(round(0.05 / res)))
         min_w = 9.9
+        min_i = -1
+        min_xy = None
+        first_w = None
         narrow_len = narrow_max = 0.0
         unk_max = 0.0
         for i, ps in enumerate(poses):
             if i % step:
                 continue
-            d, unk = self.clearance_at(field, float(ps.pose.position.x),
-                                       float(ps.pose.position.y))
+            px_, py_ = float(ps.pose.position.x), float(ps.pose.position.y)
+            d, unk = self.clearance_at(field, px_, py_)
             wd = 2.0 * d
+            if first_w is None:
+                first_w = wd
             if wd < min_w:
                 min_w = wd
+                min_i = i
+                min_xy = (px_, py_)
             if wd < self.pass_width:
                 narrow_len += 0.05
                 narrow_max = max(narrow_max, narrow_len)
@@ -1071,7 +1083,8 @@ class Arbiter(Node):
                 narrow_len = 0.0
             if unk > 0.5:
                 unk_max = max(unk_max, unk)
-        return min_w, narrow_max, unk_max
+        return (min_w, narrow_max, unk_max, min_i, min_xy, len(poses),
+                -1.0 if first_w is None else first_w)
 
     def on_plan(self, m):
         """V2-③：拿 /plan 的末位点当"正在执行的目标"，命中硬闸门就取消。
@@ -1085,7 +1098,8 @@ class Arbiter(Node):
         if self.plan_guard_log or self.plan_guard_veto:
             prof = self.plan_width_profile(m.poses)
             if prof is not None:
-                min_w, narrow_run, unk_share = prof
+                (min_w, narrow_run, unk_share, min_i, min_xy, n_pts,
+                 first_w) = prof
                 key = (round(min_w, 2), len(m.poses))
                 if key != self._pg_logged_plan:
                     self._pg_logged_plan = key
@@ -1094,11 +1108,13 @@ class Arbiter(Node):
                     bad = (narrow_run > self.narrow_len_max) or (unk_share > 0.5)
                     if bad:
                         self.stats['plan_narrow_plans'] = self.stats.get('plan_narrow_plans', 0) + 1
+                    xy = ('%.2f,%.2f' % min_xy) if min_xy else '?'
                     self.get_logger().info(
-                        '计划窄处体检：/plan %d 点，最小净宽 %.2f m，最长窄段 %.2f m'
-                        '（pass_width=%.2f / narrow_len_max=%.2f）→ %s'
-                        % (len(m.poses), min_w, narrow_run, self.pass_width,
-                           self.narrow_len_max, '穿窄处' if bad else 'OK'))
+                        '计划窄处体检：/plan %d 点，最小净宽 %.2f m@#%d(%s)，起点净宽 %.2f m，'
+                        '最长窄段 %.2f m（pass_width=%.2f / narrow_len_max=%.2f）→ %s'
+                        % (n_pts, min_w, min_i, xy, first_w, narrow_run,
+                           self.pass_width, self.narrow_len_max,
+                           '穿窄处' if bad else 'OK'))
                     if bad and self.plan_guard_veto \
                             and self._pg_cancels < self.plan_guard_max_cancel:
                         self._pg_cancels += 1
