@@ -24,6 +24,7 @@
   path_timeout_sec   ComputePathToPose 超时（默认 4 s）
 """
 import json
+from collections import deque
 import math
 import os
 import time
