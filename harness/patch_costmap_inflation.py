@@ -64,10 +64,15 @@ def main():
         return 0
 
     if a.restore:
-        if not os.path.exists(PRISTINE):
+        # 注意：vx_max 注入脚本（patch_nav_speed.py）改的是**同一个** YAML。
+        # 它的 pristine 一定是最早拍摄的"真原厂"，所以优先用它，避免把
+        # 另一处注入当成原厂写回去（本轮踩过一次：两个 pristine 的 md5 不一致）。
+        _alt = os.path.join(CACHE, 'nav_speed.pristine.yaml')
+        _src = _alt if os.path.exists(_alt) else PRISTINE
+        if not os.path.exists(_src):
             print('  无 pristine 备份可还原（说明从未 apply 过）')
             return 0
-        shutil.copy2(PRISTINE, TARGET)
+        shutil.copy2(_src, TARGET)
         try:
             os.remove(journal())
         except OSError:
