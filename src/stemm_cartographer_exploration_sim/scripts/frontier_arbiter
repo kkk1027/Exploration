@@ -369,7 +369,10 @@ class Arbiter(Node):
         self.probe_log = str(p('probe_log', '').value)
         # 观测工作流 v2：每拍一行时间线（1 Hz），供 round_digest 画轨迹图并和
         # probe / supervisor / launch.log 做秒级交叉核对。
-        self.timeline_log = str(p('timeline_log', '').value)
+        # 兜底：launch 参数没送到时用环境变量（实测在整轮里 timeline_log 偶发丢失，
+        # 导致 digest 退化成 10 s 采样、卡死秒级判定不可用；环境变量由 round.sh 导出）
+        self.timeline_log = (str(p('timeline_log', '').value)
+                             or os.environ.get('STEMM_TIMELINE_LOG', ''))
         self._tl_fh = None
         self._tl_n = 0
         self._tl_last_wall = 0.0

@@ -52,6 +52,8 @@ GRACE_SEC="${GRACE_SEC:-22.0}"
 # 方案A 视觉层开关（VISION=1 时注入 nav2 视觉图层 + 起视觉障碍源；0=纯雷达基线）
 VISION="${VISION:-0}"
 MEMLOG="$OUT/mem.jsonl"
+# 环境变量兜底：仲裁器的 timeline 路径（launch 参数偶发丢失时用这个）
+export STEMM_TIMELINE_LOG="$OUT/timeline.jsonl"
 
 # 内存采样：本机 15 GiB 且 **无 swap**，视觉链路必须证明"加得起"
 mem_sample() {
