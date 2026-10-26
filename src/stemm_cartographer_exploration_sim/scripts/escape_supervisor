@@ -41,6 +41,7 @@
 """
 import json
 import math
+import os
 import time
 
 import rclpy
@@ -153,6 +154,17 @@ class EscapeSupervisor(Node):
         # 返航失败（manager 放弃等待人工）时允许连续小步倒车，每步仍 <=0.15 m、逐步雷达复核
         self.return_reverse_streak = int(p('return_reverse_streak', 4).value)
         self._rv_streak_left = 0
+        # ---- 只读探针（P9-C0）：为 C 层"探索期受控倒车"定口径用，默认关、不改变任何控制行为 ----
+        # 用法：STEMM_REV_PROBE=1 bash harness/round.sh <tag> <sec>
+        # 受阻计时活跃期间每 STEMM_REV_PROBE_DT 秒（默认 0.25）往 supervisor.jsonl 打一行
+        # type=rev_probe，含 C 层每一道候选闸门此刻的原始读数 -> 用真实分布定阈值，不拍脑袋。
+        self.rev_probe = os.environ.get('STEMM_REV_PROBE', '') not in ('', '0', 'false', 'False')
+        try:
+            self.rev_probe_dt = max(0.1, float(os.environ.get('STEMM_REV_PROBE_DT', '0.25')))
+        except ValueError:
+            self.rev_probe_dt = 0.25
+        self._rev_probe_last = 0.0
+        self._probe_rows = 0
 
         # ---- 状态 ----
         self.points = []           # 车体系障碍点 [(x,y)]（最近一帧 /scan_raw）
@@ -161,6 +173,7 @@ class EscapeSupervisor(Node):
         self.last_motion = time.monotonic()
         self._motion_anchor = None
         self.last_foreign_cmd = 0.0
+        self.last_cmd = None          # 最近一条非本节点的 (vx, wz, 时刻)；探针用
         self.force_request_at = 0.0
         self.own_cmd_at = 0.0
         self.nav_busy = False
@@ -284,6 +297,7 @@ class EscapeSupervisor(Node):
         now = time.monotonic()
         if now - self.own_cmd_at < 0.05:
             return                          # 自己发的，忽略
+        self.last_cmd = (m.linear.x, m.angular.z, now)
         if abs(m.linear.x) > 0.02 or abs(m.angular.z) > 0.02:
             self.last_foreign_cmd = now
 
@@ -448,6 +462,8 @@ class EscapeSupervisor(Node):
     def tick(self):
         now = time.monotonic()
         self.accumulate_stuck(now)
+        if self.rev_probe:
+            self.rev_probe_tick(now)
         self.check_progress_reset(now)
         if self.phase in ('rotate', 'advance'):
             self.drive_tick(now)
@@ -484,8 +500,64 @@ class EscapeSupervisor(Node):
                 best = r
         return best, n
 
-    def explore_wedged(self):
-        """探索期是否已经"贴死且放弃前进"：前向间隙 < rotate_min_range 且静止 >= stall_sec。"""
+    def rev_probe_tick(self, now):
+        """只读探针（P9-C0）：吸收态时刻把 C 层每道闸门的原始读数记下来，不动作、不改状态。
+
+        记这一行的目的：现有 C 口径是"front < 0.34 m 且非 nav_busy"（escB 时代的旋转安全值），
+        而车端安全闸是 front_stop_distance=0.65 m，两者之间有一整段死区；同时吸收态的典型状态
+        恰恰是"有活跃目标 + blocked_waiting_clearance"。所以要先用真实分布回答三个问题：
+          ① 长停滞时 front20 到底落在哪（0.34 够不够、0.65 会不会太松）；
+          ② 长停滞时 busy / state / cmd 各是什么（能不能只凭 state 接管）；
+          ③ 后方 ±30° 是否看得见（rear_pts / rear_clear，决定倒车是否可行）。
+        """
+        if self.stuck_since is None:
+            return
+        if now - self._rev_probe_last < self.rev_probe_dt:
+            return
+        self._rev_probe_last = now
+        stall = now - self.stuck_since
+        front20 = self.range_cone(0.0, half_deg=20.0, stride=2)
+        min_all = self.min_range_all(stride=2)
+        rear_clear, rear_pts = self.rear_clearance()
+        st = (self.state_name or '').lower()
+        md = (self.mode or '').lower()
+        gave_up = ('failed_waiting_manual' in st) or ('manual' in st)
+        why = []
+        if not self.explore_reverse_enabled:
+            why.append('switch_off')
+        if self.nav_busy and ('blocked_waiting_clearance' not in st) and ('safety_stop' not in md):
+            why.append('not_blocked_state')
+        if self.nav_busy and not gave_up:
+            why.append('nav_busy_active_goal')
+        if front20 >= self.rotate_min_range:
+            why.append('front_ge_rotate_min')
+        if self._rv_explore_count >= self.explore_reverse_max_count:
+            why.append('count_exhausted')
+        if rear_pts < self.return_reverse_min_points:
+            why.append('rear_unobserved')
+        elif rear_clear < self.return_reverse_rear_clear:
+            why.append('rear_blocked')
+        cv, cw = (None, None)
+        if self.last_cmd is not None:
+            cv, cw = round(self.last_cmd[0], 3), round(self.last_cmd[1], 3)
+        self._probe_rows += 1
+        self.log(type='rev_probe', stall=round(stall, 2),
+                 front20=round(front20, 3), min_all=round(min_all, 3),
+                 rear_clear=round(rear_clear, 3), rear_pts=rear_pts,
+                 nav=(self.state_name or '')[:32], mode=(self.mode or '')[:24],
+                 busy=self.nav_busy, busy_s=round(now - self._busy_since, 1),
+                 quiet_s=round(now - self.last_foreign_cmd, 1),
+                 motion_s=round(now - self.last_motion, 1),
+                 cmd=[cv, cw], ret=self.in_return_phase(), why=why, rows=self._probe_rows)
+
+    def explore_wedged(self, now):
+        """探索期是否已经"贴死且放弃前进"：前向间隙 < rotate_min_range 且静止 >= stall_sec。
+
+        2026-10-26 修两个潜伏 bug（提交 aeef06c 引入，17:08 之后 34+ 轮里本节点每次都在
+        第一次 tick 就崩：`explore_wedged(now)` 与 `def explore_wedged(self)` 签名不匹配，
+        且内部读的是不存在的 `_stuck_since`（真名 `stuck_since`）——即探索期脱困监督整体缺失，
+        所有在该时间窗内做的 A/B 都会被这个变量污染）。见 harness/test_method_calls.py 的回归守卫。
+        """
         if not self.explore_reverse_enabled:
             return False
         if self.pose is None:
@@ -493,7 +565,7 @@ class EscapeSupervisor(Node):
         if self.nav_busy and 'blocked_waiting_clearance' not in self.state_name.lower() \
                 and 'safety_stop' not in self.mode.lower():
             return False
-        stuck = self._stuck_since is not None and (time.monotonic() - self._stuck_since) >= self.stall_sec
+        stuck = self.stuck_since is not None and (now - self.stuck_since) >= self.stall_sec
         if not stuck:
             return False
         front = self.range_cone(0.0, half_deg=20.0, stride=2)

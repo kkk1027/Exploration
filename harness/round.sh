@@ -450,6 +450,18 @@ PYEOF
 fi
 if [ -f "$OUT/launch.log" ]; then
   echo
+  # 节点猝死体检（2026-10-26 新增）：提交 aeef06c 让 escape_supervisor 在探索期第一次
+  # tick 就 Traceback 退出；launch 不为这类可选节点设硬失败，整轮只是"少一个节点"，
+  # digest 照样判 PASS —— 34+ 轮 A/B 因此被污染（详见 docs/P9 §14）。这里把它变成
+  # 显性产物（dead_nodes.txt）+ 显著告警，后续再并入 digest 的失败项。
+  {
+    echo "# 节点猝死体检 $(date '+%F %T')"
+    echo "traceback_count=$(grep -c 'Traceback (most recent call last)' "$OUT/launch.log" 2>/dev/null || echo 0)"
+    grep -E 'process has died .*exit code [1-9]' "$OUT/launch.log" 2>/dev/null | sed 's/.*\[ERROR\] //' | sort -u
+  } > "$OUT/dead_nodes.txt"
+  if [ "$(sed -n 's/^traceback_count=//p' "$OUT/dead_nodes.txt")" != "0" ]; then
+    say "⚠ 本轮有节点猝死（Traceback），见 $OUT/dead_nodes.txt —— 该轮数据不可作为结论"
+  fi
   timeout 180 python3 harness/report.py "$OUT" "$TAG" > "$OUT/report.stdout" 2>&1 || true
   timeout 180 python3 harness/round_digest.py "$OUT" > "$OUT/digest.stdout" 2>&1 || true
   head -40 "$OUT/report.stdout"

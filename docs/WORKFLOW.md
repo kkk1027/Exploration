@@ -79,11 +79,16 @@ python3 harness/nav_params.py --restore               # 逐字节还原
 ```bash
 python3 harness/test_arbiter_attrs.py && python3 harness/test_arbiter_static.py \
  && python3 harness/test_param_types.py && python3 harness/test_driver_hooks.py \
- && python3 harness/test_launch_dryrun.py && python3 harness/test_harness_setu.py
+ && python3 harness/test_launch_dryrun.py && python3 harness/test_harness_setu.py \
+ && python3 harness/test_method_calls.py
 bash -n harness/round.sh && bash -n harness/batches/run_p0_shots.sh
 git status --porcelain          # 确认没有残留注入（sim_patch / vision_fusion_patch 计数为 0）
 ```
 提交信息模板：`fix/feat(<层>): 做了什么 —— 为什么(带数据) —— 开关与回退方式`。
+
+**每轮产物里必看 `dead_nodes.txt`**（2026-10-26 新增）：任何节点 Traceback 都会让整轮
+"安静地少一个节点"（launch 不设硬失败），该轮**不可作为实验数据**；批次脚本已把它当
+"无效轮"自动重跑，digest 也会在失败项里打 `node_crash`。
 
 ## 8. 收工检查
 ```bash

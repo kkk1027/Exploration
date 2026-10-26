@@ -332,7 +332,26 @@ def main():
     lines += ['## 0. 结论', '']
     checks = ev.get('checks') or {}
     bad = [k for k, v in checks.items() if v is False]
+    # 节点猝死（2026-10-26 新增）：launch 不为可选节点设硬失败，节点 Traceback 退出时
+    # 整轮只是"少了一个节点"，旧口径照样判 PASS——必须显性化成失败项（P9 §14 的事故）。
+    dead = []
+    dnp = os.path.join(d, 'dead_nodes.txt')
+    if os.path.exists(dnp):
+        for line in open(dnp, encoding='utf-8', errors='replace'):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if line.startswith('traceback_count='):
+                try:
+                    if int(line.split('=', 1)[1] or 0) > 0:
+                        bad.append('node_crash')
+                except ValueError:
+                    pass
+                continue
+            dead.append(line)
     lines.append(f'- verdict: **{ev.get("verdict")}**　失败项: {bad if bad else "无"}')
+    if dead:
+        lines.append(f'- ⚠ 节点猝死: ' + '　'.join(x[:60] for x in dead[:3]))
     lines.append(f'- 物理接触: {coll.get("physical_contacts")}　'
                  f'倒车: {coll.get("reverse_m")} m（探索段 {coll.get("reverse_explore_m")} / '
                  f'返航受控 {coll.get("reverse_return_assist_m")}）')
