@@ -1,0 +1,292 @@
+#!/usr/bin/env python3
+"""fake_base —— **不用 Gazebo** 的 2D 运动学底座 + 地图射线雷达（nav2 测试台专用）。
+
+用户 2026-10-26 指示："测试过程中不需要 gazebo"。所以把物理仿真换成两件事：
+  1) 运动学积分：吃 /cmd_vel（含 vx_min 的负值=受限倒车），按独轮车模型积分位姿；
+  2) 地图射线：用一张离线地图（/map 或 pgm+yaml）做 raycast，发出 /scan，
+     让 nav2 的障碍层/代价地图拿到真实的近场障碍（含雷达盲区）。
+
+这样 nav2 的代价地图、膨胀、规划器、控制器、恢复行为全都照常工作，
+但**没有物理引擎**：跑得快、完全确定、不会卡在 Gazebo 起栈/接触判定上。
+
+实现要点（性能）：射线步进用"距离场跳跃"——预先算好每个格到最近障碍的距离，
+沿射线每次前进 dist(当前格)（不会跳过障碍），一束光通常 10~20 步收敛，
+833 束 @10 Hz 在纯 Python 里也能跑。
+
+参数（默认值与真机/仿真一致）：
+  map_yaml        /home/kbf/stemm_sim_ws/maps/explore_latest.yaml
+  scan_topic      scan          激光话题
+  odom_topic      odom_combined 融合里程计话题
+  beams           833           与仿真雷达一致
+  range_max       12.0 m
+  deadzone_deg    110,240       真机雷达盲区（区间内不出点）
+  rate_hz         20.0          积分频率（激光按 scan_hz 发）
+  scan_hz         10.0
+  save_state_path 空=不落盘；给路径则每分钟把位姿写进去（便于复现）
+"""
+import json
+import math
+import os
+import time
+from collections import deque
+
+import numpy as np
+import rclpy
+import tf2_ros
+from geometry_msgs.msg import Quaternion, TransformStamped, Twist
+from nav_msgs.msg import OccupancyGrid, Odometry
+from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import LaserScan
+
+
+def load_pgm(path):
+    d = open(path, 'rb').read()
+    i = 0
+    toks = []
+    while len(toks) < 4:
+        while d[i:i + 1].isspace():
+            i += 1
+        j = i
+        while not d[j:j + 1].isspace():
+            j += 1
+        toks.append(d[i:j])
+        i = j
+    i += 1
+    w, h = int(toks[1]), int(toks[2])
+    img = np.frombuffer(d[i:i + w * h], dtype=np.uint8).reshape(h, w)
+    return img, w, h
+
+
+class FakeBase(Node):
+    def __init__(self):
+        super().__init__('fake_base')
+        p = self.declare_parameter
+        p('map_yaml', '/home/kbf/stemm_sim_ws/maps/explore_latest.yaml')
+        p('scan_topic', 'scan')
+        p('odom_topic', 'odom_combined')
+        p('base_frame', 'base_footprint')
+        p('odom_frame', 'odom_combined')
+        p('map_frame', 'map')
+        p('beams', 833)
+        p('range_max', 12.0)
+        p('range_min', 0.15)
+        p('deadzone_deg', [110.0, 240.0])
+        p('rate_hz', 20.0)
+        p('scan_hz', 10.0)
+        p('start_x', 0.0)
+        p('start_y', 0.0)
+        p('start_yaw', 0.0)
+        p('noise_m', 0.01)
+        p('cmd_timeout', 0.6)
+
+        g = self.get_parameter
+        self.map_yaml = str(g('map_yaml').value)
+        self.base_frame = str(g('base_frame').value)
+        self.odom_frame = str(g('odom_frame').value)
+        self.map_frame = str(g('map_frame').value)
+        self.beams = int(g('beams').value)
+        self.range_max = float(g('range_max').value)
+        self.range_min = float(g('range_min').value)
+        dz = list(g('deadzone_deg').value)
+        self.dz = (math.radians(dz[0]), math.radians(dz[1])) if len(dz) == 2 else None
+        self.rate_hz = max(1.0, float(g('rate_hz').value))
+        self.dt = 1.0 / self.rate_hz
+        self.scan_hz = float(g('scan_hz').value)
+        self.noise = float(g('noise_m').value)
+        self.cmd_timeout = float(g('cmd_timeout').value)
+        self.x = float(g('start_x').value)
+        self.y = float(g('start_y').value)
+        self.yaw = float(g('start_yaw').value)
+        self.vx = 0.0
+        self.wz = 0.0
+        self.cmd_stamp = 0.0
+
+        self.load_map()
+        self.scan_pub = self.create_publisher(LaserScan, str(g('scan_topic').value), 10)
+        self.odom_pub = self.create_publisher(Odometry, str(g('odom_topic').value), 20)
+        self.create_subscription(Twist, '/cmd_vel', self.on_cmd, 20)
+        self.tf = tf2_ros.TransformBroadcaster(self)
+        self.t_scan = 0.0
+        self.create_timer(self.dt, self.tick)
+        self.get_logger().info(
+            'fake_base 就绪（无 Gazebo）：地图 %s %dx%d res %.3f；雷达 %d 束 @%.0f Hz，'
+            '盲区 %s；起点 (%.2f,%.2f,%.2f)'
+            % (os.path.basename(self.map_yaml), self.w, self.h, self.res, self.beams,
+               self.scan_hz,
+               ('%.0f°~%.0f°' % tuple(dz) if self.dz else '无'),
+               self.x, self.y, self.yaw))
+
+    # ---------- 地图 ----------
+    def load_map(self):
+        import yaml
+        y = yaml.safe_load(open(self.map_yaml, encoding='utf-8'))
+        img_path = y['image']
+        if not os.path.isabs(img_path):
+            img_path = os.path.join(os.path.dirname(self.map_yaml), img_path)
+        img, w, h = load_pgm(img_path)
+        self.res = float(y['resolution'])
+        ox, oy = y['origin'][0], y['origin'][1]
+        self.ox, self.oy = float(ox), float(oy)
+        self.w, self.h = w, h
+        occ = img < 100                    # PGM: 0=占据
+        unk = (img > 100) & (img < 250)    # 205=未知
+        self.occ = occ
+        self.unk = unk
+        # 距离场（到最近占据格的格数）→ 射线跳跃步进
+        INF = 1 << 20
+        d = np.full((h, w), INF, dtype=np.int32)
+        q = deque()
+        ys, xs = np.nonzero(occ)
+        for j, i in zip(ys.tolist(), xs.tolist()):
+            d[j, i] = 0
+            q.append((j, i))
+        cap = int(self.range_max / self.res) + 2
+        while q:
+            j, i = q.popleft()
+            base = d[j, i] + 1
+            if base > cap:
+                continue
+            for dj, di in ((1, 0), (-1, 0), (0, 1), (0, -1),
+                           (1, 1), (1, -1), (-1, 1), (-1, -1)):
+                nj, ni = j + dj, i + di
+                if 0 <= nj < h and 0 <= ni < w and d[nj, ni] > base:
+                    d[nj, ni] = base
+                    q.append((nj, ni))
+        self.dist = d
+        # 发给 nav2 用的 /map（占据 100 / 自由 0 / 未知 -1）
+        grid = np.zeros((h, w), dtype=np.int8)
+        grid[occ] = 100
+        grid[unk] = -1
+        msg = OccupancyGrid()
+        msg.header.frame_id = self.map_frame
+        msg.info.resolution = self.res
+        msg.info.width = w
+        msg.info.height = h
+        msg.info.origin.position.x = self.ox
+        msg.info.origin.position.y = self.oy
+        msg.info.origin.orientation.w = 1.0
+        # 注意：OccupancyGrid.data 是 int8 序列，直接赋 bytes 会触发
+        # "data field must be a set or sequence" 断言（实测把节点打崩过一次）
+        msg.data = grid.reshape(-1).astype(np.int8).tolist()
+        self.map_msg = msg
+
+    # ---------- 输入 ----------
+    def on_cmd(self, m):
+        self.vx = float(m.linear.x)
+        self.wz = float(m.angular.z)
+        self.cmd_stamp = time.monotonic()
+
+    # ---------- 每拍 ----------
+    def tick(self):
+        now = time.monotonic()
+        dt = self.dt                     # 固定步长；原来按"参数再算一遍"，
+        # 一旦参数读成 0 就会得到 dt=1000 s → 位姿直接跳飞（实测 /odom 冲到 y=9.68）
+        if now - self.cmd_stamp > self.cmd_timeout:
+            self.vx = self.wz = 0.0        # 指令超时=停车（和真机安全闸行为一致）
+        self.x += self.vx * math.cos(self.yaw) * dt
+        self.y += self.vx * math.sin(self.yaw) * dt
+        self.yaw += self.wz * dt
+        self.publish_odom()
+        self.publish_tf()
+        self.map_msg.header.stamp = self.get_clock().now().to_msg()
+        if now - self.t_scan >= 1.0 / max(1e-3, self.scan_hz):
+            self.t_scan = now
+            self.scan_pub.publish(self.raycast())
+
+    def quat(self):
+        return Quaternion(x=0.0, y=0.0,
+                          z=math.sin(self.yaw / 2.0), w=math.cos(self.yaw / 2.0))
+
+    def publish_odom(self):
+        m = Odometry()
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.header.frame_id = self.odom_frame
+        m.child_frame_id = self.base_frame
+        m.pose.pose.position.x = self.x
+        m.pose.pose.position.y = self.y
+        m.pose.pose.orientation = self.quat()
+        m.twist.twist.linear.x = self.vx
+        m.twist.twist.angular.z = self.wz
+        self.odom_pub.publish(m)
+
+    def publish_tf(self):
+        ts = TransformStamped()
+        ts.header.stamp = self.get_clock().now().to_msg()
+        ts.header.frame_id = self.odom_frame
+        ts.child_frame_id = self.base_frame
+        ts.transform.translation.x = self.x
+        ts.transform.translation.y = self.y
+        ts.transform.rotation = self.quat()
+        self.tf.sendTransform(ts)
+        ts2 = TransformStamped()
+        ts2.header.stamp = ts.header.stamp
+        ts2.header.frame_id = self.map_frame
+        ts2.child_frame_id = self.odom_frame
+        ts2.transform.rotation.w = 1.0
+        self.tf.sendTransform(ts2)
+
+    def raycast(self):
+        """距离场跳跃式 raycast；未知格不算命中（按自由处理），盲区不出点。"""
+        msg = LaserScan()
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = self.base_frame
+        msg.angle_min = -math.pi
+        msg.angle_max = math.pi
+        msg.angle_increment = 2.0 * math.pi / self.beams
+        msg.range_min = self.range_min
+        msg.range_max = self.range_max
+        msg.scan_time = 1.0 / max(1e-3, self.scan_hz)
+        ranges = []
+        ca, sa = math.cos(self.yaw), math.sin(self.yaw)
+        for k in range(self.beams):
+            ang = msg.angle_min + k * msg.angle_increment
+            if self.dz and self.dz[0] <= abs(ang) <= self.dz[1]:
+                ranges.append(float('inf'))
+                continue
+            d = math.cos(ang)
+            e = math.sin(ang)
+            wx = self.x + d * self.range_min
+            wy = self.y + e * self.range_min
+            t = self.range_min
+            hit = None
+            for _ in range(400):
+                ci = int((wx - self.ox) / self.res)
+                cj = int((wy - self.oy) / self.res)
+                if not (0 <= ci < self.w and 0 <= cj < self.h):
+                    break
+                step = float(self.dist[cj, ci]) * self.res
+                if step <= 0.0:
+                    hit = t
+                    break
+                t += max(step * 0.9, self.res * 0.5)   # 保守步进，避免越过薄墙
+                if t > self.range_max:
+                    break
+                wx = self.x + d * t
+                wy = self.y + e * t
+            if hit is None:
+                ranges.append(float('inf'))
+            else:
+                r = hit + (np.random.randn() * self.noise if self.noise > 0 else 0.0)
+                ranges.append(max(self.range_min, min(self.range_max, float(r))))
+        msg.ranges = ranges
+        return msg
+
+
+def main():
+    rclpy.init()
+    node = FakeBase()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
+        pass
+    finally:
+        try:
+            node.destroy_node()
+            rclpy.shutdown()
+        except Exception:                       # noqa: BLE001
+            pass
+
+
+if __name__ == '__main__':
+    main()

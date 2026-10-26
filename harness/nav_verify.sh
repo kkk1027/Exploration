@@ -35,20 +35,23 @@ LOG="$WS/logs/nav_verify_$(date +%H%M%S)"
 mkdir -p "$LOG"
 
 cleanup() {
-  python3 "$WS/harness/patch_costmap_inflation.py" --restore >/dev/null 2>&1
-  python3 "$WS/harness/patch_nav_speed.py" --restore >/dev/null 2>&1
+  python3 "$WS/harness/nav_params.py" --restore >/dev/null 2>&1
   python3 "$WS/harness/vision_nav_params.py" --restore >/dev/null 2>&1
-  echo "[nav_verify] 已撤销全部注入（膨胀/速度/视觉层）"
+  echo "[nav_verify] 已撤销全部注入（膨胀/速度/视觉层/规划器）"
 }
 trap cleanup EXIT INT TERM
 
-if [ "$COST_INFL" = "1" ]; then
-  python3 harness/patch_costmap_inflation.py --apply \
-    --global-radius "${GLOBE_R:-1.00}" --global-scaling "${GLOBE_S:-1.2}" --pad "${PAD:-0.10}" || exit 4
-else
-  echo "[nav_verify] COST_INFL=0：代价地图参数保持原厂（对照）"
+# 一次性生成整份 nav2 参数（唯一注入器，逐字节可回退）
+NAV_ARGS=(--vx-max "${VX_MAX:-0.35}")
+[ -n "${VX_MIN:-}" ] && NAV_ARGS+=(--vx-min "$VX_MIN")
+if [ "${COST_INFL:-1}" = "1" ]; then
+  NAV_ARGS+=(--infl-radius "${GLOBE_R:-1.00}" --infl-scaling "${GLOBE_S:-1.2}" --pad "${PAD:-0.10}")
 fi
-python3 harness/patch_nav_speed.py --apply --vx-max "${VX_MAX:-0.35}" ${VX_MIN:+--vx-min "$VX_MIN"} || exit 4
+if [ "${PLANNER_PATCH:-1}" = "1" ]; then
+  NAV_ARGS+=(--allow-unknown "${ALLOW_UNKNOWN:-false}" --motion "${MOTION_MODEL:-REEDS_SHEPP}"
+             --reverse-penalty "${REV_PENALTY:-3.0}")
+fi
+python3 harness/nav_params.py --apply "${NAV_ARGS[@]}" || exit 4
 if [ "$VISION" = "1" ]; then
   python3 harness/vision_nav_params.py --apply || exit 4
 fi

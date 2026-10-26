@@ -152,7 +152,7 @@ if [ "$(python3 -c "print(1 if float('$GRACE_SEC')>0 else 0)")" = "1" ]; then
   RRT_WAIT="${RRT_WAIT:-4}"
   python3 harness/patch_car_launch.py --apply --grace "$GRACE_SEC" --rrt-wait "$RRT_WAIT" --front-stop "${FRONT_STOP:-0}" 2>&1 | tee -a "$OUT/harness.log"
   say "返航姿态宽限：${GRACE_SEC}s（原厂 6 s；GRACE_SEC=0 可关）｜RRT 等待窗口：${RRT_WAIT:-0}s｜front_stop=${FRONT_STOP:-原厂0.65}"
-  trap 'python3 /home/kbf/stemm_exploration_sim_ws/harness/patch_car_launch.py --restore >/dev/null 2>&1; python3 /home/kbf/stemm_exploration_sim_ws/harness/patch_nav_speed.py --restore >/dev/null 2>&1; python3 /home/kbf/stemm_exploration_sim_ws/harness/vision_nav_params.py --restore >/dev/null 2>&1' EXIT INT TERM
+  trap 'python3 /home/kbf/stemm_exploration_sim_ws/harness/patch_car_launch.py --restore >/dev/null 2>&1; python3 /home/kbf/stemm_exploration_sim_ws/harness/nav_params.py --restore >/dev/null 2>&1; python3 /home/kbf/stemm_exploration_sim_ws/harness/vision_nav_params.py --restore >/dev/null 2>&1' EXIT INT TERM
 
 # ---- P9 ①②: Nav2 恢复动作 / 重规划节拍（两项独立开关，逐字节可回退）----
 # RECOVERY_BT=replan → 只提重规划节拍(1.0 Hz)，恢复动作仍是原厂 Wait(2)
@@ -185,7 +185,17 @@ if [ "$VISION" = "1" ]; then
   # 这是**全局固定值**，不按房间/世界调；改它就是一次全局决策。
   VX_MAX="${VX_MAX:-0.35}"
   if [ -n "${VX_MAX:-}" ] && [ "${VX_MAX}" != "0" ]; then
-    python3 harness/patch_nav_speed.py --apply --vx-max "$(as_float "$VX_MAX")" ${VX_MIN:+--vx-min "$VX_MIN"} 2>&1 | tee -a "$OUT/harness.log"
+    # 统一注入器：一次生成整份 nav2 参数（vx / 膨胀 / 规划器），逐字节可回退
+    NAV_ARGS=(--vx-max "$(as_float "${VX_MAX:-0.35}")")
+    [ -n "${VX_MIN:-}" ] && NAV_ARGS+=(--vx-min "$VX_MIN")
+    if [ "${COST_INFL:-0}" = "1" ]; then
+      NAV_ARGS+=(--infl-radius "${GLOBE_R:-1.00}" --infl-scaling "${GLOBE_S:-1.2}" --pad "${PAD:-0.10}")
+    fi
+    if [ "${PLANNER_PATCH:-0}" = "1" ]; then
+      NAV_ARGS+=(--allow-unknown "${ALLOW_UNKNOWN:-false}" --motion "${MOTION_MODEL:-REEDS_SHEPP}"
+                 --reverse-penalty "${REV_PENALTY:-3.0}")
+    fi
+    python3 harness/nav_params.py --apply "${NAV_ARGS[@]}" 2>&1 | tee -a "$OUT/harness.log"
   fi
   if [ "${PIPESTATUS[0]}" != "0" ]; then
     say "✗ 视觉图层注入失败，放弃本轮（参数文件未被改动）"
@@ -196,7 +206,7 @@ else
   python3 harness/vision_nav_params.py --restore 2>&1 | tee -a "$OUT/harness.log" || true
 python3 harness/patch_car_launch.py --restore 2>&1 | tee -a "$OUT/harness.log" || true
 fi
-setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE_F world:=${WORLD:-$DEFAULT_WORLD} spawn_x:=$SX spawn_y:=$SY spawn_yaw:=$SYAW disable_retreat:=$DISABLE_RETREAT escape_supervisor:=$SUPERVISOR car_escape:=$CAR_ESCAPE rviz:=${RVIZ:-false} gazebo_gui:=${GUI:-false} stack_delay:=$(as_float "${STACK_DELAY:-0.0}") scoring:=${SCORING:-v1} veto:=${VETO:-true} plan_guard_log:=${PLAN_GUARD_LOG:-false} plan_guard_veto:=${PLAN_GUARD_VETO:-false} veto_max:=${VETO_MAX:-6} veto_cooldown:=$VETO_CD_F gate:=${GATE:-false} corridor_width:=$CORRIDOR_W_F max_candidates:=${MAX_CAND:-14} retreat_max:=${RETREAT_MAX:-2} retreat_interval:=$(as_float "${RETREAT_IVL:-8.0}") pass_width:=$(as_float "${PASS_W:-0.90}") narrow_len_max:=$(as_float "${NARROW_LEN_MAX:-1.00}") unknown_span_max:=$(as_float "${UNK_SPAN_MAX:-0.35}") supervisor_rotate_min_range:=$(as_float "${SUP_ROT_MIN:-0.34}") supervisor_advance_stop_range:=$(as_float "${SUP_ADV_STOP:-0.34}") supervisor_explore_reverse:=${SUP_EXPLORE_REV:-false} supervisor_explore_reverse_max_m:=$(as_float "${SUP_EXPLORE_REV_M:-0.15}") supervisor_explore_reverse_speed:=$(as_float "${SUP_EXPLORE_REV_V:-0.06}") supervisor_explore_reverse_max_count:=${SUP_EXPLORE_REV_N:-4} probe_log:=$OUT/probe.jsonl supervisor_log:=$OUT/supervisor.jsonl vision:=$VISION vision_decay_sec:=$(as_float "${VISION_DECAY:-0.0}") vision_dump:=$([ "$VISION" = "1" ] && echo "$OUT/vision_grid" || echo '') watchdog_log:=$OUT/watchdog.jsonl nudge_log:=$OUT/nudge.jsonl candidate_probe_log:=$OUT/candidate_probe.jsonl timeline_log:=$OUT/timeline.jsonl" \
+setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE_F world:=${WORLD:-$DEFAULT_WORLD} spawn_x:=$SX spawn_y:=$SY spawn_yaw:=$SYAW disable_retreat:=$DISABLE_RETREAT escape_supervisor:=$SUPERVISOR car_escape:=$CAR_ESCAPE rviz:=${RVIZ:-false} gazebo_gui:=${GUI:-false} stack_delay:=$(as_float "${STACK_DELAY:-0.0}") scoring:=${SCORING:-v1} veto:=${VETO:-true} plan_guard_log:=${PLAN_GUARD_LOG:-false} plan_guard_veto:=${PLAN_GUARD_VETO:-false} veto_max:=${VETO_MAX:-6} veto_cooldown:=$VETO_CD_F gate:=${GATE:-false} corridor_width:=$CORRIDOR_W_F max_candidates:=${MAX_CAND:-14} retreat_max:=${RETREAT_MAX:-2} retreat_interval:=$(as_float "${RETREAT_IVL:-8.0}") pass_width:=$(as_float "${PASS_W:-0.90}") narrow_len_max:=$(as_float "${NARROW_LEN_MAX:-1.00}") unknown_span_max:=$(as_float "${UNK_SPAN_MAX:-0.35}") unknown_block:=${UNKNOWN_BLOCK:-false} supervisor_rotate_min_range:=$(as_float "${SUP_ROT_MIN:-0.34}") supervisor_advance_stop_range:=$(as_float "${SUP_ADV_STOP:-0.34}") supervisor_explore_reverse:=${SUP_EXPLORE_REV:-false} supervisor_explore_reverse_max_m:=$(as_float "${SUP_EXPLORE_REV_M:-0.15}") supervisor_explore_reverse_speed:=$(as_float "${SUP_EXPLORE_REV_V:-0.06}") supervisor_explore_reverse_max_count:=${SUP_EXPLORE_REV_N:-4} probe_log:=$OUT/probe.jsonl supervisor_log:=$OUT/supervisor.jsonl vision:=$VISION vision_decay_sec:=$(as_float "${VISION_DECAY:-0.0}") vision_dump:=$([ "$VISION" = "1" ] && echo "$OUT/vision_grid" || echo '') watchdog_log:=$OUT/watchdog.jsonl nudge_log:=$OUT/nudge.jsonl candidate_probe_log:=$OUT/candidate_probe.jsonl timeline_log:=$OUT/timeline.jsonl" \
   > "$OUT/launch.log" 2>&1 < /dev/null 9>&- &
 sleep 3; PGID=$(cat "$OUT/pgid" 2>/dev/null || echo "")
 say "已启动：PGID=$PGID  日志 $OUT/launch.log"

@@ -107,6 +107,8 @@ def generate_launch_description():
                                 'pass_width_m': LaunchConfiguration('pass_width'),
                                 'narrow_len_max_m': LaunchConfiguration('narrow_len_max'),
                                 'unknown_span_max_m': LaunchConfiguration('unknown_span_max'),
+                                # P9-⑦：与 nav2 allow_unknown:false 对齐
+                                'unknown_block': LaunchConfiguration('unknown_block'),
                                 # V2-③ 后置 veto：默认关，实验时 veto:=true
                                 'veto_enabled': LaunchConfiguration('veto'),
                                 'veto_min_esc_dirs': LaunchConfiguration('veto_min_esc'),
@@ -256,6 +258,8 @@ def generate_launch_description():
             description='窄段累计长度上限（超过即否决：不允许"勉强能过"）'),
         DeclareLaunchArgument('unknown_span_max', default_value='0.35',
             description='连续未知段长度上限（未知按障碍算，只允许短跨度例外）'),
+        DeclareLaunchArgument('unknown_block', default_value='false',
+            description='P9-⑦：候选判据是否与 nav2 allow_unknown:false 一致（禁止跨未知区、落点必须已知自由）'),
         DeclareLaunchArgument('corridor_width', default_value='1.05',
             description='前向净空预检的走廊净宽下限（m）；抬高可挡掉"看着能过、实际过不去"的口子'),
         DeclareLaunchArgument('timeline_log', default_value='',

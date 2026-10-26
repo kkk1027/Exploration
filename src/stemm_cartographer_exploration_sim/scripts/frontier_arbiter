@@ -466,6 +466,15 @@ class Arbiter(Node):
         #     "净空最大、当前能到"的点先派出去，把车挪出死角，而不是什么都不做。
         self.return_check = self._as_bool(p('return_check_enabled', True).value)
         self.return_turn_width = float(p('return_turn_width_m', 0.85).value)
+        # P9-⑦（用户 2026-10-26 提问）：候选输出会不会把 nav2 的 allow_unknown 纳入判据？
+        # 原来**不会**：候选闸门的通行 BFS 走代价地图（未知编码 -1 会被挡），
+        # 但"沿路净宽"是在 /map 上算的，而 /map 里未知格**按可通行**处理，只靠
+        # unknown_span_max(0.35 m) 给一小段容差。nav2 一旦设成 allow_unknown:false，
+        # 两边口径就不一致：仲裁认为能到、规划器却拒绝，或反过来把车带进"没看清"的角。
+        # unknown_block=True 把容差清零（任何未知段都不许），并额外要求落点本身是已知自由格。
+        self.unknown_block = self._as_bool(p('unknown_block', False).value)
+        if self.unknown_block:
+            self.unknown_span_max = 0.0
         # 半径取 0.6 m："这一脚到那儿能不能转过身"，而不是"附近某处有片空地"。
         # 取 1.2 m 时实测 3 轮里一次都没触发（房间尺度上总能找到空地），等于没生效。
         self.return_scan_radius = float(p('return_scan_radius_m', 0.60).value)
@@ -1406,6 +1415,19 @@ class Arbiter(Node):
             return False, None, None, 0.0
         if data[gy * w + gx] < 0 or data[gy * w + gx] >= 90:
             return False, None, None, 0.0
+        # P9-⑦：allow_unknown:false 时，落点必须落在**已知自由**的 /map 格里
+        # （nav2 不会再"跨未知区"到目标；落点在未知里必然规划失败）
+        if self.unknown_block and self.map is not None:
+            occ = self.map
+            ores2 = occ.info.resolution
+            oox2, ooy2 = occ.info.origin.position.x, occ.info.origin.position.y
+            mi = int((x - oox2) / ores2)
+            mj = int((y - ooy2) / ores2)
+            if not (0 <= mi < occ.info.width and 0 <= mj < occ.info.height):
+                return False, None, None, 0.0
+            mv = occ.data[mj * occ.info.width + mi]
+            if mv < 0 or mv >= 50:
+                return False, None, None, 0.0
         from collections import deque
         parent = {}
         seen = bytearray(w * h)
