@@ -18,6 +18,16 @@ source /opt/ros/humble/setup.bash
 source /home/kbf/stemm_sim_ws/install/setup.bash
 source /home/kbf/stemm_explore_ws/install/setup.bash
 source /home/kbf/stemm_exploration_sim_ws/install/setup.bash
+# ---- 干掉遗留的 ros2cli daemon（2026-10-26，第二个真根因）----
+# 现象：`ros2 node list` 空、`ros2 param set` 全超时、`ros2 param dump` 全空，
+# 但 rclpy 节点之间订阅/服务完全正常 —— 因为 daemon 是个常驻进程，
+# 它在 **没有 ROS_LOCALHOST_ONLY=1 的环境**里起过（切热点之前），
+# 之后所有 CLI 命令都复用这个"看不见回环节点"的 daemon。
+# 实测：`ros2 daemon stop` 之后同一命令立刻能列出 /probe_node。
+# 由此连锁出来的假故障：patch_sim_time 每项"超时"（参数没落地）、
+# param_audit 恒 0/8（被判 invalid）、起栈就绪标记迟迟不出现。
+# 这里每轮开跑前先停 daemon，让 CLI 用本轮环境另起一个。
+timeout 10 ros2 daemon stop >/dev/null 2>&1 || true
 # ---- 并发保护（2026-10-26）：同一时刻只允许一轮仿真 ----
 # 事故：手动启动的轮次和批次轮次撞在一起（同一 ROS_DOMAIN_ID / 同一个 gzserver），
 # 两边的指标都会变脏。拿不到锁就直接退出，且不改动任何文件。
@@ -77,7 +87,7 @@ rec() { printf '{"ts":"%s","tag":"%s","%s"}\n' "$(date -Iseconds)" "$TAG" "$1" >
 
 # ---- 1) 启动前断言：域 42 零节点 + 无 gzserver ----
 proc_residue() { pgrep -af "waypoint_follower|controller_server|planner_server|bt_navigator|behavior_server|smoother_server|cartographer_node|occupancy_grid|stemm_cartographer|robot_state_publisher|ekf_node|imu_bias_shim|scan_deadzone_relay|async_slam_toolbox|nav2_|sim_clock_resampler" 2>/dev/null | grep -vE "harness/(round|sweep)\.sh|grep|pgrep" | awk '{print $1}' | grep -vxE "$$|$PPID" | tr '\n' ' '; }
-NODES=$(ros2 node list 2>/dev/null | wc -l)
+NODES=$(timeout 10 ros2 node list 2>/dev/null | wc -l)
 GZ=$(pgrep -cx gzserver)
 PRES=$(proc_residue)
 say "启动前：ROS 节点数=$NODES（含DDS僵尸，仅记录）  gzserver=$GZ  进程残留=[${PRES}]"
@@ -88,7 +98,7 @@ if [ -n "$PRES" ] || [ "$GZ" -gt 0 ]; then
   sleep 2
   for p in $(proc_residue); do kill -9 "$p" 2>/dev/null; done
   pkill -x gzserver 2>/dev/null; sleep 4
-  NODES=$(ros2 node list 2>/dev/null | wc -l); GZ=$(pgrep -cx gzserver); PRES=$(proc_residue)
+  NODES=$(timeout 10 ros2 node list 2>/dev/null | wc -l); GZ=$(pgrep -cx gzserver); PRES=$(proc_residue)
   say "清理后：ROS 节点数=$NODES  gzserver=$GZ  进程残留=[${PRES}]"
   rec "\"check\":\"post_cleanup\",\"nodes\":$NODES,\"gzserver\":$GZ,\"residue\":\"${PRES}\""
   { [ -n "$PRES" ] || [ "$GZ" -gt 0 ]; } && { say "清理不彻底，放弃本轮"; rec '"verdict":"FAIL_preclean"'; exit 10; }
@@ -166,8 +176,8 @@ else
   python3 harness/vision_nav_params.py --restore 2>&1 | tee -a "$OUT/harness.log" || true
 python3 harness/patch_car_launch.py --restore 2>&1 | tee -a "$OUT/harness.log" || true
 fi
-setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE_F world:=${WORLD:-$DEFAULT_WORLD} spawn_x:=$SX spawn_y:=$SY spawn_yaw:=$SYAW disable_retreat:=$DISABLE_RETREAT escape_supervisor:=$SUPERVISOR car_escape:=$CAR_ESCAPE rviz:=${RVIZ:-false} gazebo_gui:=${GUI:-false} stack_delay:=$(as_float "${STACK_DELAY:-0.0}") scoring:=${SCORING:-v1} veto:=${VETO:-true} veto_max:=${VETO_MAX:-6} veto_cooldown:=$VETO_CD_F gate:=${GATE:-false} corridor_width:=$CORRIDOR_W_F max_candidates:=${MAX_CAND:-14} retreat_max:=${RETREAT_MAX:-2} retreat_interval:=$(as_float "${RETREAT_IVL:-8.0}") pass_width:=$(as_float "${PASS_W:-0.90}") narrow_len_max:=$(as_float "${NARROW_LEN_MAX:-1.00}") unknown_span_max:=$(as_float "${UNK_SPAN_MAX:-0.35}") supervisor_rotate_min_range:=$(as_float "${SUP_ROT_MIN:-0.34}") supervisor_advance_stop_range:=$(as_float "${SUP_ADV_STOP:-0.34}") probe_log:=$OUT/probe.jsonl supervisor_log:=$OUT/supervisor.jsonl vision:=$VISION vision_dump:=$([ "$VISION" = "1" ] && echo "$OUT/vision_grid" || echo '') watchdog_log:=$OUT/watchdog.jsonl nudge_log:=$OUT/nudge.jsonl candidate_probe_log:=$OUT/candidate_probe.jsonl timeline_log:=$OUT/timeline.jsonl" \
-  > "$OUT/launch.log" 2>&1 < /dev/null &
+setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE_F world:=${WORLD:-$DEFAULT_WORLD} spawn_x:=$SX spawn_y:=$SY spawn_yaw:=$SYAW disable_retreat:=$DISABLE_RETREAT escape_supervisor:=$SUPERVISOR car_escape:=$CAR_ESCAPE rviz:=${RVIZ:-false} gazebo_gui:=${GUI:-false} stack_delay:=$(as_float "${STACK_DELAY:-0.0}") scoring:=${SCORING:-v1} veto:=${VETO:-true} veto_max:=${VETO_MAX:-6} veto_cooldown:=$VETO_CD_F gate:=${GATE:-false} corridor_width:=$CORRIDOR_W_F max_candidates:=${MAX_CAND:-14} retreat_max:=${RETREAT_MAX:-2} retreat_interval:=$(as_float "${RETREAT_IVL:-8.0}") pass_width:=$(as_float "${PASS_W:-0.90}") narrow_len_max:=$(as_float "${NARROW_LEN_MAX:-1.00}") unknown_span_max:=$(as_float "${UNK_SPAN_MAX:-0.35}") supervisor_rotate_min_range:=$(as_float "${SUP_ROT_MIN:-0.34}") supervisor_advance_stop_range:=$(as_float "${SUP_ADV_STOP:-0.34}") probe_log:=$OUT/probe.jsonl supervisor_log:=$OUT/supervisor.jsonl vision:=$VISION vision_decay_sec:=$(as_float "${VISION_DECAY:-0.0}") vision_dump:=$([ "$VISION" = "1" ] && echo "$OUT/vision_grid" || echo '') watchdog_log:=$OUT/watchdog.jsonl nudge_log:=$OUT/nudge.jsonl candidate_probe_log:=$OUT/candidate_probe.jsonl timeline_log:=$OUT/timeline.jsonl" \
+  > "$OUT/launch.log" 2>&1 < /dev/null 9>&- &
 sleep 3; PGID=$(cat "$OUT/pgid" 2>/dev/null || echo "")
 say "已启动：PGID=$PGID  日志 $OUT/launch.log"
 rec "\"check\":\"launch\",\"pgid\":\"$PGID\""
@@ -209,13 +219,17 @@ if [ "$HOLD" -gt 0 ]; then
   say "空跑 $HOLD s 结束，执行 teardown 验证"
 else
   # 全流程模式：等会话自然收尾（会话结束 / 地图落盘 / 超时上限）
-  MAXW=$(python3 -c "print(int(float('$EXPLORE') + 300))")
-  say "全流程模式：最多等待 ${MAXW}s（探索 ${EXPLORE}s + 返航/存图余量）"
-  waited=0
+  # 余量按**真实时间**计：此前用 `waited=$((waited+10))` 累加，但每拍实际要 16 s
+  # （sleep 10 + mem_sample 里的 ps/ros2），"480 s" 实际跑了 770 s —— 一轮 14 分钟，
+  # 5 轮 ×2 批 = 2.4 h，严重拖慢迭代。改为按 date 差值计时，余量由 ROUND_MARGIN 控制。
+  MARGIN=${ROUND_MARGIN:-300}
+  MAXW=$(python3 -c "print(int(float('$EXPLORE') + float('$MARGIN')))")
+  say "全流程模式：最多等待 ${MAXW}s（探索 ${EXPLORE}s + 返航/存图余量 ${MARGIN}s，按真实时间计）"
+  T0=$(date +%s); waited=0
   AUDIT_DONE=0
   BACKSTEP_EXPECT=$([ "${EXPLORE_BACKSTEP:-1}" = "1" ] && echo 1 || echo 0)
   while [ "$waited" -lt "$MAXW" ]; do
-    sleep 10; waited=$((waited+10)); mem_sample
+    sleep 10; waited=$(( $(date +%s) - T0 )); mem_sample
     # P0-乙：起栈就绪后立刻做参数落地自检（此时 patch_sim_time 已跑完、栈还活着）
     if [ "$AUDIT_DONE" = "0" ] && grep -q "ready_guard_timing" "$OUT/launch.log" 2>/dev/null \
        && grep -q "全部阶段完成" "$OUT/launch.log" 2>/dev/null; then
@@ -240,10 +254,10 @@ teardown() {
   [ -n "$PGID" ] && kill -TERM -- "-$PGID" 2>/dev/null
   for i in $(seq 1 20); do pgrep -x gzserver >/dev/null || break; sleep 1; done
   pkill -x gzserver 2>/dev/null
-  for i in $(seq 1 10); do [ "$(ros2 node list 2>/dev/null | wc -l)" -le 1 ] && break; sleep 1; done
+  for i in $(seq 1 10); do [ "$(timeout 8 ros2 node list 2>/dev/null | wc -l)" -le 1 ] && break; sleep 1; done
 }
 teardown
-NODES=$(ros2 node list 2>/dev/null | wc -l); GZ=$(pgrep -cx gzserver)
+NODES=$(timeout 10 ros2 node list 2>/dev/null | wc -l); GZ=$(pgrep -cx gzserver)
 RES=$(pgrep -af "cartographer_node|sim_session_driver|controller_server|planner_server|bt_navigator|imu_bias_shim|scan_deadzone_relay" 2>/dev/null | grep -E "/(lib/|install/|opt/ros)" | grep -v "harness/round.sh" | awk '{print $1}' | tr '\n' ' ')
 say "收尾后：ROS 节点数=$NODES  gzserver=$GZ  残留=[${RES}]"
 rec "\"check\":\"post_teardown\",\"nodes\":$NODES,\"gzserver\":$GZ,\"residue\":\"${RES}\""
@@ -390,7 +404,7 @@ if [ -f "$MF" ] && [ "$(stat -c %Y "$MF")" -ge "$T_START" ]; then
 fi
 # 本轮验收（七项 + P0 两项）
 if [ -f "$OUT/launch.log" ]; then
-  python3 harness/evaluate.py "$OUT/launch.log" "$TAG" "$OUT/probe.jsonl" --p0 \
+  timeout 180 python3 harness/evaluate.py "$OUT/launch.log" "$TAG" "$OUT/probe.jsonl" --p0 \
     > "$OUT/evaluate.json" 2>&1 || true
   python3 - "$OUT/evaluate.json" <<'PYEOF'
 import json,sys
@@ -404,8 +418,8 @@ PYEOF
 fi
 if [ -f "$OUT/launch.log" ]; then
   echo
-  python3 harness/report.py "$OUT" "$TAG" > "$OUT/report.stdout" 2>&1 || true
-  python3 harness/round_digest.py "$OUT" > "$OUT/digest.stdout" 2>&1 || true
+  timeout 180 python3 harness/report.py "$OUT" "$TAG" > "$OUT/report.stdout" 2>&1 || true
+  timeout 180 python3 harness/round_digest.py "$OUT" > "$OUT/digest.stdout" 2>&1 || true
   head -40 "$OUT/report.stdout"
   echo "[report] 完整报告：$OUT/report.md"
 fi

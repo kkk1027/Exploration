@@ -62,17 +62,23 @@ BLOCK_G = f'''{SENT % "begin(global)"}
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
         combination_method: 1
-        observation_sources: vision_accum
-        vision_accum:
-          topic: /vision/obstacle_cloud
+        # 2026-10-26 P9-④：原来这里订阅的是 /vision/obstacle_cloud（累积云，只增不减）
+        # 且 clearing: False —— 家具被车挪开、或本来就是深度噪点/掠射面时，
+        # 这些格子会**永久**留在全局代价地图里，把走廊堵死到本轮结束。
+        # 实测 baser1-3 的旋转期障碍格持续增长（探针 rot_growth 事件 3 次/轮）即出自这一层。
+        # 改成 live 云 + clearing，并让 raytrace 只到 5 m（深度图有效距离）——
+        # 绝不能给 30 m：深度云只有近处点，30 m 射线会把远处真实墙体的记忆擦掉。
+        observation_sources: vision_live
+        vision_live:
+          topic: /vision/live_cloud
           data_type: "PointCloud2"
           marking: True
-          clearing: False
+          clearing: True
           min_obstacle_height: 0.05
           max_obstacle_height: 0.85
-          obstacle_max_range: 30.0
+          obstacle_max_range: 5.0
           obstacle_min_range: 0.0
-          raytrace_max_range: 30.0
+          raytrace_max_range: 5.0
           raytrace_min_range: 0.0
 {SENT % "end(global)"}
 '''

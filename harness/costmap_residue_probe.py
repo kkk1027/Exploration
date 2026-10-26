@@ -32,29 +32,65 @@ from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
 from sensor_msgs.msg import LaserScan
 
+# nav2 的 `/local_costmap/costmap_raw` 发的是 **nav2_msgs/msg/Costmap**（uint8 编码：
+# 255=未知、253=致命、254=内切），而 `/local_costmap/costmap` 才是 nav_msgs/OccupancyGrid。
+# 2026-10-26 事故：探针按 OccupancyGrid 订阅 costmap_raw → 类型不匹配、一条消息都收不到，
+# tick() 里 `if self.raw is None: return` 让 residue.jsonl 全程 0 行（静默零数据）。
+try:
+    from nav2_msgs.msg import Costmap as Nav2Costmap
+except Exception:                       # noqa: BLE001  —— 没有 nav2_msgs 时退化为只测膨胀层
+    Nav2Costmap = None
+
+
+def is_nav2_costmap(msg):
+    return hasattr(msg, 'metadata') and not hasattr(msg, 'info')
+
+
+def grid_shape(msg):
+    """两种消息的宽高字段不一样：OccupancyGrid.info / nav2_msgs.Costmap.metadata。"""
+    m = msg.metadata if is_nav2_costmap(msg) else msg.info
+    if is_nav2_costmap(msg):
+        return int(m.size_x), int(m.size_y)
+    return int(m.width), int(m.height)
+
+
+def occ_of(v, nav2):
+    """归一化到"是否占据"。OccupancyGrid: int8，>=50 占据、<0 未知；
+    nav2_msgs/Costmap: uint8，255 未知、>=250 致命/内切（原始层一般是 253）。"""
+    if nav2:
+        return v >= 250
+    return v >= 50
+
+
+def unk_of(v, nav2):
+    return (v == 255) if nav2 else (v < 0)
+
 
 def grid_stats(msg):
+    nav2 = is_nav2_costmap(msg)
     data = msg.data
-    n_occ = sum(1 for v in data if v >= 50)
-    n_free = sum(1 for v in data if 0 <= v < 50)
-    n_unk = sum(1 for v in data if v < 0)
-    h = hashlib.sha1(bytes(bytearray(1 if v >= 50 else 0 for v in data))).hexdigest()[:12]
+    n_occ = sum(1 for v in data if occ_of(v, nav2))
+    n_unk = sum(1 for v in data if unk_of(v, nav2))
+    n_free = len(data) - n_occ - n_unk
+    h = hashlib.sha1(bytes(bytearray(1 if occ_of(v, nav2) else 0 for v in data))).hexdigest()[:12]
     return n_occ, n_free, n_unk, h
 
 
 def write_pgm(msg, path):
-    """把 OccupancyGrid 写成 PGM（占据=0，自由=254，未知=205），便于人眼核对。"""
-    w, h = msg.info.width, msg.info.height
+    """把代价栅格写成 PGM（占据=0，自由=254，未知=205），便于人眼核对。"""
+    w, h = grid_shape(msg)
+    nav2 = is_nav2_costmap(msg)
     buf = bytearray(w * h)
     for idx, v in enumerate(msg.data):
         j = idx // w
         i = idx % w
         if j >= h:
             break
-        val = 205
-        if v >= 50:
+        if occ_of(v, nav2):
             val = 0
-        elif 0 <= v < 50:
+        elif unk_of(v, nav2):
+            val = 205
+        else:
             val = 254
         buf[(h - 1 - j) * w + i] = val
     with open(path, 'wb') as fh:
@@ -83,9 +119,12 @@ class Probe(Node):
         self.occ_at_rot_start = None
         self.events = []
         self.scan = None
+        self.warned_none = False
+        self.warned_noraw = False
         qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                          durability=DurabilityPolicy.TRANSIENT_LOCAL)
-        self.create_subscription(OccupancyGrid, '/local_costmap/costmap_raw', self.on_raw, qos)
+        if Nav2Costmap is not None:
+            self.create_subscription(Nav2Costmap, '/local_costmap/costmap_raw', self.on_raw, qos)
         self.create_subscription(OccupancyGrid, '/local_costmap/costmap', self.on_infl, qos)
         self.create_subscription(Odometry, '/odom_combined', self.on_odom, 20)
         self.create_subscription(LaserScan, '/scan', self.on_scan, 10)
@@ -132,9 +171,16 @@ class Probe(Node):
         if now - self.last < self.once_per:
             return
         self.last = now
-        if self.raw is None:
+        base = self.raw if self.raw is not None else self.infl
+        if base is None:
+            if not self.warned_none:
+                self.warned_none = True
+                self.get_logger().warn('既没有 costmap_raw 也没有 costmap —— 探针无从取证')
             return
-        n_occ, n_free, n_unk, h = grid_stats(self.raw)
+        if self.raw is None and not self.warned_noraw:
+            self.warned_noraw = True
+            self.get_logger().warn('costmap_raw 未到达，本行改用膨胀层数据（raw_occ 即 infl）')
+        n_occ, n_free, n_unk, h = grid_stats(base)
         i_occ = i_free = i_unk = 0
         if self.infl is not None:
             i_occ, i_free, i_unk, _ = grid_stats(self.infl)

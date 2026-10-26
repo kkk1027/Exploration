@@ -50,6 +50,8 @@ class FakeSelf:
         self.return_scan_radius = 1.20
         self.escape_goal_enabled = True
         self.escape_min_clearance = 0.55
+        # P9-⑤(b)：脱困落点必须留出掉头空间（与仲裁默认值一致）
+        self.escape_need_turn = True
         self.escape_max_dist = 1.60
         self.escape_cooldown = 8.0
         self.escape_max_total = 20
