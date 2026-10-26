@@ -117,6 +117,7 @@ def generate_launch_description():
                                 'noexit_retreat_m': LaunchConfiguration('noexit_retreat_m'),
                                 'noexit_turn_m': LaunchConfiguration('noexit_turn_m'),
                                 'noexit_retreat_need_m': LaunchConfiguration('noexit_retreat_need_m'),
+                                'noexit_turn_hold_m': LaunchConfiguration('noexit_turn_hold_m'),
                                 # V2-③ 后置 veto：默认关，实验时 veto:=true
                                 'veto_enabled': LaunchConfiguration('veto'),
                                 'veto_min_esc_dirs': LaunchConfiguration('veto_min_esc'),
@@ -302,6 +303,8 @@ def generate_launch_description():
             description='A：pinch 内存在此自由直径即可掉头（车对角线）'),
         DeclareLaunchArgument('noexit_retreat_need_m', default_value='1.00',
             description='A：回退窗口内 w>=pinch 的连续长度要求'),
+        DeclareLaunchArgument('noexit_turn_hold_m', default_value='0.30',
+            description='A：掉头空间要连续多长（避免一格毛刺被当成凹室）'),
         DeclareLaunchArgument('corridor_width', default_value='1.05',
             description='前向净空预检的走廊净宽下限（m）；抬高可挡掉"看着能过、实际过不去"的口子'),
         DeclareLaunchArgument('timeline_log', default_value='',

@@ -529,6 +529,7 @@ class Arbiter(Node):
         self.noexit_retreat_m = float(p('noexit_retreat_m', 1.20).value)
         self.noexit_turn_m = float(p('noexit_turn_m', 0.81).value)
         self.noexit_retreat_need_m = float(p('noexit_retreat_need_m', 1.00).value)
+        self.noexit_turn_hold_m = float(p('noexit_turn_hold_m', 0.30).value)
         self._last_path_reject = None
         # 半径取 0.6 m："这一脚到那儿能不能转过身"，而不是"附近某处有片空地"。
         # 取 1.2 m 时实测 3 轮里一次都没触发（房间尺度上总能找到空地），等于没生效。
@@ -1448,15 +1449,20 @@ class Arbiter(Node):
         return d, float(int(win.sum()) / tot)
 
     def _noexit_verdict(self, wlist, step_m):
-        """A 层：沿途 pinch 的"可退出性"判定（docs/P9 §13.2；语义重定义见 __init__）。
+        """A 层：沿途 pinch 的"可退出性"判定（docs/P9 §15 重定义后的语义）。
 
         wlist: [(宽度, 世界x, 世界y), ...] 与路径同序，索引 0 = 车这一侧。
-        返回 None = 所有 pinch 都能退出（放行，恢复供给）；否则返回 (wx, wy) =
-        第一个"进得去出不来"的 pinch 中点（调用方据此否决并计 reject_noexit）。
-        三条放行判据（任一成立即可）：① 穿透长度 <= noexit_short_m（只擦车角）；
-        ② 掉头空间：pinch 内存在 w >= noexit_turn_m（车对角线 0.81 m）；
-        ③ 回退空间：pinch 起点向车一侧 noexit_retreat_m 内，w >= pinch_m 的连续段
-        长度 >= noexit_retreat_need_m（能沿原路退出来）。
+        返回 None = 所有 pinch 区都能退出（放行，恢复供给）；否则返回 (wx, wy) =
+        第一个"进得去出不来"的 pinch 区中点（调用方据此否决并计 reject_noexit）。
+
+        判据（任一成立即该区放行）：
+          ① 穿透跨度 <= noexit_short_m（只擦车角）；
+          ② 掉头空间：区内存在**连续** noexit_turn_hold_m 的 w >= noexit_turn_m
+             （车对角线 0.81 m；只认连续段，避免一格测量毛刺被当成凹室）；
+          ③ 回退空间：区起点向车一侧 noexit_retreat_m 窗口内，w >= pinch_m 的连续段
+             长度 >= noexit_retreat_need_m（能沿原路退出来）。
+        相邻子缝之间如果只隔很短（< noexit_turn_m 的路径长度），合并成一个区一起判 ——
+        否则"缝-凹室-缝"会被拆成两段各自判死，而这恰恰是能掉头退出的形状。
         """
         pinch = self.noexit_pinch_m
         short = self.noexit_short_m
@@ -1464,7 +1470,11 @@ class Arbiter(Node):
         step = max(step_m, 1e-6)
         back_n = max(1, int(round(self.noexit_retreat_m / step)))
         need_n = max(2, int(round(self.noexit_retreat_need_m / step)))
+        turn_n = max(2, int(round(getattr(self, 'noexit_turn_hold_m', 0.30) / step)))
+        merge_gap_n = max(1, int(round(turn / step)))
         n = len(wlist)
+        # ---- 1) 提取子缝 ----
+        segs = []
         i = 0
         while i < n:
             if wlist[i][0] >= pinch:
@@ -1473,25 +1483,42 @@ class Arbiter(Node):
             j = i
             while j + 1 < n and wlist[j + 1][0] < pinch:
                 j += 1
-            seg_len = (j - i + 1) * step
-            ok = seg_len <= short
-            if not ok:
-                ok = any(wlist[k][0] >= turn for k in range(i, j + 1))
-            if not ok:
-                run = best = 0
-                for k in range(max(0, i - back_n), i):
-                    if wlist[k][0] >= pinch:
-                        run += 1
-                        best = max(best, run)
-                    else:
-                        run = 0
-                ok = best >= need_n
-            if not ok:
-                self.stats['pinch_len_max'] = round(
-                    max(self.stats.get('pinch_len_max', 0.0), seg_len), 2)
-                m = (i + j) // 2
-                return (wlist[m][1], wlist[m][2])
+            segs.append([i, j])
             i = j + 1
+        # ---- 2) 合并挨得近的子缝（缝-凹室-缝）----
+        zones = []
+        for a, b in segs:
+            if zones and a - zones[-1][1] <= merge_gap_n:
+                zones[-1][1] = b
+            else:
+                zones.append([a, b])
+        # ---- 3) 逐个区判可退出性 ----
+        for a, b in zones:
+            span = (b - a + 1) * step
+            if span <= short:
+                continue                                  # ① 只擦车角
+            run = best_turn = 0
+            for k in range(a, b + 1):
+                if wlist[k][0] >= turn:
+                    run += 1
+                    best_turn = max(best_turn, run)
+                else:
+                    run = 0
+            if best_turn >= turn_n:
+                continue                                  # ② 区内能掉头
+            run = best_ret = 0
+            for k in range(max(0, a - back_n), a):
+                if wlist[k][0] >= pinch:
+                    run += 1
+                    best_ret = max(best_ret, run)
+                else:
+                    run = 0
+            if best_ret >= need_n:
+                continue                                  # ③ 能沿原路退出
+            self.stats['pinch_len_max'] = round(
+                max(self.stats.get('pinch_len_max', 0.0), span), 2)
+            m = (a + b) // 2
+            return (wlist[m][1], wlist[m][2])
         return None
 
     def path_and_width(self, x, y):
