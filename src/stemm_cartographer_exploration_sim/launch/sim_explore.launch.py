@@ -221,6 +221,10 @@ def generate_launch_description():
                                    'explore_reverse_block_sec': LaunchConfiguration('supervisor_explore_reverse_block_sec'),
                                    'explore_reverse_takeover_busy': LaunchConfiguration('supervisor_explore_reverse_takeover'),
                                    'explore_reverse_rear_clear_m': LaunchConfiguration('supervisor_explore_reverse_rear_clear'),
+                                   # P9-S0：接触即倒车（默认关）
+                                   'contact_reverse_enabled': LaunchConfiguration('supervisor_contact_reverse'),
+                                   'contact_reverse_window_sec': LaunchConfiguration('supervisor_contact_reverse_window'),
+                                   'contact_reverse_max': LaunchConfiguration('supervisor_contact_reverse_max'),
                                    'log_path': LaunchConfiguration('supervisor_log')}])
 
 
@@ -388,6 +392,12 @@ def generate_launch_description():
             description='C v2：是否允许在有活跃目标时接管（吸收态本身就是"目标还在、车端零速"）'),
         DeclareLaunchArgument('supervisor_explore_reverse_rear_clear', default_value='0.40',
             description='C v2：探索期倒车前要求后方 ±30° 最小净空（m）'),
+        DeclareLaunchArgument('supervisor_contact_reverse', default_value='false',
+            description='P9-S0：物理接触后（/collision_contact_zone）允许一次受限倒车（雷达复核后方）'),
+        DeclareLaunchArgument('supervisor_contact_reverse_window', default_value='5.0',
+            description='P9-S0：接触后多少秒内仍允许触发（s）'),
+        DeclareLaunchArgument('supervisor_contact_reverse_max', default_value='3',
+            description='P9-S0：每局接触触发的倒车次数上限'),
         DeclareLaunchArgument('supervisor_recovery_timeout', default_value='40.0',
             description='累计受阻多少秒后退出脱困（用户要求的 40 s 兜底）'),
         DeclareLaunchArgument('explore_backstep', default_value='1',

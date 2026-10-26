@@ -161,6 +161,20 @@ class EscapeSupervisor(Node):
         self.explore_reverse_rear_clear_m = abs(float(
             p('explore_reverse_rear_clear_m', 0.40).value))
         self._blocked_since = None      # 车端闸"按住且不再发速度"的起始时刻
+        # ---- P9-S0：接触即倒车（默认关）。实测最坏的 S0 事件不是"闸按住"，而是
+        # 车头顶住看不见的低矮物体（Dumbbell/FitnessEquipment/床头柜）持续研磨几分钟：
+        # c3r4 一轮 14351 个接触帧、接触时长 175 s，而那一轮 blocked 段最长只有 1.0 s ——
+        # 状态机根本不会报 blocked，所以 C 的状态口径永远等不到它。这里改用
+        # "/collision_contact_zone"（碰撞探针在接触瞬间发布）直接触发一次受限倒车。
+        self.contact_reverse_enabled = str(
+            p('contact_reverse_enabled', False).value).lower() in ('true', '1', 'yes', 'on')
+        self.contact_reverse_window_sec = abs(float(
+            p('contact_reverse_window_sec', 5.0).value))
+        self.contact_reverse_max = int(p('contact_reverse_max', 3).value)
+        self.contact_reverse_quiet_sec = abs(float(
+            p('contact_reverse_quiet_sec', 0.5).value))
+        self._contact_at = None
+        self._rv_contact_count = 0
         self._rv_explore_count = 0
         self._wedge_info = {}           # 触发时的判据快照（日志归因用）
         # 返航失败（manager 放弃等待人工）时允许连续小步倒车，每步仍 <=0.15 m、逐步雷达复核
@@ -238,6 +252,8 @@ class EscapeSupervisor(Node):
         self.create_subscription(LaserScan, self.scan_topic, self.on_scan, qos_sensor)
         self.create_subscription(Odometry, self.odom_topic, self.on_odom, 20)
         self.create_subscription(Twist, self.cmd_topic, self.on_cmd, 20)
+        self.create_subscription(PoseStamped, '/collision_contact_zone',
+                                 self.on_contact_zone, 10)
         self.create_subscription(String, self.nav_state_topic, self.on_nav_state, 10)
         # P0-甲：看门狗检测到"静默静止"（车端安全闸把速度置零）时主动请求一次脱困单元，
         # 不再依赖本节点自己从 cmd_vel 推断 —— 那条路在 cmd≡0 的场景里永远等不到。
@@ -313,6 +329,12 @@ class EscapeSupervisor(Node):
         self.last_cmd = (m.linear.x, m.angular.z, now)
         if abs(m.linear.x) > 0.02 or abs(m.angular.z) > 0.02:
             self.last_foreign_cmd = now
+
+    def on_contact_zone(self, m):
+        """碰撞探针在物理接触瞬间上报（P9-S0）。只记时刻，决策在 tick 里做。"""
+        self._contact_at = time.monotonic()
+        self.log(type='contact_seen', pos=[round(m.pose.position.x, 2),
+                                          round(m.pose.position.y, 2)])
 
     def on_nav_state(self, m):
         self.nav_state = (m.data or '').strip()
@@ -614,7 +636,17 @@ class EscapeSupervisor(Node):
         explore = False
         if not self.return_reverse_enabled and not self.explore_reverse_enabled:
             return False
-        if not self.in_return_phase():
+        contact_panic = False
+        if (self.contact_reverse_enabled and self._contact_at is not None
+                and not self.in_return_phase()
+                and (now - self._contact_at) <= self.contact_reverse_window_sec
+                and self._rv_contact_count < self.contact_reverse_max
+                and (now - self.last_foreign_cmd) >= self.contact_reverse_quiet_sec):
+            # 接触后车端已松手（静默 ≥0.5 s）→ 允许一次受限倒车把车退离障碍。
+            # 不要求 blocked 状态：实测贴着低矮物体研磨时状态机根本不报 blocked。
+            contact_panic = True
+            explore = True
+        if not contact_panic and not self.in_return_phase():
             if not self.explore_wedged(now):
                 return False
             explore = True
@@ -665,6 +697,9 @@ class EscapeSupervisor(Node):
         self._rv_start = (self.pose[0], self.pose[1]) if self.pose else None
         if explore:
             self._rv_explore_count += 1
+            if contact_panic:
+                self._rv_contact_count += 1
+                self._contact_at = None      # 一次接触只换一次倒车
         else:
             self._rv_count += 1
         if self._rv_streak_left > 0:
@@ -672,7 +707,7 @@ class EscapeSupervisor(Node):
         self.assist_pub.publish(Bool(data=True))
         self.log(type='reverse_assist_start', rear_points=npts,
                  rear_clear=round(clear, 3), nav=self.nav_state,
-                 phase='explore' if explore else 'return',
+                 phase=('contact' if contact_panic else 'explore') if explore else 'return',
                  wedge=dict(self._wedge_info) if explore else None,
                  note=('探索期贴死（车端闸按住且已静默 ≥%.1fs）：受控小步倒车'
                        % self.explore_reverse_block_sec

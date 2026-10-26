@@ -91,7 +91,8 @@ def one(d):
             why['not_holding' if str(w).startswith('not_holding_') else w] += 1
     o['why'] = dict(why.most_common(4))
     o['rev_start_explore'] = sum(1 for s in starts if s.get('phase') == 'explore')
-    o['rev_start_return'] = sum(1 for s in starts if s.get('phase') != 'explore')
+    o['rev_start_contact'] = sum(1 for s in starts if s.get('phase') == 'contact')
+    o['rev_start_return'] = sum(1 for s in starts if s.get('phase') == 'return')
     o['units'] = sum(1 for e in sup if e.get('type') == 'unit_start')
     tl = jsonl(os.path.join(d, 'timeline.jsonl'))
     runs = blocked_runs(tl)
@@ -115,7 +116,7 @@ def main():
             continue
         print('\n==== 批次 %s（%d 轮） ====' % (pre, len(dirs)))
         hdr = ('轮次', '接触', '判定', 'blocked(段/≥10s/最长)', 'C探针行', 'C可触发',
-               'C倒车(探/返)', '脱困单元', 'A否决', 'A放行', 'A检查', '最长pinch', 'narrow否决')
+               'C倒车(探/接触/返)', '脱困单元', 'A否决', 'A放行', 'A检查', '最长pinch', 'narrow否决')
         print('%-30s %s' % (hdr[0], ' '.join(hdr[1:])))
         tot = Counter()
         for d in dirs:
@@ -124,7 +125,8 @@ def main():
                 o['dir'][:30], o.get('contact'), str(o.get('verdict'))[:4],
                 o.get('blk_n', 0), o.get('blk_ge10', 0), o.get('blk_max', 0),
                 o.get('probe_rows'), o.get('would_fire'),
-                '%d/%d' % (o.get('rev_start_explore', 0), o.get('rev_start_return', 0)),
+                '%d/%d/%d' % (o.get('rev_start_explore', 0), o.get('rev_start_contact', 0),
+                              o.get('rev_start_return', 0)),
                 o.get('units'), o.get('reject_noexit'), o.get('noexit_passed'),
                 o.get('noexit_checked'), o.get('pinch_len_max'), o.get('rejected_narrow')))
             for k in ('contact', 'would_fire', 'rev_start_explore', 'units',
