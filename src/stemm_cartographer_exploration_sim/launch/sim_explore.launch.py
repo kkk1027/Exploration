@@ -208,6 +208,11 @@ def generate_launch_description():
                                    'explore_reverse_max_m': LaunchConfiguration('supervisor_explore_reverse_max_m'),
                                    'explore_reverse_speed': LaunchConfiguration('supervisor_explore_reverse_speed'),
                                    'explore_reverse_max_count': LaunchConfiguration('supervisor_explore_reverse_max_count'),
+                                   # C v2 口径（2026-10-26 用真实数据重定）：状态+静默计时 + front 门槛
+                                   'explore_reverse_front_m': LaunchConfiguration('supervisor_explore_reverse_front'),
+                                   'explore_reverse_block_sec': LaunchConfiguration('supervisor_explore_reverse_block_sec'),
+                                   'explore_reverse_takeover_busy': LaunchConfiguration('supervisor_explore_reverse_takeover'),
+                                   'explore_reverse_rear_clear_m': LaunchConfiguration('supervisor_explore_reverse_rear_clear'),
                                    'log_path': LaunchConfiguration('supervisor_log')}])
 
 
@@ -353,6 +358,14 @@ def generate_launch_description():
             description='探索期受控倒车速度（m/s，小速度）'),
         DeclareLaunchArgument('supervisor_explore_reverse_max_count', default_value='4',
             description='探索期受控倒车每局步数上限'),
+        DeclareLaunchArgument('supervisor_explore_reverse_front', default_value='0.70',
+            description='C v2：前向 ±20° 最小测距 ≤ 此值才值得倒车（车端安全闸 front_stop=0.65）'),
+        DeclareLaunchArgument('supervisor_explore_reverse_block_sec', default_value='6.0',
+            description='C v2：车端闸按住且不再发速度需持续多少秒才接管（实测段时长 p75=5.3 s）'),
+        DeclareLaunchArgument('supervisor_explore_reverse_takeover', default_value='true',
+            description='C v2：是否允许在有活跃目标时接管（吸收态本身就是"目标还在、车端零速"）'),
+        DeclareLaunchArgument('supervisor_explore_reverse_rear_clear', default_value='0.40',
+            description='C v2：探索期倒车前要求后方 ±30° 最小净空（m）'),
         DeclareLaunchArgument('supervisor_recovery_timeout', default_value='40.0',
             description='累计受阻多少秒后退出脱困（用户要求的 40 s 兜底）'),
         DeclareLaunchArgument('explore_backstep', default_value='1',

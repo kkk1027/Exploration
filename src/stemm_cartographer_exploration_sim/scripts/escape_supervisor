@@ -150,7 +150,19 @@ class EscapeSupervisor(Node):
         self.explore_reverse_max_count = int(p('explore_reverse_max_count', 4).value)
         self.explore_reverse_max_m = float(p('explore_reverse_max_m', 0.15).value)
         self.explore_reverse_speed = float(p('explore_reverse_speed', 0.06).value)
+        # C v2 口径（2026-10-26 用真实数据重定，见 docs/P9 §14）：老口径是
+        # "front<0.34 m 且非 nav_busy"，实测在 156 个探索期长停滞段里只覆盖 3%，
+        # 而真吸收态是"车端闸按住 blocked_waiting_clearance + 车端不再发速度"，
+        # 段内 front 中位 0.50、68% 在 0.70 以内。故改用状态+静默计时触发。
+        self.explore_reverse_front_m = abs(float(p('explore_reverse_front_m', 0.70).value))
+        self.explore_reverse_block_sec = abs(float(p('explore_reverse_block_sec', 6.0).value))
+        self.explore_reverse_takeover_busy = str(
+            p('explore_reverse_takeover_busy', True).value).lower() in ('true', '1', 'yes', 'on')
+        self.explore_reverse_rear_clear_m = abs(float(
+            p('explore_reverse_rear_clear_m', 0.40).value))
+        self._blocked_since = None      # 车端闸"按住且不再发速度"的起始时刻
         self._rv_explore_count = 0
+        self._wedge_info = {}           # 触发时的判据快照（日志归因用）
         # 返航失败（manager 放弃等待人工）时允许连续小步倒车，每步仍 <=0.15 m、逐步雷达复核
         self.return_reverse_streak = int(p('return_reverse_streak', 4).value)
         self._rv_streak_left = 0
@@ -204,6 +216,7 @@ class EscapeSupervisor(Node):
         self._rv_moved = 0.0
         self._rv_count = 0
         self._rv_last_end = 0.0
+        self._rv_explore_phase = False   # 本次倒车属探索期(C)还是返航期
         self._rv_points = 0
         self.unit_anchor = None
         self.arm_clearance = None
@@ -311,6 +324,16 @@ class EscapeSupervisor(Node):
         except Exception:
             self.mode = ''
             self.state_name = self.nav_state.lower()
+        # C v2：车端闸"按住且不再发速度"的连续计时（吸收态的判据，用真实数据定的口径）
+        blob = (self.state_name + ' ' + self.mode).lower()
+        holding = ('blocked_waiting_clearance' in blob) or ('blocked_precheck' in blob) \
+            or ('safety_stop' in self.mode.lower())
+        quiet = (time.monotonic() - self.last_foreign_cmd) >= 1.0
+        if holding and quiet:
+            if self._blocked_since is None:
+                self._blocked_since = time.monotonic()
+        else:
+            self._blocked_since = None
 
     def on_status(self, m):
         busy = False
@@ -551,25 +574,37 @@ class EscapeSupervisor(Node):
                  cmd=[cv, cw], ret=self.in_return_phase(), why=why, rows=self._probe_rows)
 
     def explore_wedged(self, now):
-        """探索期是否已经"贴死且放弃前进"：前向间隙 < rotate_min_range 且静止 >= stall_sec。
+        """探索期"值得倒一小步"的判据（C v2，2026-10-26 用真实数据重定口径）。
 
-        2026-10-26 修两个潜伏 bug（提交 aeef06c 引入，17:08 之后 34+ 轮里本节点每次都在
-        第一次 tick 就崩：`explore_wedged(now)` 与 `def explore_wedged(self)` 签名不匹配，
-        且内部读的是不存在的 `_stuck_since`（真名 `stuck_since`）——即探索期脱困监督整体缺失，
-        所有在该时间窗内做的 A/B 都会被这个变量污染）。见 harness/test_method_calls.py 的回归守卫。
+        老口径（`front < rotate_min_range 0.34` + 必须 `stuck_since` 且非 nav_busy）在
+        156 个探索期 ≥10 s 停滞段里只覆盖 3%，且吸收态几乎总是"有活跃目标"，净触发≈0。
+        实测吸收态的定义特征是：
+          * `blocked_waiting_clearance` / `blocked_precheck_pending` / `mode=safety_stop`；
+          * **车端已经不再发速度**（cmd≈0，段内 |vx| 均值 0.004）；
+          * 段内 front20 中位 0.50 m、68% ≤0.70 m（车端安全闸 front_stop=0.65）。
+        因此判据改为"车端闸按住 + 静默 ≥ explore_reverse_block_sec + front ≤ explore_reverse_front_m"，
+        与 `stuck_since` 解耦（吸收态里车常在做原地微转，老计时被不断清零）。
         """
         if not self.explore_reverse_enabled:
             return False
-        if self.pose is None:
+        if self.pose is None or not self.points:
             return False
-        if self.nav_busy and 'blocked_waiting_clearance' not in self.state_name.lower() \
-                and 'safety_stop' not in self.mode.lower():
+        if now - self.points_stamp > self.scan_stale_sec:
             return False
-        stuck = self.stuck_since is not None and (now - self.stuck_since) >= self.stall_sec
-        if not stuck:
+        if self._blocked_since is None:
             return False
+        holding = now - self._blocked_since
+        if holding < self.explore_reverse_block_sec:
+            return False
+        if now - self.last_foreign_cmd < 1.0:
+            return False                      # 车端还在发速度：不抢
         front = self.range_cone(0.0, half_deg=20.0, stride=2)
-        return front < self.rotate_min_range
+        if front > self.explore_reverse_front_m:
+            return False                      # 前向不紧：倒车没意义（多半在等目标）
+        self._wedge_info = {'front20': round(front, 3), 'block_s': round(holding, 1),
+                            'nav': self.state_name[:28], 'mode': self.mode[:20],
+                            'busy': self.nav_busy}
+        return True
 
     def maybe_reverse_assist(self, now):
         explore = False
@@ -582,7 +617,10 @@ class EscapeSupervisor(Node):
         gave_up = ('failed_waiting_manual' in self.state_name.lower()
                    or 'manual' in self.state_name.lower())
         if self.nav_busy and not gave_up:
-            return False                     # 有活跃目标就让 Nav2 自己走
+            # 有活跃目标通常让 Nav2 自己走；但探索期的吸收态恰恰是"目标还在、车端已零速按住"，
+            # 所以 C v2 允许在"车端闸按住且静默"时接管（开关 explore_reverse_takeover_busy）。
+            if not (explore and self.explore_reverse_takeover_busy):
+                return False
         if explore:
             if self._rv_explore_count >= self.explore_reverse_max_count:
                 return False
@@ -597,22 +635,25 @@ class EscapeSupervisor(Node):
             return False
         if now - self.last_foreign_cmd < 1.0:
             return False
-        if now - self.last_motion < 2.0:
+        if now - self.last_motion < (1.0 if explore else 2.0):
             return False
         clear, npts = self.rear_clearance()
-        if npts < self.return_reverse_min_points:
+        need_pts = self.return_reverse_min_points
+        need_clear = self.explore_reverse_rear_clear_m if explore else self.return_reverse_rear_clear
+        if npts < need_pts:
             # 真机雷达后方是盲区：看不到就必须当作"不清空"，绝不倒车
             self.log(type='reverse_assist_refused', why='rear_unobserved',
                      rear_points=npts, rear_clear=round(clear, 3), nav=self.nav_state)
             self._rv_last_end = now + 30.0
             return False
-        if clear < self.return_reverse_rear_clear:
+        if clear < need_clear:
             self.log(type='reverse_assist_refused', why='rear_blocked',
                      rear_points=npts, rear_clear=round(clear, 3), nav=self.nav_state)
             self._rv_last_end = now + 10.0
             return False
         self.phase = 'reverse'
         self._rv_active = True
+        self._rv_explore_phase = explore
         self._rv_t0 = now
         self._rv_moved = 0.0
         self._rv_speed = self.explore_reverse_speed if explore else self.return_reverse_speed
@@ -628,7 +669,9 @@ class EscapeSupervisor(Node):
         self.log(type='reverse_assist_start', rear_points=npts,
                  rear_clear=round(clear, 3), nav=self.nav_state,
                  phase='explore' if explore else 'return',
-                 note=('探索期贴死（安全闸已放弃前进）：受控小步倒车'
+                 wedge=dict(self._wedge_info) if explore else None,
+                 note=('探索期贴死（车端闸按住且已静默 ≥%.1fs）：受控小步倒车'
+                       % self.explore_reverse_block_sec
                        if explore else '返航卡住（起点离占据格太近）：受控小步倒车'))
         return True
 
@@ -637,7 +680,9 @@ class EscapeSupervisor(Node):
             self.end_reverse(now, 'foreign_cmd')
             return
         clear, npts = self.rear_clearance()
-        if npts < self.return_reverse_min_points or clear < self.return_reverse_rear_clear:
+        need_clear = self.explore_reverse_rear_clear_m if self._rv_explore_phase \
+            else self.return_reverse_rear_clear
+        if npts < self.return_reverse_min_points or clear < need_clear:
             self.end_reverse(now, 'rear_blocked')
             return
         if self._rv_start is not None and self.pose is not None:
