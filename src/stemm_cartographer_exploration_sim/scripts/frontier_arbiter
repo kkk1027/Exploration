@@ -457,6 +457,8 @@ class Arbiter(Node):
         self._ff_actions = 0
         self._ff_last_action = 0.0
         self._ff_stuck_since = None
+        self._ff_blocked_since = None
+        self.ff_blocked_sec = float(p('failfast_blocked_sec', 15.0).value)
         self._pg_cancels = 0
         self._pg_logged_plan = None
         self.veto_min_esc = int(p('veto_min_esc_dirs', 3).value)
@@ -1801,7 +1803,19 @@ class Arbiter(Node):
             return
         front, nav, mode = self._ff_state()
         blocked = ('blocked_' in nav) or ('blocked_' in mode)
-        clear = blocked or (front is not None and front < self.ff_front)
+        # L1-b（2026-10-26 补）：车端自己进入 blocked_waiting_clearance 超过
+        # ff_blocked_sec（默认 15 s）也算"确定过不去"——实测 76 s / 125 s 那两次长停滞
+        # 就属于这一类（front 未进 0.60 m，旧判据漏检）。
+        if blocked:
+            if self._ff_blocked_since is None:
+                self._ff_blocked_since = now
+            if now - self._ff_blocked_since >= self.ff_blocked_sec:
+                clear = True
+            else:
+                clear = (front is not None and front < self.ff_front)
+        else:
+            self._ff_blocked_since = None
+            clear = front is not None and front < self.ff_front
         waiting = any(w in nav for w in FF_WAIT_WORDS) or any(w in mode for w in FF_WAIT_WORDS)
         if not clear or waiting:
             self._ff_stuck_since = None

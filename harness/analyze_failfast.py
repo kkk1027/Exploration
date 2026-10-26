@@ -83,7 +83,7 @@ WAIT_NAV = ('waiting_for_rrt_frontier', 'warming_up', 'canceled',
 
 
 def detect(rows, window=15.0, drift_m=0.20, path_m=None, intent_frac=0.0, front_m=0.60,
-           cooldown=20.0, need_state=True):
+           cooldown=20.0, need_state=True, blocked_sec=15.0):
     """L1-v2：「确定过不去」判定。返回命中列表 [(t_hit, x, y, drift, plen, front_med, state_share)]。"""
     hits = []
     last_hit = -1e9
@@ -117,6 +117,8 @@ def detect(rows, window=15.0, drift_m=0.20, path_m=None, intent_frac=0.0, front_
         blocked_nav = sum(1 for r in win if 'blocked_' in (r.get('nav') or '')) / len(win)
         near = drift <= drift_m
         clear = (front_med is not None and front_med < front_m) or blocked_nav >= 0.6
+        if not clear and blocked_nav >= 0.9 and (win[-1]['t'] - win[0]['t']) >= blocked_sec:
+            clear = True      # L1-b：车端自己 blocked 持续够久 = 确定过不去
         state_ok = (state_share >= 0.6) if need_state else True
         move_ok = True if path_m is None else (plen >= path_m)
         if near and clear and state_ok and move_ok:
