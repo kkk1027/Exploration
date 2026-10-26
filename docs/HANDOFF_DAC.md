@@ -93,3 +93,5 @@ python3 harness/analyze_stuck_clearance.py --glob 'logs/round_*'  # 卡点自由
 2. A 实现（按 §13），先 1 轮冒烟确认 `reject_noexit>0` 且接触 0，再 5 轮。
 3. D 克制版（§12.3 三选一）最后做，因为它的历史副作用最大。
 4. 全部完成后把 §12/§13 与实测数据合成 `docs/P9` 最终总结。
+
+> 操作细节见 `docs/WORKFLOW.md`（跑轮/批次/快测/看数/改参/自检/收工）。
