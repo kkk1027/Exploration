@@ -76,11 +76,13 @@ for i in $(seq "$START" "$(( START + N - 1 ))") ; do
   # 起栈期失败（gzserver 没起来 → preflight 超时）不算实验数据：删掉重来一次
   # 注意：不能匹配 "gzserver 已退出" —— 那是 round.sh 正常的收尾打印（踩过一次，
   # 把跑完整的轮次误判成起栈失败又重跑了一遍，白花 5 分钟）。只认"真起不来"的特征。
-  # 2026-10-26 追加：**节点猝死（Traceback）** 也判无效轮 —— aeef06c 让 escape_supervisor
-  # 每轮都崩，而 digest 照样判 PASS，34+ 轮 A/B 被污染。收尾时的 "-15/SIGTERM" 不算。
-  if grep -qE "sensor preflight timed out|Core sensor preflight failed|nav2 生命周期未在 guard 超时内激活|Traceback \(most recent call last\)|process has died .*exit code [1-9]" "$D/launch.log" 2>/dev/null \
+  # 2026-10-26 追加：**节点真崩** 也判无效轮 —— aeef06c 让 escape_supervisor 每轮都崩，
+  # 而 digest 照样判 PASS，34+ 轮 A/B 被污染。判据用 check_node_health.py：
+  # 只认异常行不在关停白名单里的 Traceback（ExternalShutdownException 等是收关噪声）。
+  if grep -qE "sensor preflight timed out|Core sensor preflight failed|nav2 生命周期未在 guard 超时内激活" "$D/launch.log" 2>/dev/null \
+     || ! python3 harness/check_node_health.py "$D/launch.log" --quiet \
      || ! [ -s "$D/timeline.jsonl" ] || ! [ -s "$D/digest.md" ]; then
-    echo "  ↻ $TAG 起栈失败/节点猝死，重跑一次" >> "$PROG"
+    echo "  ↻ $TAG 起栈失败/节点真崩，重跑一次" >> "$PROG"
     rm -rf "$D"
     pkill -x gzserver 2>/dev/null; rm -f /dev/shm/fastrtps_* 2>/dev/null; sleep 5
     RVIZ=true GUI=false VISION=1 POSE_OVERRIDE="0.0 0.0 0.0" ROUND_MARGIN="${ROUND_MARGIN:-90}" RECOVERY_BT="${RECOVERY_BT:-none}" \

@@ -524,54 +524,58 @@ class EscapeSupervisor(Node):
         return best, n
 
     def rev_probe_tick(self, now):
-        """只读探针（P9-C0）：吸收态时刻把 C 层每道闸门的原始读数记下来，不动作、不改状态。
+        """只读探针（P9-C0/C2）：把 C 层每道闸门此刻的读数与"会不会触发"记下来，不动作、不改状态。
 
-        记这一行的目的：现有 C 口径是"front < 0.34 m 且非 nav_busy"（escB 时代的旋转安全值），
-        而车端安全闸是 front_stop_distance=0.65 m，两者之间有一整段死区；同时吸收态的典型状态
-        恰恰是"有活跃目标 + blocked_waiting_clearance"。所以要先用真实分布回答三个问题：
-          ① 长停滞时 front20 到底落在哪（0.34 够不够、0.65 会不会太松）；
-          ② 长停滞时 busy / state / cmd 各是什么（能不能只凭 state 接管）；
-          ③ 后方 ±30° 是否看得见（rear_pts / rear_clear，决定倒车是否可行）。
+        触发条件与闸门解耦：只要"车端闸按住"或"受阻计时活跃"任一成立就记（吸收态里车常在做
+        原地微转，`stuck_since` 会被不断清零，只靠它会漏掉最关键的时刻）。
+        why 里列出当前**不满足**的闸门；空列表 = 若开关打开，这一次 tick 就会倒车（would_fire）。
         """
-        if self.stuck_since is None:
+        holding = self._blocked_since is not None
+        stalled = self.stuck_since is not None
+        if not (holding or stalled):
             return
         if now - self._rev_probe_last < self.rev_probe_dt:
             return
         self._rev_probe_last = now
-        stall = now - self.stuck_since
+        stall = (now - self.stuck_since) if stalled else None
+        hold_s = (now - self._blocked_since) if holding else None
         front20 = self.range_cone(0.0, half_deg=20.0, stride=2)
         min_all = self.min_range_all(stride=2)
         rear_clear, rear_pts = self.rear_clearance()
         st = (self.state_name or '').lower()
         md = (self.mode or '').lower()
-        gave_up = ('failed_waiting_manual' in st) or ('manual' in st)
+        quiet_s = now - self.last_foreign_cmd
         why = []
         if not self.explore_reverse_enabled:
             why.append('switch_off')
-        if self.nav_busy and ('blocked_waiting_clearance' not in st) and ('safety_stop' not in md):
-            why.append('not_blocked_state')
-        if self.nav_busy and not gave_up:
-            why.append('nav_busy_active_goal')
-        if front20 >= self.rotate_min_range:
-            why.append('front_ge_rotate_min')
+        if not holding or (hold_s is not None and hold_s < self.explore_reverse_block_sec):
+            why.append('not_holding_%s' % (round(hold_s or 0.0, 1)))
+        if front20 > self.explore_reverse_front_m:
+            why.append('front_gt_gate')
+        if quiet_s < 1.0:
+            why.append('cmd_active')
+        if self.nav_busy and not self.explore_reverse_takeover_busy:
+            why.append('busy_no_takeover')
         if self._rv_explore_count >= self.explore_reverse_max_count:
             why.append('count_exhausted')
         if rear_pts < self.return_reverse_min_points:
             why.append('rear_unobserved')
-        elif rear_clear < self.return_reverse_rear_clear:
+        elif rear_clear < self.explore_reverse_rear_clear_m:
             why.append('rear_blocked')
+        would = [w for w in why if w != 'switch_off']
         cv, cw = (None, None)
         if self.last_cmd is not None:
             cv, cw = round(self.last_cmd[0], 3), round(self.last_cmd[1], 3)
         self._probe_rows += 1
-        self.log(type='rev_probe', stall=round(stall, 2),
+        self.log(type='rev_probe', stall=None if stall is None else round(stall, 2),
+                 hold_s=None if hold_s is None else round(hold_s, 2),
                  front20=round(front20, 3), min_all=round(min_all, 3),
                  rear_clear=round(rear_clear, 3), rear_pts=rear_pts,
                  nav=(self.state_name or '')[:32], mode=(self.mode or '')[:24],
-                 busy=self.nav_busy, busy_s=round(now - self._busy_since, 1),
-                 quiet_s=round(now - self.last_foreign_cmd, 1),
+                 busy=self.nav_busy, quiet_s=round(quiet_s, 1),
                  motion_s=round(now - self.last_motion, 1),
-                 cmd=[cv, cw], ret=self.in_return_phase(), why=why, rows=self._probe_rows)
+                 cmd=[cv, cw], ret=self.in_return_phase(),
+                 why=why, would_fire=(not would), rows=self._probe_rows)
 
     def explore_wedged(self, now):
         """探索期"值得倒一小步"的判据（C v2，2026-10-26 用真实数据重定口径）。

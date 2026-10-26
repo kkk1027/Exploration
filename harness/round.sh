@@ -454,13 +454,13 @@ if [ -f "$OUT/launch.log" ]; then
   # tick 就 Traceback 退出；launch 不为这类可选节点设硬失败，整轮只是"少一个节点"，
   # digest 照样判 PASS —— 34+ 轮 A/B 因此被污染（详见 docs/P9 §14）。这里把它变成
   # 显性产物（dead_nodes.txt）+ 显著告警，后续再并入 digest 的失败项。
-  {
-    echo "# 节点猝死体检 $(date '+%F %T')"
-    echo "traceback_count=$(grep -c 'Traceback (most recent call last)' "$OUT/launch.log" 2>/dev/null || echo 0)"
-    grep -E 'process has died .*exit code [1-9]' "$OUT/launch.log" 2>/dev/null | sed 's/.*\[ERROR\] //' | sort -u
-  } > "$OUT/dead_nodes.txt"
-  if [ "$(sed -n 's/^traceback_count=//p' "$OUT/dead_nodes.txt")" != "0" ]; then
-    say "⚠ 本轮有节点猝死（Traceback），见 $OUT/dead_nodes.txt —— 该轮数据不可作为结论"
+  # 只认"真崩"：Traceback 块的异常行不在关停白名单里。
+  # （收关时 rclpy 每个节点都会打 ExternalShutdownException + exit code 1，那是正常噪声，
+  #  第一版体检把它当真崩 → 每轮都被判无效，批次白重跑。见 harness/check_node_health.py）
+  if timeout 60 python3 harness/check_node_health.py "$OUT/launch.log" > "$OUT/dead_nodes.txt" 2>&1; then
+    :
+  else
+    say "⚠ 本轮有节点真崩，见 $OUT/dead_nodes.txt —— 该轮数据不可作为结论"
   fi
   timeout 180 python3 harness/report.py "$OUT" "$TAG" > "$OUT/report.stdout" 2>&1 || true
   timeout 180 python3 harness/round_digest.py "$OUT" > "$OUT/digest.stdout" 2>&1 || true

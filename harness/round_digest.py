@@ -338,17 +338,15 @@ def main():
     dnp = os.path.join(d, 'dead_nodes.txt')
     if os.path.exists(dnp):
         for line in open(dnp, encoding='utf-8', errors='replace'):
-            line = line.strip()
+            line = line.rstrip('\n')
             if not line or line.startswith('#'):
                 continue
-            if line.startswith('traceback_count='):
-                try:
-                    if int(line.split('=', 1)[1] or 0) > 0:
-                        bad.append('node_crash')
-                except ValueError:
-                    pass
+            if line.startswith('traceback_blocks='):
+                if 'real_crash=0' not in line:
+                    bad.append('node_crash')
                 continue
-            dead.append(line)
+            if line.strip().startswith('✗'):
+                dead.append(line.strip())
     lines.append(f'- verdict: **{ev.get("verdict")}**　失败项: {bad if bad else "无"}')
     if dead:
         lines.append(f'- ⚠ 节点猝死: ' + '　'.join(x[:60] for x in dead[:3]))
