@@ -38,6 +38,10 @@ class SessionDriver(Node):
     def __init__(self):
         super().__init__('sim_session_driver')
         self.explore_sec = float(self.declare_parameter('explore_sec', 180.0).value)
+        # 用户 2026-10-26 追加规则：探索限时到时若"候选任务还在执行"，**不许中断它去返航**，
+        # 等这个候选到达/取消/失败之后再返航；0 = 关闭（旧行为），默认 20 s 上限兜底。
+        self.return_wait_goal = float(self.declare_parameter('return_wait_goal_sec', 20.0).value)
+        self._rwg_started = None
         self.map_out = self.declare_parameter(
             'map_out', '~/stemm_sim_ws/maps/explore_latest').value
         self.hard_warn = float(self.declare_parameter('hard_warn_sec', HARD_WARN_SEC).value)
@@ -143,6 +147,21 @@ class SessionDriver(Node):
         if self.t_first_goal is None:
             self.t_first_goal = now
             self.get_logger().info('=== 自主探索开始计时（收到第一个前沿目标）===')
+
+    def _goal_in_progress(self):
+        """候选任务是否还在执行（到达/取消/失败都算结束）。
+
+        依据 manager 的 nav_state JSON：nav_goal_active=True 且状态不是返航/收尾一类。
+        """
+        o = getattr(self, 'nav', None) or {}
+        if not o:
+            return False
+        if not bool(o.get('nav_goal_active')):
+            return False
+        blob = (str(o.get('mode') or '') + ' ' + str(o.get('navigation_state') or '')).lower()
+        if ('return' in blob) or ('home' in blob) or ('finalizing' in blob) or ('shutdown' in blob):
+            return False
+        return True
 
     def _on_nav_state(self, msg):
         raw = msg.data or ''
@@ -459,6 +478,17 @@ class SessionDriver(Node):
         # 阶段2：到点则触发"结束建图"（与实机同一条服务）
         if not self.done_sent:
             if now - self.t_first_goal >= self.explore_sec:
+                # 用户规则（2026-10-26）：正在执行的候选不许被打断 —— 等它到/取消/失败。
+                if self.return_wait_goal > 0 and self._goal_in_progress():
+                    if self._rwg_started is None:
+                        self._rwg_started = now
+                        self.get_logger().info(
+                            '=== 探索限时到（%.0fs）但候选任务仍在执行 → 等它结束再返航（上限 %.0fs）==='
+                            % (self.explore_sec, self.return_wait_goal))
+                    if now - self._rwg_started < self.return_wait_goal:
+                        return
+                    self.get_logger().warn(
+                        '=== 等待候选结束超时（%.0fs）→ 仍按原规则返航 ===' % self.return_wait_goal)
                 if self._standoff_pending:
                     arrived = (self.pose_xy is not None and self._standoff_target is not None
                                and math.hypot(self.pose_xy[0] - self._standoff_target[0],

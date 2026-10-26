@@ -216,6 +216,7 @@ def generate_launch_description():
         output='screen',
         parameters=[{'use_sim_time': use_sim_time,
                      'explore_sec': explore_sec,
+                     'return_wait_goal_sec': LaunchConfiguration('return_wait_goal_sec'),
                      'map_out': map_out}])
 
     # 就绪门闸脚本（仅保留供实验，不接进主链；见 stack_delay 的注释）
@@ -246,6 +247,8 @@ def generate_launch_description():
         DeclareLaunchArgument('spawn_y', default_value='0.0'),
         DeclareLaunchArgument('spawn_yaw', default_value='0.0'),
         DeclareLaunchArgument('explore_sec', default_value='180.0'),
+        DeclareLaunchArgument('return_wait_goal_sec', default_value='20.0',
+            description='探索限时到点时若候选仍在执行，等它结束再返航的上限秒数（0=关闭，旧行为）'),
         DeclareLaunchArgument('frontier_source', default_value='rrt'),
         DeclareLaunchArgument('auto_explore', default_value='true'),
         DeclareLaunchArgument('use_sim_time', default_value='true'),
