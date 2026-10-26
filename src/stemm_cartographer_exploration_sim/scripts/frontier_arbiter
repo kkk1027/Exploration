@@ -516,6 +516,20 @@ class Arbiter(Node):
         self.width_unknown_block = self._as_bool(p('width_unknown_block', False).value)
         if self.unknown_block:
             self.unknown_span_max = 0.0
+        # P9-A（用户 2026-10-26 批准的方向，2026-10-26 夜实测后重定义）：把"一刀切 pass_width
+        # 否决"换成"0.752 m 硬禁 + 1.6~1.05 m 带可退出性判定"。原因：pass_width=1.05 上线后
+        # rejected_narrow 涨到 587~671/轮（供给被掐掉一半），而真窄卡死仍有 19 次/14 轮；
+        # 单纯再加一条更低阈值的否决是空操作（<1.05 的路径早就被否决了）。所以 A 的语义是：
+        # * 路径最小净宽 < noexit_pinch_m(0.752) → 照旧硬否决（真挤不过去）；
+        # * 落在 [pinch, pass_width) → 判"能不能退出"：能退出就**放行**（恢复供给），
+        #   不能退出才否决并单独计 reject_noexit；这样才能同时压卡死与提高覆盖。
+        self.noexit_enabled = self._as_bool(p('noexit_enabled', False).value)
+        self.noexit_pinch_m = float(p('noexit_pinch_m', 0.752).value)
+        self.noexit_short_m = float(p('noexit_short_m', 0.35).value)
+        self.noexit_retreat_m = float(p('noexit_retreat_m', 1.20).value)
+        self.noexit_turn_m = float(p('noexit_turn_m', 0.81).value)
+        self.noexit_retreat_need_m = float(p('noexit_retreat_need_m', 1.00).value)
+        self._last_path_reject = None
         # 半径取 0.6 m："这一脚到那儿能不能转过身"，而不是"附近某处有片空地"。
         # 取 1.2 m 时实测 3 轮里一次都没触发（房间尺度上总能找到空地），等于没生效。
         self.return_scan_radius = float(p('return_scan_radius_m', 0.60).value)
@@ -1433,6 +1447,53 @@ class Arbiter(Node):
         tot = int(win.size) or 1
         return d, float(int(win.sum()) / tot)
 
+    def _noexit_verdict(self, wlist, step_m):
+        """A 层：沿途 pinch 的"可退出性"判定（docs/P9 §13.2；语义重定义见 __init__）。
+
+        wlist: [(宽度, 世界x, 世界y), ...] 与路径同序，索引 0 = 车这一侧。
+        返回 None = 所有 pinch 都能退出（放行，恢复供给）；否则返回 (wx, wy) =
+        第一个"进得去出不来"的 pinch 中点（调用方据此否决并计 reject_noexit）。
+        三条放行判据（任一成立即可）：① 穿透长度 <= noexit_short_m（只擦车角）；
+        ② 掉头空间：pinch 内存在 w >= noexit_turn_m（车对角线 0.81 m）；
+        ③ 回退空间：pinch 起点向车一侧 noexit_retreat_m 内，w >= pinch_m 的连续段
+        长度 >= noexit_retreat_need_m（能沿原路退出来）。
+        """
+        pinch = self.noexit_pinch_m
+        short = self.noexit_short_m
+        turn = self.noexit_turn_m
+        step = max(step_m, 1e-6)
+        back_n = max(1, int(round(self.noexit_retreat_m / step)))
+        need_n = max(2, int(round(self.noexit_retreat_need_m / step)))
+        n = len(wlist)
+        i = 0
+        while i < n:
+            if wlist[i][0] >= pinch:
+                i += 1
+                continue
+            j = i
+            while j + 1 < n and wlist[j + 1][0] < pinch:
+                j += 1
+            seg_len = (j - i + 1) * step
+            ok = seg_len <= short
+            if not ok:
+                ok = any(wlist[k][0] >= turn for k in range(i, j + 1))
+            if not ok:
+                run = best = 0
+                for k in range(max(0, i - back_n), i):
+                    if wlist[k][0] >= pinch:
+                        run += 1
+                        best = max(best, run)
+                    else:
+                        run = 0
+                ok = best >= need_n
+            if not ok:
+                self.stats['pinch_len_max'] = round(
+                    max(self.stats.get('pinch_len_max', 0.0), seg_len), 2)
+                m = (i + j) // 2
+                return (wlist[m][1], wlist[m][2])
+            i = j + 1
+        return None
+
     def path_and_width(self, x, y):
         """BFS 出整条路径，再沿路径查"垂直于路径的连续自由宽度"。
 
@@ -1541,6 +1602,7 @@ class Arbiter(Node):
             unknown_run = 0.0
             unknown_run_max = 0.0
             step_m = res
+            wlist = []          # A 层用：与路径同序的 (宽度, 世界x, 世界y)
             for i in idxs:
                 idx = path[i]
                 cx_, cy_ = idx % w, idx // w
@@ -1548,6 +1610,7 @@ class Arbiter(Node):
                 wyp_ = cy_ * res + oy
                 d, unk_ = self.clearance_at(field, wxp_, wyp_)
                 width_ = 2.0 * d                    # 自由带宽 ≈ 2×到最近障碍的距离
+                wlist.append((width_, wxp_, wyp_))
                 if width_ < min_w:
                     min_w, min_unk, min_at = width_, unk_, (wxp_, wyp_)
                 if width_ < self.pass_width:
@@ -1566,13 +1629,30 @@ class Arbiter(Node):
             self.stats['pass_unknown_max'] = round(
                 max(self.stats.get('pass_unknown_max', 0.0), unknown_run_max), 2)
             if min_at is None:
+                self._last_path_reject = None
                 return True, None, None, 0.0
-            if narrow_len_max_run > self.narrow_len_max:
+            if narrow_len_max_run > self.narrow_len_max and not self.noexit_enabled:
+                self._last_path_reject = 'narrow'
                 return True, min_at, min_w, min_unk      # 窄段太长 → 否决
             if unknown_run_max > self.unknown_span_max:
+                self._last_path_reject = 'unknown'
                 return True, min_at, min_w, min_unk      # 未知段太长 → 否决
             if min_w < self.pass_width:
+                # A 层（noexit_enabled）：pass_width 只做"上限"，真正的判据是"能不能退出"。
+                # 采样点不连续（超长路径截断）时放弃 A，退回原判据，避免把长度算错。
+                contiguous = (len(wlist) == len(path))
+                if self.noexit_enabled and contiguous and min_w >= self.noexit_pinch_m:
+                    self.stats['noexit_checked'] = self.stats.get('noexit_checked', 0) + 1
+                    bad_at = self._noexit_verdict(wlist, step_m)
+                    if bad_at is None:
+                        self.stats['noexit_passed'] = self.stats.get('noexit_passed', 0) + 1
+                        self._last_path_reject = None
+                        return True, None, min_w, min_unk   # 能退出 → 放行（恢复供给）
+                    self._last_path_reject = 'noexit'
+                    return True, bad_at, min_w, min_unk
+                self._last_path_reject = 'narrow'
                 return True, min_at, min_w, min_unk
+            self._last_path_reject = None
             return True, None, min_w, min_unk
 
         need = self.corridor_width
@@ -2063,8 +2143,12 @@ class Arbiter(Node):
                 self.note_refusal(gx, gy)
                 continue
             if narrow is not None:
-                self.stats['rejected_narrow'] += 1
-                self._note_uniq('rejected_narrow', gx, gy)
+                if self._last_path_reject == 'noexit':
+                    self.stats['reject_noexit'] = self.stats.get('reject_noexit', 0) + 1
+                    self._note_uniq('reject_noexit', gx, gy)
+                else:
+                    self.stats['rejected_narrow'] += 1
+                    self._note_uniq('rejected_narrow', gx, gy)
                 self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
                 self.note_refusal(gx, gy)
                 if (min_w is not None and min_w >= self.corridor_hard
@@ -2206,8 +2290,12 @@ class Arbiter(Node):
                 self.note_refusal(gx, gy)
                 continue
             if narrow is not None:
-                self.stats['rejected_narrow'] += 1
-                self._note_uniq('rejected_narrow', gx, gy)
+                if self._last_path_reject == 'noexit':
+                    self.stats['reject_noexit'] = self.stats.get('reject_noexit', 0) + 1
+                    self._note_uniq('reject_noexit', gx, gy)
+                else:
+                    self.stats['rejected_narrow'] += 1
+                    self._note_uniq('rejected_narrow', gx, gy)
                 self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
                 self.note_refusal(gx, gy)
                 # 软回退只允许"确实够宽、而且宽度不是靠未知格撑出来的"候选。
@@ -2306,8 +2394,12 @@ class Arbiter(Node):
                 self.note_refusal(gx, gy)
                 continue
             if narrow is not None:
-                self.stats['rejected_narrow'] += 1
-                self._note_uniq('rejected_narrow', gx, gy)
+                if self._last_path_reject == 'noexit':
+                    self.stats['reject_noexit'] = self.stats.get('reject_noexit', 0) + 1
+                    self._note_uniq('reject_noexit', gx, gy)
+                else:
+                    self.stats['rejected_narrow'] += 1
+                    self._note_uniq('rejected_narrow', gx, gy)
                 self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
                 self.note_refusal(gx, gy)
                 if fallback is None:
