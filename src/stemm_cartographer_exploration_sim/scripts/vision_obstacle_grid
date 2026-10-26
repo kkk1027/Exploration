@@ -100,6 +100,12 @@ class VisionObstacleGrid(Node):
         # P0-己：幽灵障碍——累积格若长期没被再次观测就淡出（0=永不衰减，维持旧行为）。
         # 视觉看到的是物体表面，家具被挪走后旧格会永久堵路；默认 120 s 慢衰减。
         d('decay_sec', 120.0)
+        # P9-⑧（2026-10-27 用户批准）：**累积层**（-> /vision/obstacle_cloud -> 全局代价地图）
+        # 的独立衰减窗口。原来累积层与实时层共用 decay_sec（实验口径 20 s），结果
+        # "视觉看到过的低矮物体"20 s 后就被遗忘，全局规划器随后直接横穿它
+        # （s0ar1：卡在健身器材上、轮子空转，而 /map 与雷达都认为那里是空的）。
+        # -1 = 沿用 decay_sec（保持旧行为）。
+        d('accum_decay_sec', -1.0)
 
         g = self.get_parameter
         self.cloud_topic = g('cloud_topic').value
@@ -121,6 +127,8 @@ class VisionObstacleGrid(Node):
         self.live_frame = str(g('live_frame').value or 'base_footprint')
         self.dilate = max(0, int(g('dilate_cells').value))
         self.decay = float(g('decay_sec').value)
+        _ad = float(g('accum_decay_sec').value)
+        self.accum_decay = _ad if _ad >= 0.0 else self.decay
 
         self.cells = set()
         self.hits = {}          # 格 → 被观测到的帧数（跨帧持久化）
@@ -276,15 +284,16 @@ class VisionObstacleGrid(Node):
     def publish_accum(self):
         if not self.cells:
             return
-        if self.decay > 0.0:
+        if self.accum_decay > 0.0:
             import time as _time
             now_t = _time.monotonic()
-            stale = [c for c in self.cells if now_t - self.seen_at.get(c, 0.0) > self.decay]
+            stale = [c for c in self.cells
+                     if now_t - self.seen_at.get(c, 0.0) > self.accum_decay]
             if stale:
                 for c in stale:
                     self.cells.discard(c)
                 self.get_logger().info('衰减移除 %d 个长期未再观测的障碍格（%.0fs 窗口）'
-                                       % (len(stale), self.decay))
+                                       % (len(stale), self.accum_decay))
         stamp = self.get_clock().now().to_msg()
         arr = np.fromiter((v for c in self.cells for v in c), dtype=np.int64,
                           count=2 * len(self.cells)).reshape(-1, 2)

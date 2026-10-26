@@ -83,6 +83,42 @@ BLOCK_G = f'''{SENT % "begin(global)"}
 {SENT % "end(global)"}
 '''
 
+# P9-⑧（2026-10-27 用户批准"先修1"）：全局代价地图的视觉层改用**累积云**且不清除。
+# 事故：s0ar1 车卡在健身器材上轮子空转，而 /map 与雷达都认为那里空（物体在扫描平面下）；
+# 视觉其实看到了它，但全局层用的是 live 云 + clearing + 5 m raytrace —— 车一离开，
+# 视觉障碍就被射线清掉，全局规划器随后直接横穿那里（用户看到的"红障碍被路径穿过去"）。
+# 累积云已由 vision_obstacle_grid 做过"2 帧确认 + 膨胀 + 独立衰减(accum_decay_sec)"，
+# 幽灵障碍问题由衰减窗口负责，不再靠 raytrace 清除。
+BLOCK_G_ACCUM = f'''{SENT % "begin(global)"}
+      {TAG_G}:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        combination_method: 1
+        # P9-⑧：累积云 + 不清除；不做 raytrace（否则会把累积记忆扫掉）
+        observation_sources: vision_accum
+        vision_accum:
+          topic: /vision/obstacle_cloud
+          data_type: "PointCloud2"
+          marking: True
+          clearing: False
+          min_obstacle_height: 0.05
+          max_obstacle_height: 0.85
+          obstacle_max_range: 30.0
+          obstacle_min_range: 0.0
+          raytrace_max_range: 0.0
+          raytrace_min_range: 0.0
+{SENT % "end(global)"}
+'''
+
+
+MODE = 'live'
+
+
+def sections():
+    g = BLOCK_G if MODE == 'live' else BLOCK_G_ACCUM
+    return [('local_costmap', TAG_L, BLOCK_L), ('global_costmap', TAG_G, g)]
+
+
 SECTIONS = [('local_costmap', TAG_L, BLOCK_L), ('global_costmap', TAG_G, BLOCK_G)]
 
 
@@ -147,7 +183,7 @@ def remove_tag(line, tag):
 
 def do_apply(lines):
     changed = False
-    for name, tag, block in SECTIONS:
+    for name, tag, block in sections():
         lo, hi = section_range(lines, name)
         i = find_plugins_line(lines, lo, hi)
         if tag not in plugin_list_of(lines[i]):
@@ -155,7 +191,18 @@ def do_apply(lines):
             changed = True
         # 块：不存在才追加（追加到该段的 always_send_full_costmap 之前）
         key = 'begin(local)' if name == 'local_costmap' else 'begin(global)'
-        if SENT % key not in '\n'.join(lines):
+        if SENT % key in '\n'.join(lines):
+            # 已注入：若内容与目标模式不一致（例如 live -> accum），就地替换整块
+            b, e = SENT % key, SENT % (key.replace('begin', 'end'))
+            try:
+                i = lines.index(b); j = lines.index(e, i)
+            except ValueError:
+                i = j = None
+            want = block.rstrip('\n').split('\n')
+            if i is not None and [x.rstrip() for x in lines[i:j + 1]] != [x.rstrip() for x in want]:
+                lines[i:j + 1] = want
+                changed = True
+        else:
             anchor = None
             for j in range(lo, hi):
                 if lines[j].lstrip().startswith('always_send_full_costmap'):
@@ -170,7 +217,7 @@ def do_apply(lines):
 
 def do_restore(lines):
     changed = False
-    for name, tag, block in SECTIONS:
+    for name, tag, block in sections():
         key = 'begin(local)' if name == 'local_costmap' else 'begin(global)'
         b, e = SENT % key, SENT % key.replace('begin', 'end')
         while b in lines:
@@ -194,7 +241,7 @@ def validate(text, expect_tags=True):
         return False, f'YAML 解析失败: {e}'
     if not expect_tags:
         return True, 'ok'
-    for name, tag, _ in SECTIONS:
+    for name, tag, _ in sections():
         sec = d.get(name) or {}
         inner = sec.get(name) or {}
         names = (inner.get('ros__parameters') or {}).get('plugins') or []
@@ -239,7 +286,12 @@ def main():
     ap.add_argument('--apply', action='store_true')
     ap.add_argument('--restore', action='store_true')
     ap.add_argument('--check', action='store_true')
+    ap.add_argument('--global-mode', choices=('live', 'accum'), default='live',
+                    help='global_costmap 的视觉层源：live=实时云+清除（旧行为）；'
+                         'accum=累积云+不清除（P9-⑧，治"视觉障碍被遗忘后路径横穿"）')
     a = ap.parse_args()
+    global MODE
+    MODE = a.global_mode
     path = target_path()
     text = open(path, encoding='utf-8').read()
     lines = text.split('\n')
@@ -253,7 +305,7 @@ def main():
         except Exception as e:
             print(f'  YAML: FAIL {e}')
             return 1
-        for name, tag, _ in SECTIONS:
+        for name, tag, _ in sections():
             names = d[name][name]['ros__parameters'].get('plugins')
             print(f'  {name}.plugins = {names}')
         return 0
@@ -266,7 +318,7 @@ def main():
     load_journal(path)
     if a.apply:
         # 记录注入前的原始 plugins 行（restore 时逐字节还原）
-        for name, tag, _ in SECTIONS:
+        for name, tag, _ in sections():
             lo, hi = section_range(lines, name)
             i = find_plugins_line(lines, lo, hi)
             if tag not in plugin_list_of(lines[i]) and name not in JOURNAL:
@@ -291,7 +343,7 @@ def main():
             pass
     print(f'  ✓ {"注入" if a.apply else "撤销"}完成')
     # 打印结果确认
-    for name, tag, _ in SECTIONS:
+    for name, tag, _ in sections():
         lo, hi = section_range(lines, name)
         i = find_plugins_line(lines, lo, hi)
         print(f'    {name}: {plugin_list_of(lines[i])}')
