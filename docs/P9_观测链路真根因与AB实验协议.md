@@ -207,3 +207,50 @@ python3 harness/batches/compare_batches.py base after
    **接近/对准/安全闸**问题，不是"通道太窄"。这正好指向唯一还没批准的动作：
    **受限倒车 `vx_min`（−0.08 m/s）**。
 3. 归因率（派发目标 ↔ 卡死事件的最近邻匹配 ≤4 m）：base 12%、after 14%，基本不变。
+
+---
+
+## 9. 只拉导航栈的现场验证（nav_verify，用户 2026-10-26 指示）
+
+> 用户原话："后续先只拉导航栈和 rviz2，我来验证效果。而不是重跑探索建图，
+> 因为和探索建图的关系不大，而是和 nav2 强相关。"
+
+```bash
+cd /home/kbf/stemm_exploration_sim_ws
+COST_INFL=1 VISION=1 GAZEBO_GUI=true RVIZ=true bash harness/nav_verify.sh
+# 对照（原厂代价地图参数）：COST_INFL=0 bash harness/nav_verify.sh
+```
+
+起的东西：Gazebo 世界 + 机器人 + 车端 nav2（`auto_explore:=false`，不会自己跑）+ RViz
++ `nav_plan_audit`。**没有**探索/仲裁/脱困监督参与，退出时自动撤销全部注入。
+
+当前注入的调优值（可直接 `ros2 param get` 核对）：
+
+| 参数 | 原厂 | 现在 | 含义 |
+| --- | --- | --- | --- |
+| `global inflation_layer.inflation_radius` | 0.4 | **1.0** | 1 m 内都算"贵" |
+| `global inflation_layer.cost_scaling_factor` | 3.0 | **1.2** | 代价衰减更慢 ⇒ 离障碍远才便宜 |
+| `footprint_padding`（两个 costmap） | 无(0.01) | **0.10** | 内切 0.235→0.335 ⇒ 净宽 <0.67 m 直接致命 |
+| `local inflation_radius / scaling` | 0.45 / 3.0 | 未动 | 局部跟线仍要灵活 |
+| `vx_max` | 0.5 | 0.35 | 冲死角速度 |
+
+验证方法（现场）：
+
+1. RViz 里用 **2D Goal Pose** 给一个目标（最好挑"明明有宽路可选"的点）；
+2. 终端立刻出现一行体检结论，例如实测样例：
+   `[plan#4] 137 点(跳过起点 11) 最小净宽 0.20 m @(-0.88,-0.82) 窄于判据的连续段 0.85 m
+    / 比车还窄的点 6 个 → ✗ 穿窄处（判据 净宽≥1.05、车宽 0.47、窄段≤1.00；累计 2/4 条穿窄处）`
+3. RViz 里 `/plan` 是橙色粗线；`/plan_audit/markers` 把窄处点画成红点、整条计划最窄点画成球
+   （黄=仅窄于判据，橙=比车还窄）。
+4. 把目标稍微挪一点再给一次，比较两次的最小净宽 —— 可以直接看出"换条路会不会更宽"。
+
+日志：`logs/nav_verify_<HHMMSS>/launch.log`、`plan_audit.jsonl`（每次计划一行结构化记录）。
+
+起栈踩过的三个坑（已在 launch 里修）：
+
+* 缺 `sim_shims` 垫片 → `system_preflight` 报 `wheeltec-robot.service is not active` 直接拆栈；
+* 车端栈与 Gazebo 同时启动 → `sensor_preflight` 8 s 等不到 odom（改成延迟 12 s 起）；
+* RViz 被 SIGINT 后刷 `failed to create guard condition`（拆栈后的噪声，不是根因）。
+
+尚未做的对照（下一轮）：同一 `nav_verify` 里跑 `COST_INFL=0` 与 `=1` 各一组目标，
+统计"计划最小净宽中位数 / 穿窄处比例"，把这套代价调参的影响量成数字。
