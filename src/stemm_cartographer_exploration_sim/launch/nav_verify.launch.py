@@ -15,9 +15,11 @@
 """
 import os
 
-from ament_index_python.packages import get_package_share_directory
+from ament_index_python.packages import get_package_prefix, get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import (DeclareLaunchArgument, IncludeLaunchDescription,
+                            SetEnvironmentVariable, TimerAction)
+from launch.substitutions import EnvironmentVariable
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
@@ -49,11 +51,18 @@ def generate_launch_description():
             'auto_explore': 'false',
         }.items())
 
+    # 车端 system_preflight 会校验 wheeltec-robot.service 等现场服务；
+    # 仿真里必须把 sim_shims 垫片前置到 PATH，否则 preflight 直接失败把整栈拆掉
+    # （第一次起 nav_verify 就栽在这：'wheeltec-robot.service is not active'）。
+    shim_dir = os.path.join(get_package_prefix('stemm_cartographer_exploration_sim'),
+                            'lib', 'stemm_cartographer_exploration_sim', 'sim_shims')
+
     audit = Node(package='stemm_cartographer_exploration_sim',
                  executable='nav_plan_audit', name='nav_plan_audit', output='screen',
                  parameters=[{'use_sim_time': use_sim_time,
                               'pass_width': LaunchConfiguration('pass_width'),
                               'narrow_len_max': LaunchConfiguration('narrow_len_max'),
+                              'car_width': LaunchConfiguration('car_width'),
                               'log_path': LaunchConfiguration('plan_audit_log')}])
 
     rviz = Node(package='rviz2', executable='rviz2', name='rviz2', output='screen',
@@ -62,6 +71,7 @@ def generate_launch_description():
                 condition=IfCondition(LaunchConfiguration('rviz')))
 
     return LaunchDescription([
+        SetEnvironmentVariable('PATH', [shim_dir, ':', EnvironmentVariable('PATH')]),
         DeclareLaunchArgument(
             'world',
             default_value='/home/kbf/stemm_sim_ws/install/wheeltec_two_wheel_model/share/'
@@ -72,6 +82,12 @@ def generate_launch_description():
         DeclareLaunchArgument('use_sim_time', default_value='true'),
         DeclareLaunchArgument('pass_width', default_value='1.05'),
         DeclareLaunchArgument('narrow_len_max', default_value='1.00'),
+        DeclareLaunchArgument('car_width', default_value='0.47'),
         DeclareLaunchArgument('plan_audit_log', default_value=''),
-        robot, stack, audit, rviz,
+        robot,
+        # 车端栈必须**等机器人把传感器喂起来**再起：sensor_preflight 只等 8 s，
+        # 和 Gazebo 同时启动会撞上"odom 还没动"直接判死（实测连续两次整栈被拆掉）。
+        DeclareLaunchArgument('stack_delay', default_value='12.0'),
+        TimerAction(period=LaunchConfiguration('stack_delay'), actions=[stack]),
+        audit, rviz,
     ])

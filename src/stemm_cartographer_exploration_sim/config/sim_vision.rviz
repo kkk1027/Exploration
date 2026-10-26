@@ -267,6 +267,35 @@ Visualization Manager:
     - Class: rviz_default_plugins/Path
       Alpha: 1
       Buffer Length: 1
+      Color: 255; 170; 0
+      Enabled: true
+      Line Style: Lines
+      Line Width: 0.08
+      Name: nav2 全局计划 /plan
+      Pose Style: None
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /plan
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: 计划窄处标记 /plan_audit/markers
+      Namespaces: {}
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /plan_audit/markers
+      Value: true
+    - Class: rviz_default_plugins/Path
+      Alpha: 1
+      Buffer Length: 1
       Class: rviz_default_plugins/Path
       Color: 0; 255; 0
       Enabled: true

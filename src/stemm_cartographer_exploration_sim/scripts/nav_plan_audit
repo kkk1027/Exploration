@@ -36,9 +36,13 @@ class PlanAudit(Node):
         p = self.declare_parameter
         p('pass_width', 1.05)
         p('narrow_len_max', 1.00)
+        p('car_width', 0.47)
+        p('skip_start_m', 0.60)
         p('log_path', '')
         p('sample_step_m', 0.05)
         self.pass_w = float(self.get_parameter('pass_width').value)
+        self.car_w = float(self.get_parameter('car_width').value)
+        self.skip_start = float(self.get_parameter('skip_start_m').value)
         self.narrow_max = float(self.get_parameter('narrow_len_max').value)
         self.log_path = str(self.get_parameter('log_path').value or '')
         self.step_m = float(self.get_parameter('sample_step_m').value)
@@ -121,35 +125,47 @@ class PlanAudit(Node):
         step = max(1, int(round(self.step_m / (self.field[3] or 0.05))))
         min_w, min_at = 9.9, None
         narrow_run = run_max = 0.0
+        hard_pts = 0
         bad_marks = []
+        x0, y0 = pts[0]
+        skipped = 0
         for k in range(0, len(pts), step):
             x, y = pts[k]
+            # 起点 0.6 m 内跳过：车自己周围几帧没建图，距离场会量成"很窄"，纯属噪声
+            if math.hypot(x - x0, y - y0) < self.skip_start:
+                skipped += 1
+                continue
             wd = self.width_at(x, y)
             if wd is None:
                 return
             if wd < min_w:
                 min_w, min_at = wd, (x, y)
+            if wd < self.car_w:
+                hard_pts += 1
             if wd < self.pass_w:
                 narrow_run += self.step_m
                 run_max = max(run_max, narrow_run)
                 bad_marks.append((x, y))
             else:
                 narrow_run = 0.0
-        bad = run_max > self.narrow_max
+        if min_at is None:
+            return
+        # 判穿窄处：① 有一段持续窄于判据；② 有任何一点窄到"比车还窄"（硬违规）
+        bad = (run_max > self.narrow_max) or (hard_pts > 0)
         self.n_plans += 1
         if bad:
             self.n_bad += 1
         self.get_logger().info(
-            '[plan#%d] %d 点 最小净宽 %.2f m @(%.2f,%.2f) 最长窄段 %.2f m → %s'
-            '（判据 净宽≥%.2f / 窄段≤%.2f；累计 %d/%d 条穿窄处）'
-            % (self.n_plans, len(pts), min_w,
-               min_at[0] if min_at else float('nan'),
-               min_at[1] if min_at else float('nan'),
-               run_max, '✗ 穿窄处' if bad else '✓ 通过',
-               self.pass_w, self.narrow_max, self.n_bad, self.n_plans))
+            '[plan#%d] %d 点(跳过起点 %d) 最小净宽 %.2f m @(%.2f,%.2f) '
+            '窄于判据的连续段 %.2f m / 比车还窄的点 %d 个 → %s'
+            '（判据 净宽≥%.2f、车宽 %.2f、窄段≤%.2f；累计 %d/%d 条穿窄处）'
+            % (self.n_plans, len(pts), skipped, min_w, min_at[0], min_at[1],
+               run_max, hard_pts, '✗ 穿窄处' if bad else '✓ 通过',
+               self.pass_w, self.car_w, self.narrow_max, self.n_bad, self.n_plans))
         if self.jsonl:
             self.jsonl.write(json.dumps({'t': round(time.time(), 2), 'n': self.n_plans,
                                          'min_w': round(min_w, 3), 'narrow_run': round(run_max, 3),
+                                         'hard_pts': hard_pts,
                                          'bad': bad, 'min_at': min_at,
                                          'goal': [round(pts[-1][0], 2), round(pts[-1][1], 2)]})
                              + '\n')
