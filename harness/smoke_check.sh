@@ -74,6 +74,7 @@ fi
 
 echo "[smoke] 6) 离线不变量（打分/仲裁签名，<1 秒）"
 W=/home/kbf/stemm_exploration_sim_ws
+if python3 "$W/harness/test_arbiter_attrs.py" >/dev/null 2>&1; then ok "仲裁无幽灵属性（只读未声明）"; else bad "仲裁存在只读未声明的属性（运行到该分支必崩）"; fi
 if python3 "$W/harness/test_arbiter_static.py" >/dev/null 2>&1; then ok "仲裁 path_and_width 签名一致"; else bad "仲裁返回值/调用点签名不一致（会直接崩）"; fi
 if python3 "$W/harness/test_scoring.py" >/dev/null 2>&1; then ok "打分内核离线断言通过"; else bad "打分内核离线断言失败"; fi
 if python3 "$W/harness/test_launch_dryrun.py" >/dev/null 2>&1; then ok "launch 可构造（干跑）"; else bad "launch 构造失败（import/类型错）"; fi

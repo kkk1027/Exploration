@@ -349,6 +349,11 @@ class Arbiter(Node):
         # D1：末端也查（原来 skip=1.2 m 会整段跳过目标点附近）；保留参数名做兼容，
         # 但语义改为"末端额外加密采样距离"，不再"跳过"。
         self.corridor_tail_dense = float(p('corridor_tail_dense_m', 0.8).value)
+        # 2026-10-26 修：这个属性一直"只有使用、没有声明"（历史遗留）。
+        # 只要 path_and_width 走到"没有净空场"的回退分支就 AttributeError，
+        # 把仲裁节点当场打死 —— 车端于是拿不到任何新目标，
+        # 用户看到的就是"路径不刷新、车长时间卡住"。默认 0.0：整条路径都查。
+        self.corridor_skip_far = float(p('corridor_skip_far_m', 0.0).value)
         # D2/D3：用"到最近障碍的距离"代替轴向法向扫线（斜通道不再被高估 1.41 倍），
         # 障碍集合 = /map 占据 ∪ 视觉障碍栅格占据
         self.clearance_mode = str(p('clearance_mode', 'distance').value).lower()
@@ -1589,6 +1594,8 @@ class Arbiter(Node):
         """异步可达性校验：返回 future 或 None（不可用/已有在途请求）"""
         if self.pending is not None:
             return None
+        if getattr(self, 'cli', None) is None:      # 服务客户端从未创建（历史遗留），直接放弃
+            return
         if not self.cli.service_is_ready():
             if not self.cli.wait_for_service(timeout_sec=0.2):
                 return None
