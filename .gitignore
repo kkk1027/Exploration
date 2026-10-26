@@ -8,3 +8,9 @@ __pycache__/
 # 方案A 生成物（可回退补丁的备份/journal，不入库）
 patches/*.vision_backup.yaml
 patches/*.vision_journal.json
+
+# 可回退补丁的运行期备份（由 patch_*.py 生成，可随时重建）
+patches/*.journal.json
+patches/*.pristine.*
+patches/*.pristine.yaml
+patches/*.pristine.xml

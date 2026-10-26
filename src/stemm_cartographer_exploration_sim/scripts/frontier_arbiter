@@ -464,6 +464,8 @@ class Arbiter(Node):
         self.escape_max_dist = float(p('escape_max_dist_m', 1.60).value)
         self.escape_cooldown = float(p('escape_cooldown_sec', 8.0).value)
         self.escape_max_total = int(p('escape_max_total', 20).value)
+        # P9-⑤(b)：脱困落点是否必须留出掉头空间（默认开）
+        self.escape_need_turn = bool(p('escape_need_turn', True).value)
         self._esc_last = 0.0
         self._esc_count = 0
         self.corridor_stride = max(1, int(p('corridor_stride_cells', 2).value))
@@ -1131,6 +1133,13 @@ class Arbiter(Node):
                 d_here = float(dist_m[cj, ci])
                 if 2.0 * d_here < self.escape_min_clearance:
                     continue
+                # P9-⑤(b)：脱困目标是"挪出去"用的，落点必须**转得动身**
+                # （差速车对角线 0.81 m，掉头空间 < return_turn_width 就是换个地方继续卡）。
+                # 原来只查了净空 escape_min_clearance(0.55) < 0.85，等于没管掉头。
+                if self.escape_need_turn:
+                    turn = self.turn_space_near(gx, gy)
+                    if turn is not None and turn < self.return_turn_width:
+                        continue
                 ok, narrow, _min_w, _unk = self.path_and_width(gx, gy)
                 if not ok or narrow is not None:
                     continue
