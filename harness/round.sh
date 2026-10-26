@@ -3,7 +3,16 @@
 # 用法: round.sh <标签> <探索秒数> [启动后等待秒数(仅空跑用)]
 # 产物: runs/<时间戳>-<标签>.jsonl 摘要 + logs/round_<时间戳>_<标签>/launch.log
 set +u
-unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy ROS_LOCALHOST_ONLY
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
+# ---- DDS 只走回环（2026-10-26）----
+# 事故：机器切到手机热点（172.20.10.5/28）之后，组播发现时好时坏 ——
+#   `ros2 node list`=0 但 `service list`=200+、`ros2 param set` 全部超时、
+#   TF 消息收不到（RViz 里"TF 断了"）、guard 判 TF 不健康把整栈拆掉。
+# 本仓库的仿真全在本机，所以强制 ROS_LOCALHOST_ONLY=1（走 shm/loopback），
+# 彻底不依赖网卡。需要跨机看 RViz 时用 SIM_REMOTE=1 关掉本保护。
+if [ "${SIM_REMOTE:-0}" != "1" ]; then
+  export ROS_LOCALHOST_ONLY=1
+fi
 source /home/kbf/stemm_sim_ws/domain_guard.sh || exit 9
 source /opt/ros/humble/setup.bash
 source /home/kbf/stemm_sim_ws/install/setup.bash
