@@ -153,6 +153,26 @@ if [ "$(python3 -c "print(1 if float('$GRACE_SEC')>0 else 0)")" = "1" ]; then
   python3 harness/patch_car_launch.py --apply --grace "$GRACE_SEC" --rrt-wait "$RRT_WAIT" --front-stop "${FRONT_STOP:-0}" 2>&1 | tee -a "$OUT/harness.log"
   say "返航姿态宽限：${GRACE_SEC}s（原厂 6 s；GRACE_SEC=0 可关）｜RRT 等待窗口：${RRT_WAIT:-0}s｜front_stop=${FRONT_STOP:-原厂0.65}"
   trap 'python3 /home/kbf/stemm_exploration_sim_ws/harness/patch_car_launch.py --restore >/dev/null 2>&1; python3 /home/kbf/stemm_exploration_sim_ws/harness/patch_nav_speed.py --restore >/dev/null 2>&1; python3 /home/kbf/stemm_exploration_sim_ws/harness/vision_nav_params.py --restore >/dev/null 2>&1' EXIT INT TERM
+
+# ---- P9 ①②: Nav2 恢复动作 / 重规划节拍（两项独立开关，逐字节可回退）----
+# RECOVERY_BT=replan → 只提重规划节拍(1.0 Hz)，恢复动作仍是原厂 Wait(2)
+# RECOVERY_BT=spin   → 额外把 Wait(2) 换成受限 Spin（会改变位姿；实测在墙角顶死时
+#                      会拿"物理接触"换位移，必须能和只提节拍分开验证）
+# RECOVERY_BT=off    → 显式还原成原厂（Wait + 0.3 Hz）；不设=不动这个文件
+RECOVERY_BT="${RECOVERY_BT:-none}"
+case "$RECOVERY_BT" in
+  replan)
+    python3 harness/patch_recovery_bt.py --apply --spin off --replan-hz "${REPLAN_HZ:-1.0}" 2>&1 | tee -a "$OUT/harness.log"
+    rec '"check":"recovery_bt","mode":"replan"';;
+  spin)
+    python3 harness/patch_recovery_bt.py --apply --spin on --spin-dist "${SPIN_DIST:-0.6}" --spin-time "${SPIN_TIME:-6.0}" --replan-hz "${REPLAN_HZ:-1.0}" 2>&1 | tee -a "$OUT/harness.log"
+    rec '"check":"recovery_bt","mode":"spin"';;
+  off)
+    python3 harness/patch_recovery_bt.py --restore 2>&1 | tee -a "$OUT/harness.log"
+    rec '"check":"recovery_bt","mode":"off"';;
+  *) : ;;
+esac
+say "Nav2 恢复动作/节拍：RECOVERY_BT=$RECOVERY_BT（none 表示不加补丁）"
 fi
 
 say "视觉层 VISION=$VISION"
