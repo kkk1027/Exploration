@@ -626,6 +626,7 @@ class Arbiter(Node):
         self.stats = {'seen': 0, 'rejected_size': 0, 'rejected_path': 0,
                       'rejected_black': 0, 'published': 0,
                       'rejected_narrow': 0, 'narrow_fallback': 0, 'narrow_blocked_all': 0,
+                      'reject_noexit': 0, 'noexit_passed': 0, 'noexit_checked': 0,
                       'gate_reject': 0, 'gate_penalized': 0,
                       'escape_zones': 0}
 
@@ -1393,6 +1394,11 @@ class Arbiter(Node):
                 'fallback_obs': self.stats.get('fallback_obs', 0),
                 'rejected_narrow': self.stats.get('rejected_narrow', 0),
                 'rejected_oneway': self.stats.get('rejected_oneway', 0),
+                # P9-A 观测：A 打开后必须能看到"救回多少供给 / 否决多少不可退出"
+                'reject_noexit': self.stats.get('reject_noexit', 0),
+                'noexit_passed': self.stats.get('noexit_passed', 0),
+                'noexit_checked': self.stats.get('noexit_checked', 0),
+                'pinch_len_max': self.stats.get('pinch_len_max', 0.0),
             }
             if extra:
                 row.update(extra)
