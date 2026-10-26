@@ -170,7 +170,8 @@ def generate_launch_description():
                                'low_z_max': 0.35,
                                'dump_path': LaunchConfiguration('vision_dump'),
                                'decay_sec': LaunchConfiguration('vision_decay_sec'),
-                               'accum_decay_sec': LaunchConfiguration('vision_accum_decay_sec')}])
+                               'accum_decay_sec': LaunchConfiguration('vision_accum_decay_sec'),
+                               'low_accum_decay_sec': LaunchConfiguration('vision_low_accum_decay_sec')}])
 
     # P1-2：静止看门狗 —— 车端前向安全闸会让 nav2 "在导航但不动"，这里 5 s 级识别并自愈
     watchdog = Node(package='stemm_cartographer_exploration_sim',
@@ -416,6 +417,8 @@ def generate_launch_description():
             description='生命周期 nudge 事件 JSONL 路径（空=只打日志）'),
         DeclareLaunchArgument('vision', default_value='false',
             description='是否启动视觉障碍源（方案A）。nav2 图层注入需同时 apply 参数补丁'),
+        DeclareLaunchArgument('vision_low_accum_decay_sec', default_value='120.0',
+            description='P9-⑧b：低矮带累积记忆窗口（s）'),
         DeclareLaunchArgument('vision_accum_decay_sec', default_value='-1.0',
             description='P9-⑧：累积视觉层（-> 全局代价地图）的独立衰减窗口，-1=沿用 vision_decay_sec'),
         DeclareLaunchArgument('vision_decay_sec', default_value='0.0',

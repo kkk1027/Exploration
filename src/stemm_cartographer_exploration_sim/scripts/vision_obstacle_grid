@@ -106,6 +106,13 @@ class VisionObstacleGrid(Node):
         # （s0ar1：卡在健身器材上、轮子空转，而 /map 与雷达都认为那里是空的）。
         # -1 = 沿用 decay_sec（保持旧行为）。
         d('accum_decay_sec', -1.0)
+        # P9-⑧b（2026-10-27 用户批准"继续"）：**低矮带单独累积**。
+        # 上一步（全带累积 120 s）机制没错但覆盖 -17.8%，因为高带视觉点太多、太吵。
+        # 而雷达看不见的恰恰只有低矮带（z 0.05~0.35 m：哑铃、器材底座、床头柜脚）——
+        # 高障碍雷达自己就能看见，无需视觉再记一遍。故只把低矮带做"累积+不清除"，
+        # 高带仍走 live（局部体素层）。代价最小、最对准事故类型。
+        d('low_accum_topic', '/vision/low_accum_cloud')
+        d('low_accum_decay_sec', 120.0)
 
         g = self.get_parameter
         self.cloud_topic = g('cloud_topic').value
@@ -129,8 +136,11 @@ class VisionObstacleGrid(Node):
         self.decay = float(g('decay_sec').value)
         _ad = float(g('accum_decay_sec').value)
         self.accum_decay = _ad if _ad >= 0.0 else self.decay
+        self.low_accum_decay = float(g('low_accum_decay_sec').value)
 
         self.cells = set()
+        self.low_cells = set()      # 低矮带累积格（-> 全局代价地图的"视觉低障碍"层）
+        self.low_seen = {}          # 低矮带格 -> 最后观测时刻
         self.hits = {}          # 格 → 被观测到的帧数（跨帧持久化）
         self.seen_at = {}       # 格 → 最后一次被观测的 monotonic 时间（衰减用）
         self.last_live = np.zeros((0, 3), dtype=np.float64)
@@ -152,6 +162,8 @@ class VisionObstacleGrid(Node):
         self.pub_live = self.create_publisher(PointCloud2, g('live_topic').value, qos_vis)
         self.pub_cloud = self.create_publisher(PointCloud2, g('cloud_topic_out').value, qos_vis)
         self.pub_low = self.create_publisher(PointCloud2, g('low_topic').value, qos_vis)
+        self.pub_low_accum = self.create_publisher(
+            PointCloud2, g('low_accum_topic').value, qos_vis)
         self.pub_grid = self.create_publisher(OccupancyGrid, g('grid_topic').value, qos_map)
 
         self.tf_buffer = tf2_ros.Buffer()
@@ -247,6 +259,22 @@ class VisionObstacleGrid(Node):
         else:
             self.last_low = np.zeros((0, 3), dtype=np.float64)
 
+        # 低矮带累积（P9-⑧b）：只记 z∈[low_z_min, low_z_max] 的格
+        if self.last_low.shape[0]:
+            lx = np.floor(self.last_low[:, 0] / self.res).astype(np.int64)
+            ly = np.floor(self.last_low[:, 1] / self.res).astype(np.int64)
+            OFF2 = 1 << 20
+            base2 = 2 * OFF2
+            k2 = (lx + OFF2) * base2 + (ly + OFF2)
+            u2, c2 = np.unique(k2, return_counts=True)
+            g2 = u2[c2 >= self.min_pts]
+            if g2.size:
+                import time as _time2
+                t2 = _time2.monotonic()
+                for c in zip((g2 // base2 - OFF2).tolist(), (g2 % base2 - OFF2).tolist()):
+                    self.low_seen[c] = t2
+                    self.low_cells.add(c)
+
         keep2 = keep & (dist >= self.range_min)
         if not keep2.any():
             return
@@ -313,6 +341,30 @@ class VisionObstacleGrid(Node):
         pts[:, 1] = (arr[:, 1] + 0.5) * self.res
         pts[:, 2] = self.obstacle_z
         self.pub_cloud.publish(cloud_msg(pts, self.global_frame, stamp))
+        self._publish_low_accum(stamp)
+
+    def _publish_low_accum(self, stamp):
+        """低矮带累积云（P9-⑧b）：给全局代价地图当"雷达看不见的低障碍"记忆层。"""
+        if not self.low_cells:
+            return
+        if self.low_accum_decay > 0.0:
+            import time as _time
+            now_t = _time.monotonic()
+            stale = [c for c in self.low_cells
+                     if now_t - self.low_seen.get(c, 0.0) > self.low_accum_decay]
+            if stale:
+                for c in stale:
+                    self.low_cells.discard(c)
+                    self.low_seen.pop(c, None)
+                self.get_logger().info('低矮带累积移除 %d 格（%.0fs 窗口）'
+                                       % (len(stale), self.low_accum_decay))
+        arr = np.fromiter((v for c in self.low_cells for v in c), dtype=np.int64,
+                          count=2 * len(self.low_cells)).reshape(-1, 2)
+        pts = np.empty((arr.shape[0], 3), dtype=np.float32)
+        pts[:, 0] = (arr[:, 0] + 0.5) * self.res
+        pts[:, 1] = (arr[:, 1] + 0.5) * self.res
+        pts[:, 2] = 0.08            # 明确落在低矮带高度，供全局层按 z 过滤
+        self.pub_low_accum.publish(cloud_msg(pts, self.global_frame, stamp))
         self.stats['pub_grid'] += 1
         self.publish_grid(arr, stamp)
 

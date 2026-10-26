@@ -111,11 +111,36 @@ BLOCK_G_ACCUM = f'''{SENT % "begin(global)"}
 '''
 
 
+BLOCK_G_LOWACCUM = f'''{SENT % "begin(global)"}
+      {TAG_G}:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        combination_method: 1
+        # P9-⑧b：只把**低矮带**累积云（z 0.05~0.35 m，雷达扫描平面以下）写进全局代价地图，
+        # 不清除、不做 raytrace —— 这是雷达唯一"看不见"的部分；高障碍交回雷达自己记。
+        # 相比全带累积（§20，覆盖 -17.8%），代价最小、最对准"哑铃/器材底座/床头柜"这类事故。
+        observation_sources: vision_low_accum
+        vision_low_accum:
+          topic: /vision/low_accum_cloud
+          data_type: "PointCloud2"
+          marking: True
+          clearing: False
+          min_obstacle_height: 0.02
+          max_obstacle_height: 0.45
+          obstacle_max_range: 30.0
+          obstacle_min_range: 0.0
+          raytrace_max_range: 0.0
+          raytrace_min_range: 0.0
+{SENT % "end(global)"}
+'''
+
+
 MODE = 'live'
 
 
 def sections():
-    g = BLOCK_G if MODE == 'live' else BLOCK_G_ACCUM
+    g = {'live': BLOCK_G, 'accum': BLOCK_G_ACCUM,
+         'lowaccum': BLOCK_G_LOWACCUM}.get(MODE, BLOCK_G)
     return [('local_costmap', TAG_L, BLOCK_L), ('global_costmap', TAG_G, g)]
 
 
@@ -286,9 +311,10 @@ def main():
     ap.add_argument('--apply', action='store_true')
     ap.add_argument('--restore', action='store_true')
     ap.add_argument('--check', action='store_true')
-    ap.add_argument('--global-mode', choices=('live', 'accum'), default='live',
+    ap.add_argument('--global-mode', choices=('live', 'accum', 'lowaccum'), default='live',
                     help='global_costmap 的视觉层源：live=实时云+清除（旧行为）；'
-                         'accum=累积云+不清除（P9-⑧，治"视觉障碍被遗忘后路径横穿"）')
+                         'accum=全带累积云+不清除（P9-⑧，覆盖退化）；'
+                         'lowaccum=仅低矮带累积（P9-⑧b，推荐试）')
     a = ap.parse_args()
     global MODE
     MODE = a.global_mode
