@@ -63,6 +63,8 @@ def generate_launch_description():
                               'pass_width': LaunchConfiguration('pass_width'),
                               'narrow_len_max': LaunchConfiguration('narrow_len_max'),
                               'car_width': LaunchConfiguration('car_width'),
+                              'veto': LaunchConfiguration('plan_veto'),
+                              'veto_max': LaunchConfiguration('plan_veto_max'),
                               'log_path': LaunchConfiguration('plan_audit_log')}])
 
     rviz = Node(package='rviz2', executable='rviz2', name='rviz2', output='screen',
@@ -83,6 +85,9 @@ def generate_launch_description():
         DeclareLaunchArgument('pass_width', default_value='1.05'),
         DeclareLaunchArgument('narrow_len_max', default_value='1.00'),
         DeclareLaunchArgument('car_width', default_value='0.47'),
+        DeclareLaunchArgument('plan_veto', default_value='true',
+            description='计划穿窄处时直接取消该目标（"宁可不走"）；false=只报警'),
+        DeclareLaunchArgument('plan_veto_max', default_value='10'),
         DeclareLaunchArgument('plan_audit_log', default_value=''),
         robot,
         # 车端栈必须**等机器人把传感器喂起来**再起：sensor_preflight 只等 8 s，

@@ -55,9 +55,9 @@ fi
 # 视觉累积格衰减（0=不衰减）
 VDEC="${VISION_DECAY:-20.0}"
 
-echo "[nav_verify] 世界=$WORLD  判据 pass_width=${PASS_W} m  视觉层=$VISION  膨胀注入=$COST_INFL"
+echo "[nav_verify] 世界=$WORLD  判据 pass_width=${PASS_W} m  视觉层=$VISION  膨胀注入=$COST_INFL  计划否决=${PLAN_VETO:-true}"
 echo "[nav_verify] 日志目录：$LOG"
 ros2 launch stemm_cartographer_exploration_sim nav_verify.launch.py \
   world:="$WORLD" gazebo_gui:="$GAZEBO_GUI" rviz:="$RVIZ" \
-  pass_width:="$(awk -v v="$PASS_W" 'BEGIN{printf "%.4f", v}')" \
+  pass_width:="$(awk -v v="$PASS_W" 'BEGIN{printf "%.4f", v}')" plan_veto:="${PLAN_VETO:-true}" \
   plan_audit_log:="$LOG/plan_audit.jsonl" 2>&1 | tee "$LOG/launch.log"

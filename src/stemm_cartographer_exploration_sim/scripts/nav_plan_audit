@@ -37,12 +37,17 @@ class PlanAudit(Node):
         p('pass_width', 1.05)
         p('narrow_len_max', 1.00)
         p('car_width', 0.47)
+        p('veto', False)          # 计划穿窄处时直接取消当前导航目标（"宁可不走"）
+        p('veto_max', 10)
         p('skip_start_m', 0.60)
         p('log_path', '')
         p('sample_step_m', 0.05)
         self.pass_w = float(self.get_parameter('pass_width').value)
         self.car_w = float(self.get_parameter('car_width').value)
         self.skip_start = float(self.get_parameter('skip_start_m').value)
+        self.veto = bool(self.get_parameter('veto').value)
+        self.veto_max = int(self.get_parameter('veto_max').value)
+        self.n_veto = 0
         self.narrow_max = float(self.get_parameter('narrow_len_max').value)
         self.log_path = str(self.get_parameter('log_path').value or '')
         self.step_m = float(self.get_parameter('sample_step_m').value)
@@ -58,10 +63,14 @@ class PlanAudit(Node):
         self.create_subscription(OccupancyGrid, '/map', self.on_map, qmap)
         self.create_subscription(Path, '/plan', self.on_plan, 5)
         self.mark_pub = self.create_publisher(MarkerArray, '/plan_audit/markers', 5)
+        from action_msgs.srv import CancelGoal
+        self.cancel_cli = self.create_client(CancelGoal, '/navigate_to_pose/_action/cancel_goal')
         self.create_timer(1.0, self.tick)
         self.get_logger().info(
-            'nav_plan_audit 就绪：判据 净宽≥%.2f m、最长窄段≤%.2f m（看 /plan 是不是在钻窄缝）'
-            % (self.pass_w, self.narrow_max))
+            'nav_plan_audit 就绪：判据 净宽≥%.2f m、车宽 %.2f m、最长窄段≤%.2f m；'
+            '穿窄处时%s' % (self.pass_w, self.car_w, self.narrow_max,
+                          '**直接取消目标**（veto=%d 次上限）' % self.veto_max if self.veto
+                          else '只报警不拦截'))
 
     # ---------- 距离场 ----------
     def on_map(self, m):
@@ -170,7 +179,30 @@ class PlanAudit(Node):
                                          'goal': [round(pts[-1][0], 2), round(pts[-1][1], 2)]})
                              + '\n')
             self.jsonl.flush()
+        if bad and self.veto and self.n_veto < self.veto_max:
+            self.cancel_goal(min_w, run_max, hard_pts)
         self.publish_marks(bad_marks[::3], min_at, bad)
+
+    def cancel_goal(self, min_w, run_max, hard_pts):
+        """取消当前 NavigateToPose 目标（"这条计划不许走"），并计数。"""
+        try:
+            from action_msgs.msg import GoalInfo
+            from action_msgs.srv import CancelGoal
+            from unique_identifier_msgs.msg import UUID
+            if not self.cancel_cli.service_is_ready() and \
+                    not self.cancel_cli.wait_for_service(timeout_sec=1.0):
+                self.get_logger().warn('取消失败：cancel_goal 服务不可达')
+                return
+            req = CancelGoal.Request()
+            # 传全零 UUID = 取消该 action 下**所有**目标（nav_verify 里目标都是手动给的）
+            req.goal_info = GoalInfo(goal_id=UUID(uuid=[0] * 16))
+            self.cancel_cli.call_async(req)
+            self.n_veto += 1
+            self.get_logger().warn(
+                '✗✗ 计划穿窄处（最小净宽 %.2f m、窄段 %.2f m、比车还窄 %d 点）→ 已取消该目标；'
+                '第 %d 次（上限 %d）' % (min_w, run_max, hard_pts, self.n_veto, self.veto_max))
+        except Exception as exc:                # noqa: BLE001
+            self.get_logger().warn('取消失败：%s' % exc)
 
     def publish_marks(self, narrow_pts, min_at, bad):
         arr = MarkerArray()
