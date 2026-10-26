@@ -415,6 +415,16 @@ class Arbiter(Node):
         # InvalidParameterTypeException 把整个仲裁节点打死（实测第 1 轮即崩）。
         # 所以默认值用 bool，并同时容忍字符串/数字写法。
         self.veto_enabled = self._as_bool(p('veto_enabled', False).value)
+        # P9-⑥（用户 2026-10-26："路径永远不经过略宽于车身的窄处"）
+        # 候选闸门查的是**仲裁器自己 BFS 出来的那条路**，而真正开的是 nav2 planner
+        # 在代价地图上算出的 /plan —— 不是同一条路。这里对 /plan 再做一次体检：
+        #   plan_guard_log  : 只记录（每轮统计计划的最小净宽 / 最长窄段）
+        #   plan_guard_veto : 命中判据就取消目标（"宁可不走"）
+        self.plan_guard_log = self._as_bool(p('plan_guard_log', False).value)
+        self.plan_guard_veto = self._as_bool(p('plan_guard_veto', False).value)
+        self.plan_guard_max_cancel = int(p('plan_guard_max_cancel', 6).value)
+        self._pg_cancels = 0
+        self._pg_logged_plan = None
         self.veto_min_esc = int(p('veto_min_esc_dirs', 3).value)
         self.veto_occ_max = float(p('veto_occ_frac_max', 0.30).value)
         self.veto_self_r = float(p('veto_self_radius_m', 0.60).value)
@@ -966,13 +976,69 @@ class Arbiter(Node):
             return False
         return True
 
+    def plan_width_profile(self, poses):
+        """沿 nav2 规划出的 /plan 逐点查净宽 → (min_w, 最长窄段 m, 未知占比最大值)。"""
+        field = self.clearance_field()
+        if field is None or not poses:
+            return None
+        res = field[3]
+        step = max(1, int(round(0.05 / res)))
+        min_w = 9.9
+        narrow_len = narrow_max = 0.0
+        unk_max = 0.0
+        for i, ps in enumerate(poses):
+            if i % step:
+                continue
+            d, unk = self.clearance_at(field, float(ps.pose.position.x),
+                                       float(ps.pose.position.y))
+            wd = 2.0 * d
+            if wd < min_w:
+                min_w = wd
+            if wd < self.pass_width:
+                narrow_len += 0.05
+                narrow_max = max(narrow_max, narrow_len)
+            else:
+                narrow_len = 0.0
+            if unk > 0.5:
+                unk_max = max(unk_max, unk)
+        return min_w, narrow_max, unk_max
+
     def on_plan(self, m):
         """V2-③：拿 /plan 的末位点当"正在执行的目标"，命中硬闸门就取消。
 
         只处理"不是本节点派的"目标 —— 自己派的点在派发时已经过闸门，
         再 veto 一次等于自己打自己，还会把派发节奏搞乱。
+        例外：P9-⑥ 的 plan_guard 对所有计划（含自己派的）做窄处体检。
         """
-        if not self.veto_enabled or not m.poses:
+        if not m.poses:
+            return
+        if self.plan_guard_log or self.plan_guard_veto:
+            prof = self.plan_width_profile(m.poses)
+            if prof is not None:
+                min_w, narrow_run, unk_share = prof
+                key = (round(min_w, 2), len(m.poses))
+                if key != self._pg_logged_plan:
+                    self._pg_logged_plan = key
+                    self.stats['plan_min_w'] = round(min_w, 2)
+                    self.stats['plan_narrow_run'] = round(narrow_run, 2)
+                    bad = (narrow_run > self.narrow_len_max) or (unk_share > 0.5)
+                    if bad:
+                        self.stats['plan_narrow_plans'] = self.stats.get('plan_narrow_plans', 0) + 1
+                    self.get_logger().info(
+                        '计划窄处体检：/plan %d 点，最小净宽 %.2f m，最长窄段 %.2f m'
+                        '（pass_width=%.2f / narrow_len_max=%.2f）→ %s'
+                        % (len(m.poses), min_w, narrow_run, self.pass_width,
+                           self.narrow_len_max, '穿窄处' if bad else 'OK'))
+                    if bad and self.plan_guard_veto \
+                            and self._pg_cancels < self.plan_guard_max_cancel:
+                        self._pg_cancels += 1
+                        self.stats['plan_veto'] = self.stats.get('plan_veto', 0) + 1
+                        self.get_logger().warn(
+                            '✗ 计划穿窄处（最窄 %.2f m、窄段 %.2f m）→ 取消该目标；第 %d 次'
+                            % (min_w, narrow_run, self._pg_cancels))
+                        self._do_veto_cancel()
+                        return
+        if not self.veto_enabled:
             return
         try:
             pos = m.poses[-1].pose.position

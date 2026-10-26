@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""nav_plan_audit —— 只看 nav2 规划出的 /plan，量它有没有"穿窄处"（可视化 + 日志）。
+
+用户 2026-10-26 的判断是"车明明有更宽的路却偏要钻窄缝"。这个节点把这件事变成
+可以**当场看见**的东西，而不是等整轮跑完看报告：
+
+  * 订阅 /map（SLAM 实时地图）→ 每 1 s 重算一张"到最近障碍的距离场"；
+  * 订阅 /plan（nav2 全局规划结果）→ 沿路径每 5 cm 取点，算自由净宽 = 2×距离；
+  * 终端打印一行：`[plan] 48 点 最小净宽 0.62 m @(x,y) → 穿窄处（判据 1.05 m）`
+  * 把"窄处"点发布成 RViz MarkerArray（红球）+ 把整条计划的最窄点发布成黄球，
+    这样在 RViz 里一眼就能看出规划器挑了一条怎样的缝；
+  * 同时计数：本轮/本次会话 共几条计划、其中几条穿窄处，退出时汇总。
+
+参数：pass_width（判据，默认 1.05）、narrow_len_max（最长允许窄段，默认 1.00）、
+      log_path（可选 JSONL）。
+"""
+import json
+import math
+import os
+import time
+from collections import deque
+
+import numpy as np
+import rclpy
+from geometry_msgs.msg import Point
+from nav_msgs.msg import OccupancyGrid, Path
+from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from std_msgs.msg import ColorRGBA
+from visualization_msgs.msg import Marker, MarkerArray
+
+
+class PlanAudit(Node):
+    def __init__(self):
+        super().__init__('nav_plan_audit')
+        p = self.declare_parameter
+        p('pass_width', 1.05)
+        p('narrow_len_max', 1.00)
+        p('log_path', '')
+        p('sample_step_m', 0.05)
+        self.pass_w = float(self.get_parameter('pass_width').value)
+        self.narrow_max = float(self.get_parameter('narrow_len_max').value)
+        self.log_path = str(self.get_parameter('log_path').value or '')
+        self.step_m = float(self.get_parameter('sample_step_m').value)
+        self.field = None            # (dist_m, ox, oy, res, w, h)
+        self.field_stamp = 0.0
+        self.map_msg = None
+        self.n_plans = 0
+        self.n_bad = 0
+        self.last_sig = None
+        self.jsonl = open(self.log_path, 'a', encoding='utf-8') if self.log_path else None
+        qmap = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                          durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.create_subscription(OccupancyGrid, '/map', self.on_map, qmap)
+        self.create_subscription(Path, '/plan', self.on_plan, 5)
+        self.mark_pub = self.create_publisher(MarkerArray, '/plan_audit/markers', 5)
+        self.create_timer(1.0, self.tick)
+        self.get_logger().info(
+            'nav_plan_audit 就绪：判据 净宽≥%.2f m、最长窄段≤%.2f m（看 /plan 是不是在钻窄缝）'
+            % (self.pass_w, self.narrow_max))
+
+    # ---------- 距离场 ----------
+    def on_map(self, m):
+        self.map_msg = m
+
+    def build_field(self):
+        if self.map_msg is None:
+            return
+        m = self.map_msg
+        w, h = m.info.width, m.info.height
+        res = m.info.resolution
+        ox, oy = m.info.origin.position.x, m.info.origin.position.y
+        data = np.array(m.data, dtype=np.int16).reshape(h, w)
+        # PGM/栅格：>=50 占据、<0 未知。未知按障碍处理（"没看清就不许钻"）
+        occ = (data >= 50) | (data < 0)
+        INF = 1 << 20
+        d = np.full((h, w), INF, dtype=np.int32)
+        q = deque()
+        ys, xs = np.nonzero(occ)
+        for j, i in zip(ys.tolist(), xs.tolist()):
+            d[j, i] = 0
+            q.append((j, i))
+        cap = int(2.5 / res)
+        while q:
+            j, i = q.popleft()
+            base = d[j, i] + 1
+            if base > cap:
+                continue
+            for dj, di in ((1, 0), (-1, 0), (0, 1), (0, -1),
+                           (1, 1), (1, -1), (-1, 1), (-1, -1)):
+                nj, ni = j + dj, i + di
+                if 0 <= nj < h and 0 <= ni < w and d[nj, ni] > base:
+                    d[nj, ni] = base
+                    q.append((nj, ni))
+        self.field = (d.astype(np.float32) * res, ox, oy, res, w, h)
+        self.field_stamp = time.time()
+
+    def width_at(self, x, y):
+        if self.field is None:
+            return None
+        dist, ox, oy, res, w, h = self.field
+        i = int((x - ox) / res)
+        j = int((y - oy) / res)
+        if not (0 <= i < w and 0 <= j < h):
+            return 0.0
+        return 2.0 * float(dist[j, i])
+
+    def tick(self):
+        if self.field is None or time.time() - self.field_stamp > 1.0:
+            self.build_field()
+
+    # ---------- 计划体检 ----------
+    def on_plan(self, m):
+        if not m.poses or self.field is None:
+            return
+        pts = [(float(ps.pose.position.x), float(ps.pose.position.y)) for ps in m.poses]
+        sig = (len(pts), round(pts[0][0], 2), round(pts[-1][0], 2), round(pts[-1][1], 2))
+        if sig == self.last_sig:
+            return
+        self.last_sig = sig
+        step = max(1, int(round(self.step_m / (self.field[3] or 0.05))))
+        min_w, min_at = 9.9, None
+        narrow_run = run_max = 0.0
+        bad_marks = []
+        for k in range(0, len(pts), step):
+            x, y = pts[k]
+            wd = self.width_at(x, y)
+            if wd is None:
+                return
+            if wd < min_w:
+                min_w, min_at = wd, (x, y)
+            if wd < self.pass_w:
+                narrow_run += self.step_m
+                run_max = max(run_max, narrow_run)
+                bad_marks.append((x, y))
+            else:
+                narrow_run = 0.0
+        bad = run_max > self.narrow_max
+        self.n_plans += 1
+        if bad:
+            self.n_bad += 1
+        self.get_logger().info(
+            '[plan#%d] %d 点 最小净宽 %.2f m @(%.2f,%.2f) 最长窄段 %.2f m → %s'
+            '（判据 净宽≥%.2f / 窄段≤%.2f；累计 %d/%d 条穿窄处）'
+            % (self.n_plans, len(pts), min_w,
+               min_at[0] if min_at else float('nan'),
+               min_at[1] if min_at else float('nan'),
+               run_max, '✗ 穿窄处' if bad else '✓ 通过',
+               self.pass_w, self.narrow_max, self.n_bad, self.n_plans))
+        if self.jsonl:
+            self.jsonl.write(json.dumps({'t': round(time.time(), 2), 'n': self.n_plans,
+                                         'min_w': round(min_w, 3), 'narrow_run': round(run_max, 3),
+                                         'bad': bad, 'min_at': min_at,
+                                         'goal': [round(pts[-1][0], 2), round(pts[-1][1], 2)]})
+                             + '\n')
+            self.jsonl.flush()
+        self.publish_marks(bad_marks[::3], min_at, bad)
+
+    def publish_marks(self, narrow_pts, min_at, bad):
+        arr = MarkerArray()
+        head = Marker()
+        head.header.frame_id = 'map'
+        head.header.stamp = self.get_clock().now().to_msg()
+        head.action = Marker.DELETEALL
+        arr.markers.append(head)
+        if narrow_pts:
+            mk = Marker()
+            mk.header = head.header
+            mk.ns = 'narrow'
+            mk.id = 1
+            mk.type = Marker.SPHERE_LIST
+            mk.action = Marker.ADD
+            mk.scale.x = mk.scale.y = mk.scale.z = 0.10
+            mk.color = ColorRGBA(r=1.0, g=0.15, b=0.15, a=0.85)
+            mk.points = [Point(x=float(x), y=float(y), z=0.10) for x, y in narrow_pts[:400]]
+            arr.markers.append(mk)
+        if min_at:
+            mk2 = Marker()
+            mk2.header = head.header
+            mk2.ns = 'min'
+            mk2.id = 2
+            mk2.type = Marker.SPHERE
+            mk2.action = Marker.ADD
+            mk2.pose.position = Point(x=float(min_at[0]), y=float(min_at[1]), z=0.20)
+            mk2.pose.orientation.w = 1.0
+            mk2.scale.x = mk2.scale.y = mk2.scale.z = 0.22
+            mk2.color = ColorRGBA(r=1.0, g=0.85, b=0.1, a=0.95) if not bad \
+                else ColorRGBA(r=1.0, g=0.4, b=0.0, a=0.95)
+            arr.markers.append(mk2)
+        self.mark_pub.publish(arr)
+
+    def destroy_node(self):
+        try:
+            self.get_logger().info('会话汇总：%d 条计划，其中 %d 条穿窄处（判据 净宽≥%.2f m、窄段≤%.2f m）'
+                                   % (self.n_plans, self.n_bad, self.pass_w, self.narrow_max))
+        except Exception:                       # noqa: BLE001
+            pass
+        super().destroy_node()
+
+
+def main():
+    rclpy.init()
+    node = PlanAudit()
+    try:
+        rclpy.spin(node)
+    except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
+        pass
+    finally:
+        node.destroy_node()
+        try:
+            rclpy.shutdown()
+        except Exception:                       # noqa: BLE001
+            pass
+
+
+if __name__ == '__main__':
+    main()

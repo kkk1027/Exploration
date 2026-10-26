@@ -113,6 +113,9 @@ def generate_launch_description():
                                 'veto_occ_frac_max': LaunchConfiguration('veto_occ_max'),
                                 'veto_max_per_session': LaunchConfiguration('veto_max'),
                                 'veto_cooldown_sec': LaunchConfiguration('veto_cooldown'),
+                                # P9-⑥：对 nav2 实际规划出的 /plan 做窄处体检（可选强制取消）
+                                'plan_guard_log': LaunchConfiguration('plan_guard_log'),
+                                'plan_guard_veto': LaunchConfiguration('plan_guard_veto'),
                                 # V1 闸门（落点级）：与 veto 搭配才覆盖全部派发通道
                                 'gate_enabled': LaunchConfiguration('gate'),
                                 'gate_esc_dirs_min': LaunchConfiguration('gate_min_esc'),
@@ -185,6 +188,11 @@ def generate_launch_description():
                                    'recovery_timeout_sec': LaunchConfiguration('supervisor_recovery_timeout'),
                                    'rotate_min_range': LaunchConfiguration('supervisor_rotate_min_range'),
                                    'advance_stop_range': LaunchConfiguration('supervisor_advance_stop_range'),
+                                   # P9-⑤（用户 2026-10-26 批准"短距离小速度倒车"）：探索期受控小步倒车
+                                   'explore_reverse_enabled': LaunchConfiguration('supervisor_explore_reverse'),
+                                   'explore_reverse_max_m': LaunchConfiguration('supervisor_explore_reverse_max_m'),
+                                   'explore_reverse_speed': LaunchConfiguration('supervisor_explore_reverse_speed'),
+                                   'explore_reverse_max_count': LaunchConfiguration('supervisor_explore_reverse_max_count'),
                                    'log_path': LaunchConfiguration('supervisor_log')}])
 
 
@@ -280,6 +288,10 @@ def generate_launch_description():
             description='后置 veto 每局最多否决次数'),
         DeclareLaunchArgument('veto_cooldown', default_value='10.0',
             description='后置 veto 冷却秒数（两次否决之间的最小间隔）'),
+        DeclareLaunchArgument('plan_guard_log', default_value='false',
+            description='P9-⑥：记录 nav2 /plan 的最小净宽与最长窄段（False=不体检）'),
+        DeclareLaunchArgument('plan_guard_veto', default_value='false',
+            description='P9-⑥：计划穿窄处时取消该目标（宁可不走）'),
         DeclareLaunchArgument('scoring', default_value='v1',
             description='前沿收益函数版本：v1=未知格数/就近（历史实测口径），v2=邻域未知占比，'
                         'v3=朝前未知+贴已知边界（此前从未真正生效，需单独 A/B）'),
@@ -289,6 +301,14 @@ def generate_launch_description():
             description='脱困旋转时"扫过扇区"的最小测距门槛（低于此值不转）'),
         DeclareLaunchArgument('supervisor_advance_stop_range', default_value='0.34',
             description='脱困前进时前向 ±45° 的最小测距门槛'),
+        DeclareLaunchArgument('supervisor_explore_reverse', default_value='false',
+            description='P9：探索期是否允许脱困监督做一次受控小步倒车（雷达复核后方净空；用户 2026-10-26 批准）'),
+        DeclareLaunchArgument('supervisor_explore_reverse_max_m', default_value='0.15',
+            description='探索期受控倒车单步上限（m）'),
+        DeclareLaunchArgument('supervisor_explore_reverse_speed', default_value='0.06',
+            description='探索期受控倒车速度（m/s，小速度）'),
+        DeclareLaunchArgument('supervisor_explore_reverse_max_count', default_value='4',
+            description='探索期受控倒车每局步数上限'),
         DeclareLaunchArgument('supervisor_recovery_timeout', default_value='40.0',
             description='累计受阻多少秒后退出脱困（用户要求的 40 s 兜底）'),
         DeclareLaunchArgument('explore_backstep', default_value='1',

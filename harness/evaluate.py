@@ -110,6 +110,18 @@ if probe and os.path.exists(probe):
     # 放行条件严格对齐批准口径：patch 明确开启 + 单次 <=0.20 m（含余量）+ 每轮 <=2 次（车端 max_per_session=2）；
     # 其余仍按违规计（盲退 / 超包络 / 次数超限）。
     backstep_on = '探索期受控小步倒车已启用' in txt
+    # 2026-10-26（用户批准"短距离小速度倒车"）：MPPI 的 vx_min 从 0.0 开到 -0.08 后，
+    # 控制器**自己**就能在贴脸时后退一点。它与"脱困监督的受控小步"是两条独立通道，
+    # 所以给一套**独立包络**：单窗口 <=0.15 m、探索期累计 <=0.60 m（0.08 m/s × 数秒）。
+    # 判据来源是被注入的参数文件里的哨兵（不是日志文本），避免"说了但没落地"。
+    _navp = ('/home/kbf/wheeltec_ros2/src/stemm_cartographer_exploration/config/'
+             'stemm_safe_nav2_params.yaml')
+    mppi_rev_on = False
+    try:
+        if os.path.exists(_navp):
+            mppi_rev_on = 'sim_patch(vx_min)' in open(_navp, encoding='utf-8').read()
+    except OSError:
+        mppi_rev_on = False
     max_win = max(rev_dists) if rev_dists else 0.0
     # 2026-10-25 修：倒车审计必须**区分阶段**。
     # 之前把"探索期小步倒车"的包络（单次 <=0.20、整轮 <=0.50）套到**返航期**
@@ -146,12 +158,16 @@ if probe and os.path.exists(probe):
     # 会混进前一段的残余运动（vf1r7 单窗 0.257 m），按"命令值"从严会把合法脱困判违规。
     return_ok = (return_assist_m > 0.0 and return_assist_m <= 1.60
                  and max_win <= 0.30 and explore_rev_m <= 0.50)
-    authorized = (explore_ok if rev_hard > 0 else False) or return_ok
+    # MPPI 受限倒车包络（只在"开了 vx_min 注入"的轮次里生效）
+    mppi_ok = bool(mppi_rev_on and max_win <= 0.15 and explore_rev_m <= 0.60)
+    authorized = ((explore_ok or mppi_ok) if rev_hard > 0 else False) or return_ok
     collision['reverse_return_assist_m'] = round(return_assist_m, 2)
     collision['reverse_explore_m'] = round(explore_rev_m, 2)
     collision['backstep_enabled'] = backstep_on
     collision['reverse_max_window_m'] = max_win
     collision['reverse_authorized'] = authorized
+    collision['mppi_reverse_enabled'] = mppi_rev_on
+    collision['mppi_reverse_ok'] = mppi_ok
     checks['no_reverse'] = (collision['reverse_hard_windows'] == 0) or authorized
 
 # ---- 方案A：视觉层（只在 vision:=true 的轮次要求）----

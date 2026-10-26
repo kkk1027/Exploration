@@ -25,18 +25,25 @@ NEED = 0.90
 
 
 def bfs_clearance(occ, res, cap=2.0):
+    """到最近占据格的**切比雪夫距离场**（单位：格，整数）。
+
+    2026-10-26 事故：原来用 float32 逐格累加 0.05 做松弛（`d[nj,ni] > d[j,i]+res`），
+    浮点漂移会让 `>` 反复成立、格子被无限重复入队 —— 单轮就挂了 10 分钟以上，
+    整批"卡住点宽度分布"因此一直没跑出来（而结论表里还在引用旧数字）。
+    改成整数格数 BFS：精确、单轮 < 0.2 s。返回值仍换算成米（2×clearance）。
+    """
     H, W = occ.shape
-    INF = 1e9
-    d = np.full((H, W), INF, dtype=np.float32)
+    cap_cells = max(1, int(round(cap / res)))
+    d = np.full((H, W), cap_cells + 1, dtype=np.int32)
     q = deque()
     for j in range(H):
         for i in np.nonzero(occ[j])[0]:
-            d[j, i] = 0.0
+            d[j, i] = 0
             q.append((j, i))
     while q:
         j, i = q.popleft()
-        base = d[j, i] + res
-        if base > cap:
+        base = d[j, i] + 1
+        if base > cap_cells:
             continue
         for dj, di in ((1, 0), (-1, 0), (0, 1), (0, -1),
                        (1, 1), (1, -1), (-1, 1), (-1, -1)):
@@ -44,7 +51,7 @@ def bfs_clearance(occ, res, cap=2.0):
             if 0 <= nj < H and 0 <= ni < W and d[nj, ni] > base:
                 d[nj, ni] = base
                 q.append((nj, ni))
-    return d
+    return d.astype(np.float32) * float(res)
 
 
 def main():
