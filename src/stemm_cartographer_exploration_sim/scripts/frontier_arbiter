@@ -442,7 +442,7 @@ class Arbiter(Node):
         self.ff_zone_radius = float(p('failfast_zone_radius_m', 2.0).value)
         self.ff_max_actions = int(p('failfast_max_actions', 8).value)
         self.ff_escalate_sec = float(p('failfast_escalate_sec', 40.0).value)
-        self._ff_hist = []          # [(t, x, y)]
+        self._ff_hist = deque(maxlen=240)   # [(t, x, y)]（deque：_update_failfast 里 popleft）
         self._ff_hits = []          # [(t, x, y)]
         self._ff_hard = []          # [(x, y, until)] 本轮禁入区
         self._ff_actions = 0
