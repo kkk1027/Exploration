@@ -12,9 +12,17 @@ START="${START:-1}"
 for i in $(seq "$START" "$(( START + N - 1 ))") ; do
   # 起栈前清场：上一轮若异常退出会留下 gzserver / /dev/shm 里的 fastrtps 段，
   # 让新一轮 gzserver 迟迟起不来 → sensor preflight 8 s 超时 → 整轮直接作废。
+  # 2026-10-26 修复"批次切换时轮次拿不到轮目录/起栈失败"（连续 3 轮复现）：
+  #   ① 收掉上一批残留（整栈按可执行路径枚举，比 pkill 单进程可靠）
+  #   ② 删掉上一轮被杀后可能仍被孤儿持有的 flock 文件
+  #   ③ 轮询等 gzserver 真正归零（最多 30 s），再清 fastrtps 共享内存段
+  bash harness/stack_kill.sh term >/dev/null 2>&1
   pkill -x gzserver 2>/dev/null; pkill -x gzclient 2>/dev/null
+  rm -f /tmp/stemm_round.lock 2>/dev/null
+  for _ in $(seq 1 30); do [ "$(pgrep -cx gzserver)" = "0" ] && break; sleep 1; done
   rm -f /dev/shm/fastrtps_* 2>/dev/null
   sleep 2
+  echo "  清场完成 gzserver=$(pgrep -cx gzserver) lock=$( [ -e /tmp/stemm_round.lock ] && echo 有 || echo 无 )" >> "$PROG"
   TAG="${PREFIX}r$i"
   echo "START $TAG $(date +%H:%M:%S)" >> "$PROG"
   # 轮次在后台起，方便同时挂探针与截图
