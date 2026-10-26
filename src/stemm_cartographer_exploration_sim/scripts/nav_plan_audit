@@ -113,7 +113,8 @@ class PlanAudit(Node):
             return None
         dist, ox, oy, res, w, h = self.field
         i = int((x - ox) / res)
-        j = int((y - oy) / res)
+        # 同上：OccupancyGrid 的 data 第 0 行是**图上方**，origin 在左下 ⇒ 行号要翻转
+        j = h - 1 - int((y - oy) / res)
         if not (0 <= i < w and 0 <= j < h):
             return 0.0
         return 2.0 * float(dist[j, i])

@@ -252,7 +252,9 @@ class FakeBase(Node):
             hit = None
             for _ in range(400):
                 ci = int((wx - self.ox) / self.res)
-                cj = int((wy - self.oy) / self.res)
+                # PGM 的第 0 行在图**上方**，而地图 origin 是**左下**角
+                # → 世界 y 要翻转成行号，否则整张"地图/点云"会上下镜像（实测踩过）
+                cj = self.h - 1 - int((wy - self.oy) / self.res)
                 if not (0 <= ci < self.w and 0 <= cj < self.h):
                     break
                 step = float(self.dist[cj, ci]) * self.res

@@ -23,7 +23,7 @@ MAP="${MAP:-$HOME/stemm_sim_ws/maps/explore_latest.yaml}"
 START="${START:-0.0 0.0 0.0}"
 set -- $START
 SX="$1"; SY="$2"; SYAW="$3"
-LOG="$WS/logs/nav_sim_$(date +%H%M%S)"; mkdir -p "$LOG"
+LOG="${LOG:-$WS/logs/nav_sim_$(date +%H%M%S)}"; mkdir -p "$LOG"
 PASS_W="${PASS_W:-1.05}"
 
 cleanup() {
@@ -38,6 +38,7 @@ if [ "${NAV_ARGS_OFF:-0}" != "1" ]; then
   [ -n "${VX_MIN:-}" ] && ARGS+=(--vx-min "$VX_MIN")
   if [ "${COST_INFL:-1}" = "1" ]; then
     ARGS+=(--infl-radius "${GLOBE_R:-1.00}" --infl-scaling "${GLOBE_S:-1.2}" --pad "${PAD:-0.10}")
+    [ -n "${COST_PEN:-}" ] && ARGS+=(--cost-penalty "$COST_PEN")
   fi
   if [ "${PLANNER_PATCH:-1}" = "1" ]; then
     ARGS+=(--allow-unknown "${ALLOW_UNKNOWN:-false}" --motion "${MOTION_MODEL:-REEDS_SHEPP}"

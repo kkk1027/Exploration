@@ -115,6 +115,10 @@ def patch_text(txt, a):
             out.append(f'{ind}motion_model_for_search: "{a.motion}"    # sim_patch\n')
             done.append('motion')
             continue
+        if st.startswith('cost_penalty:') and a.cost_penalty is not None:
+            out.append(f'{ind}cost_penalty: {a.cost_penalty}    # sim_patch：窄缝贵到不愿钻\n')
+            done.append('cost_penalty')
+            continue
         if st.startswith('reverse_penalty:') and a.reverse_penalty is not None:
             out.append(f'{ind}reverse_penalty: {a.reverse_penalty}    # sim_patch：倒车更贵\n')
             done.append('reverse_penalty')
@@ -138,6 +142,9 @@ def main():
     ap.add_argument('--motion', default=None,
                     choices=['DUBIN', 'REEDS_SHEPP', 'GRID_A_STAR', 'STATE_LATTICE'])
     ap.add_argument('--reverse-penalty', type=float, default=None)
+    ap.add_argument('--cost-penalty', type=float, default=None,
+                    help='Smac 的 cost_penalty：代价地图的代价按"每米 × 系数"累加，'
+                         '系数调大就会宁可绕远也不穿高代价的窄缝')
     a = ap.parse_args()
     if not os.path.exists(TARGET):
         print(f'✗ 找不到 {TARGET}')
