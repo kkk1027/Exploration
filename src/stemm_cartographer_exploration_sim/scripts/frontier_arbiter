@@ -446,6 +446,11 @@ class Arbiter(Node):
         self.ff_zone_radius = float(p('failfast_zone_radius_m', 2.0).value)
         self.ff_max_actions = int(p('failfast_max_actions', 8).value)
         self.ff_escalate_sec = float(p('failfast_escalate_sec', 40.0).value)
+        # 拉黑单位＝"死角/自由连通域"（用户 2026-10-26 批准）：只拉黑落点半径挡不住
+        # "同一墙角的另一侧"，实测 L2 动作 10 次仍出现 82/99 s 长停滞。
+        self.ff_comp_radius = float(p('failfast_comp_radius_m', 6.0).value)
+        self._ff_cells = {}        # {(ci, cj): until}  禁入连通域的栅格
+
         self._ff_hist = deque(maxlen=240)   # [(t, x, y)]（deque：_update_failfast 里 popleft）
         self._ff_hits = []          # [(t, x, y)]
         self._ff_hard = []          # [(x, y, until)] 本轮禁入区
@@ -1837,6 +1842,10 @@ class Arbiter(Node):
         self.stuck_zones.append((x, y, now + self.ff_ttl))
         if hard:
             self._ff_hard.append((x, y, now + self.ff_ttl))
+            cells = self._ff_flood(x, y, now)
+            self.stats['failfast_zone_cells'] = len(self._ff_cells)
+            self.get_logger().warn(
+                'L2 升级：把这一整块自由连通域（%d 格，半径 %.1f m）记为本轮禁入区' % (cells, self.ff_comp_radius))
             self.stats['failfast_hardzone'] = self.stats.get('failfast_hardzone', 0) + 1
         cancelled = self._do_veto_cancel()
         self.last_pub = 0.0          # 关键：允许下一拍立刻派别的目标（等于"报告失败并换目标"）
@@ -1847,6 +1856,46 @@ class Arbiter(Node):
                self.ff_ttl, '、并升级为本轮禁入区' if hard else '', self._ff_actions))
         self._ff_hits = [h for h in self._ff_hits if now - h[0] <= self.ff_ttl]
 
+    def _ff_flood(self, x, y, now):
+        """从 (x,y) 出发在 /map 的自由格上做 flood fill，把这一整块"死角"记成本轮禁入区。
+
+        只填自由格（/map < 50），半径上限 ff_comp_radius（默认 6 m），
+        这样"同一死角换到另一侧前沿"也会被挡住。
+        """
+        occ = self.map
+        if occ is None:
+            return 0
+        ores = occ.info.resolution
+        ow, oh = occ.info.width, occ.info.height
+        oox, ooy = occ.info.origin.position.x, occ.info.origin.position.y
+        data = occ.data
+        ci = int((x - oox) / ores)
+        cj = int((y - ooy) / ores)
+        if not (0 <= ci < ow and 0 <= cj < oh):
+            return 0
+        rmax = int(self.ff_comp_radius / ores)
+        rad2 = rmax * rmax
+        seen = set()
+        dq = deque([(ci, cj)])
+        n = 0
+        until = now + self.ff_ttl
+        while dq and n < 20000:
+            i, j = dq.popleft()
+            if (i, j) in seen:
+                continue
+            if (i - ci) ** 2 + (j - cj) ** 2 > rad2:
+                continue
+            if not (0 <= i < ow and 0 <= j < oh):
+                continue
+            v = data[j * ow + i]
+            if v >= 50 or v < 0:          # 障碍/未知：不扩
+                continue
+            seen.add((i, j))
+            self._ff_cells[(i, j)] = until
+            n += 1
+            dq.extend(((i + 1, j), (i - 1, j), (i, j + 1), (i, j - 1)))
+        return n
+
     def failfast_blocked(self, x, y, now):
         """候选是否落在"本轮禁入区"内（L2 升级后的硬过滤）。"""
         if not self.failfast_enabled:
@@ -1855,6 +1904,19 @@ class Arbiter(Node):
         for zx, zy, _ in self._ff_hard:
             if math.hypot(x - zx, y - zy) <= self.ff_hard_radius:
                 return True
+        # 连通域（死角）判定：落点所在栅格若被登记过就直接拒绝
+        if self._ff_cells:
+            if len(self._ff_cells) > 60000:
+                self._ff_cells = {k: v for k, v in self._ff_cells.items() if v > now}
+            occ = self.map
+            if occ is not None:
+                ores = occ.info.resolution
+                oox, ooy = occ.info.origin.position.x, occ.info.origin.position.y
+                ci = int((x - oox) / ores)
+                cj = int((y - ooy) / ores)
+                until = self._ff_cells.get((ci, cj))
+                if until is not None and until > now:
+                    return True
         return False
 
     def zone_penalty(self, x, y, now):

@@ -129,6 +129,7 @@ def generate_launch_description():
                                 'failfast_zone_radius_m': LaunchConfiguration('failfast_zone_radius'),
                                 'failfast_max_actions': LaunchConfiguration('failfast_max_actions'),
                                 'failfast_escalate_sec': LaunchConfiguration('failfast_escalate'),
+                                'failfast_comp_radius_m': LaunchConfiguration('failfast_comp_radius'),
                                 # V1 闸门（落点级）：与 veto 搭配才覆盖全部派发通道
                                 'gate_enabled': LaunchConfiguration('gate'),
                                 'gate_esc_dirs_min': LaunchConfiguration('gate_min_esc'),
@@ -326,6 +327,8 @@ def generate_launch_description():
             description='每轮最多触发几次判失败'),
         DeclareLaunchArgument('failfast_escalate', default_value='40.0',
             description='同区累计多少秒后升级为禁入区'),
+        DeclareLaunchArgument('failfast_comp_radius', default_value='6.0',
+            description='死角连通域半径（m）：确认过不去后把这个范围内的整块自由区域拉黑'),
         DeclareLaunchArgument('plan_guard_log', default_value='false',
             description='P9-⑥：记录 nav2 /plan 的最小净宽与最长窄段（False=不体检）'),
         DeclareLaunchArgument('plan_guard_veto', default_value='false',
