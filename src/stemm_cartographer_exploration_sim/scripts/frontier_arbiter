@@ -509,6 +509,11 @@ class Arbiter(Node):
         # 两边口径就不一致：仲裁认为能到、规划器却拒绝，或反过来把车带进"没看清"的角。
         # unknown_block=True 把容差清零（任何未知段都不许），并额外要求落点本身是已知自由格。
         self.unknown_block = self._as_bool(p('unknown_block', False).value)
+        # P9-D（用户 2026-10-26 批准，根治"真窄卡死族"的前提）：
+        # 判宽时把**未知格按障碍计**。原来未知只用于统计占比，距离场只由已知障碍生成，
+        # 于是"半侧还没观测到"的缝在决策时刻被量成宽路 —— 这正是 19 次窄点卡死里
+        # 大部分"决策时看着能过、进去后墙才出现"的机制来源。
+        self.width_unknown_block = self._as_bool(p('width_unknown_block', False).value)
         if self.unknown_block:
             self.unknown_span_max = 0.0
         # 半径取 0.6 m："这一脚到那儿能不能转过身"，而不是"附近某处有片空地"。
@@ -844,7 +849,8 @@ class Arbiter(Node):
             return None
         w, h = info.width, info.height
         ox, oy = info.origin.position.x, info.origin.position.y
-        key = (self._map_seq, self._vg_seq, w, h, round(res, 6), round(ox, 4), round(oy, 4))
+        key = (self._map_seq, self._vg_seq, w, h, round(res, 6), round(ox, 4), round(oy, 4),
+               bool(self.width_unknown_block))
         if key == self._clear_key and self._clear_field is not None:
             return self._clear_field
         try:
@@ -857,6 +863,9 @@ class Arbiter(Node):
         arr = np.asarray(m.data, dtype=np.int16).reshape(h, w)
         blocked = arr >= 50
         unknown = arr < 0
+        if self.width_unknown_block:
+            # 未知格按障碍计（P9-D）：距离场因此把"没看清"的地方也当成走不通
+            blocked = blocked | unknown
         vg = self.vision_grid
         if self.use_vision_obstacles and vg is not None:
             vr = vg.info.resolution
