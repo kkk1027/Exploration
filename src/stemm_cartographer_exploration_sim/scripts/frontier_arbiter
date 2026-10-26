@@ -28,6 +28,10 @@ import math
 import os
 import time
 
+# P9-L1：「在等」而不是「过不去」的状态词（来自 50 轮历史 timeline 的实测分类）
+FF_WAIT_WORDS = ('waiting_for_rrt_frontier', 'warming_up', 'arrived', 'canceled',
+                 'return_home_wait', 'clearance_restored', 'succeeded', 'stopped')
+
 import rclpy
 from action_msgs.msg import GoalStatusArray
 from geometry_msgs.msg import PoseStamped, Twist
@@ -423,6 +427,27 @@ class Arbiter(Node):
         self.plan_guard_log = self._as_bool(p('plan_guard_log', False).value)
         self.plan_guard_veto = self._as_bool(p('plan_guard_veto', False).value)
         self.plan_guard_max_cancel = int(p('plan_guard_max_cancel', 6).value)
+        # ---- P9-L1/L2：卡死治理「确定过不去 → 报失败/换目标」----
+        # 阈值来自 50 轮历史 timeline 的离线复算（harness/analyze_failfast.py）：
+        #   滑窗 20 s / 漂移 <=0.20 m / front 中位 <0.60 m 或 nav=blocked_*
+        #   → 命中 62 次，确认(同 2 m 内 60 s >=2 次) 0.38 次/轮，误报 5/50 轮，覆盖 7/11 顶住类事件。
+        # 注意：历史数据证明"里程 >=0.6 m"这条不能当必要条件（真卡死时里程≈0，会把事件全滤掉）。
+        self.failfast_enabled = self._as_bool(p('failfast_enabled', False).value)
+        self.ff_window = float(p('failfast_window_sec', 20.0).value)
+        self.ff_drift = float(p('failfast_drift_m', 0.20).value)
+        self.ff_front = float(p('failfast_front_m', 0.60).value)
+        self.ff_confirm = max(1, int(p('failfast_confirm_hits', 2).value))
+        self.ff_ttl = float(p('failfast_ttl_sec', 60.0).value)
+        self.ff_hard_radius = float(p('failfast_hard_radius_m', 1.2).value)
+        self.ff_zone_radius = float(p('failfast_zone_radius_m', 2.0).value)
+        self.ff_max_actions = int(p('failfast_max_actions', 8).value)
+        self.ff_escalate_sec = float(p('failfast_escalate_sec', 40.0).value)
+        self._ff_hist = []          # [(t, x, y)]
+        self._ff_hits = []          # [(t, x, y)]
+        self._ff_hard = []          # [(x, y, until)] 本轮禁入区
+        self._ff_actions = 0
+        self._ff_last_action = 0.0
+        self._ff_stuck_since = None
         self._pg_cancels = 0
         self._pg_logged_plan = None
         self.veto_min_esc = int(p('veto_min_esc_dirs', 3).value)
@@ -1728,6 +1753,106 @@ class Arbiter(Node):
             self._stuck_ref = (now, self.pose[0], self.pose[1])
         self.stuck_zones = [z for z in self.stuck_zones if z[2] > now]
 
+    # ---------------- P9-L1：「确定过不去」判定 ----------------
+    def _ff_state(self):
+        """从 manager 的 nav_state JSON 里取 (front_min_range, nav, mode)。"""
+        o = getattr(self, '_nav_payload', None) or {}
+        front = o.get('front_min_range')
+        try:
+            front = float(front) if front is not None else None
+        except (TypeError, ValueError):
+            front = None
+        nav = str(o.get('navigation_state') or '').lower()
+        mode = str(o.get('mode') or '').lower()
+        return front, nav, mode
+
+    def _update_failfast(self, now):
+        """滑窗判「确定过不去」；确认后取消目标 + 拉黑该点 + 标记本轮禁入区。
+
+        判据（离线标定，见 harness/analyze_failfast.py 与 docs/P9）：
+          1) 窗口内位姿包围盒对角线 <= ff_drift（同一小范围）
+          2) 净空证据：front_min_range < ff_front  或  nav 处于 blocked_*
+          3) 非"等"状态：mode/nav 不在 waiting/arrived/canceled 一类
+        连续满足 >= ff_window 秒算一次命中；同一 2 m 内 ff_ttl 秒内有 ff_confirm 次命中
+        才真正动手（避免把正常探索的短暂停顿当成过不去）。
+        """
+        if not self.failfast_enabled or self.pose is None:
+            return
+        self._ff_hist.append((now, self.pose[0], self.pose[1]))
+        while self._ff_hist and now - self._ff_hist[0][0] > self.ff_window * 1.5:
+            self._ff_hist.popleft()
+        win = [h for h in self._ff_hist if now - h[0] <= self.ff_window]
+        if len(win) < 5 or (win[-1][0] - win[0][0]) < self.ff_window * 0.8:
+            return
+        xs = [w[1] for w in win]
+        ys = [w[2] for w in win]
+        drift = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+        if drift > self.ff_drift:
+            self._ff_stuck_since = None
+            return
+        front, nav, mode = self._ff_state()
+        blocked = ('blocked_' in nav) or ('blocked_' in mode)
+        clear = blocked or (front is not None and front < self.ff_front)
+        waiting = any(w in nav for w in FF_WAIT_WORDS) or any(w in mode for w in FF_WAIT_WORDS)
+        if not clear or waiting:
+            self._ff_stuck_since = None
+            return
+        if self._ff_stuck_since is None:
+            self._ff_stuck_since = now
+            return
+        # 已连续满足 ff_window 秒 → 记一次命中（10 s 内不重复记账）
+        if now - self._ff_stuck_since < self.ff_window:
+            return
+        if self._ff_hits and now - self._ff_hits[-1][0] < 10.0:
+            return
+        x, y = self.pose[0], self.pose[1]
+        self._ff_hits.append((now, x, y))
+        self.stats['failfast_hit'] = self.stats.get('failfast_hit', 0) + 1
+        near = [h for h in self._ff_hits
+                if now - h[0] <= self.ff_ttl
+                and math.hypot(h[1] - x, h[2] - y) <= self.ff_zone_radius]
+        self.get_logger().warn(
+            'L1 判定：在 (%.2f,%.2f) 已 %.0f s 同一小范围（漂移 %.2f m、front=%s、nav=%s），'
+            '同区命中 %d/%d 次'
+            % (x, y, now - self._ff_stuck_since, drift,
+               ('%.2f' % front) if front is not None else 'n/a', nav or mode or 'n/a',
+               len(near), self.ff_confirm))
+        if len(near) < self.ff_confirm:
+            return
+        if self._ff_actions >= self.ff_max_actions:
+            return
+        if now - self._ff_last_action < 15.0:
+            return
+        # ---- L2 动作：取消 → 拉黑 → 立即允许重派（同拍换目标）----
+        span = near[-1][0] - near[0][0]
+        hard = (len(near) >= self.ff_confirm + 1) or (span >= self.ff_escalate_sec)
+        self._ff_actions += 1
+        self._ff_last_action = now
+        self.stats['failfast_action'] = self.stats.get('failfast_action', 0) + 1
+        self.blacklist.append((x, y, now + self.ff_ttl))
+        self.stuck_zones.append((x, y, now + self.ff_ttl))
+        if hard:
+            self._ff_hard.append((x, y, now + self.ff_ttl))
+            self.stats['failfast_hardzone'] = self.stats.get('failfast_hardzone', 0) + 1
+        cancelled = self._do_veto_cancel()
+        self.last_pub = 0.0          # 关键：允许下一拍立刻派别的目标（等于"报告失败并换目标"）
+        self.get_logger().warn(
+            '✗ L2 判失败：位置 (%.2f,%.2f) 判定过不去（同区命中 %d 次、跨度 %.0f s）→ '
+            '取消目标=%s、拉黑 %.0f s%s；第 %d 次'
+            % (x, y, len(near), span, '是' if cancelled else '否(无活跃目标)',
+               self.ff_ttl, '、并升级为本轮禁入区' if hard else '', self._ff_actions))
+        self._ff_hits = [h for h in self._ff_hits if now - h[0] <= self.ff_ttl]
+
+    def failfast_blocked(self, x, y, now):
+        """候选是否落在"本轮禁入区"内（L2 升级后的硬过滤）。"""
+        if not self.failfast_enabled:
+            return False
+        self._ff_hard = [z for z in self._ff_hard if z[2] > now]
+        for zx, zy, _ in self._ff_hard:
+            if math.hypot(x - zx, y - zy) <= self.ff_hard_radius:
+                return True
+        return False
+
     def zone_penalty(self, x, y, now):
         """"禁入/降权"区域罚分（v1 与 v2/v3 共用）。
 
@@ -1795,6 +1920,7 @@ class Arbiter(Node):
     def _tick_v1(self):
         now = time.monotonic()
         self._update_stuck(now)
+        self._update_failfast(now)
         if self.map is None or self.pose is None or not self.cands:
             return
         if self.mgr_busy and now - self.last_pub < self.repub:
@@ -1804,6 +1930,10 @@ class Arbiter(Node):
             return
         scored = []
         for x, y, _ in cands:
+            if self.failfast_blocked(x, y, now):
+                self.stats['failfast_reject'] = self.stats.get('failfast_reject', 0) + 1
+                self._note_uniq('failfast_reject', x, y)
+                continue
             u = self.unknown_cells(x, y)
             if self.blacklisted(x, y, now):
                 self.stats['penalized_black'] = self.stats.get('penalized_black', 0) + 1
@@ -1894,6 +2024,7 @@ class Arbiter(Node):
 
     def _tick_v3(self):
         now = time.monotonic()
+        self._update_failfast(now)
         self._update_stuck(now)
         if self.map is None or self.pose is None or not self.cands:
             return
@@ -2021,6 +2152,7 @@ class Arbiter(Node):
 
     def _tick_v2(self):
         now = time.monotonic()
+        self._update_failfast(now)
         self._update_stuck(now)
         if self.map is None or self.pose is None or not self.cands:
             return
