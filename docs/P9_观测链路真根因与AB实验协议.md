@@ -404,3 +404,92 @@ A 层（0.752 m 沿途硬禁 + 可退出性）与 C 层（受限倒车）仍未�
 
 A 依赖的宽度输入仍是"未知按可通行"的现状（D 的克制版未实施），因此
 **半侧未观测的 pinch 仍可能被量宽** → A 只能拦"已看清的窄处"，对"看清之前就进去"的场景无效。
+
+---
+
+## 14. 探索期脱困监督整体缺失（2026-10-26 夜发现，影响 34+ 轮数据）
+
+### 14.1 事故
+
+提交 `aeef06c`（17:21，"治专挑窄处走"）在 `maybe_reverse_assist` 里写
+`self.explore_wedged(now)`，而定义是 `def explore_wedged(self)`；同函数内还读
+`self._stuck_since`（真名 `stuck_since`）。两处都在**探索期第一次 tick** 触发异常：
+
+```
+TypeError: EscapeSupervisor.explore_wedged() takes 1 positional argument but 2 were given
+```
+
+`escape_supervisor` 每轮开机即 Traceback 退出。launch 不给这类节点设硬失败，于是整轮只是
+"少了一个节点"：digest 照旧 PASS、接触照旧统计，**只是脱困监督（旋转/前进/倒车）全程不存在**。
+
+### 14.2 影响范围（已逐轮核实 launch.log）
+
+* **17:08 之后、共 34+ 轮**（`suprevr*`、`myrun*`、`ffr*`、`dzr*`、`rfr*`、`sbr*`、`c2r*`、`d1*`、`smk`、`c0r*`）
+  的 `Traceback` 命中 `explore_wedged() takes`。
+* 因此 **`nosp`（16:03，监督是活的）不能再当"当前口径基线"**：它的对照物必须重跑。
+* L1/L2（FailFast）的结论不因此失效（它们在仲裁器侧），但"最长原地挪动 13.4→40.2 s"这类
+  对比受污染（一侧有监督、另一侧没有）。
+
+### 14.3 修复与回归守卫
+
+* `explore_wedged(self, now)` 且内部用 `now` + `self.stuck_since`（`eb45c8f`）。
+* 新增 `harness/test_method_calls.py`（AST）：查 `self.<method>(...)` 位置参数个数与定义是否匹配、
+  以及 `self._xxx` 是否从未赋值。**已用旧版文件验证能抓到这两处**（argcount + undefined_attr）。
+* 新增 `harness/check_node_health.py`：从 launch.log 的 Traceback 块取异常行，
+  `ExternalShutdownException / KeyboardInterrupt / SystemExit` 等**收关噪声忽略**，
+  其它异常才算真崩。`round.sh` 产出 `dead_nodes.txt` 并在真崩时告警；
+  `round_digest` 把它并入失败项 `node_crash`；`run_p0_shots.sh` 把真崩判为无效轮自动重跑。
+  （第一版体检只 grep `Traceback` 字样 → 每轮收关都被判猝死，白重跑一轮，已修）
+
+### 14.4 教训（写进纪律）
+
+> 任何"少一个节点也不报错"的故障必须先被识别，否则所有 A/B 都在比两个不同的系统。
+> 每个实验轮先看 `dead_nodes.txt` 与 digest 的 `node_crash`，再看指标。
+
+---
+
+## 15. C 层（探索期受控倒车）口径标定 —— 用 89 轮真实数据，不用猜
+
+### 15.1 老口径为什么必然是 0 触发
+
+老口径 = `front < rotate_min_range(0.34)` **且** `stuck_since`（0.02 m / 0.04 rad 的即时运动锚点）
+**且** 非 `nav_busy`。实测：
+
+| 事实 | 数值 |
+| --- | --- |
+| 探索期 ≥10 s 停滞段（0.05 m/0.2 rad 窗口口径，排除返航） | **156 段**（21 段 ≥30 s） |
+| 其中 front20 < 0.34 m | 4 段（**3%**） |
+| front20 ∈ [0.34, 0.65) | 14 段（9%，但含 144 s / 136 s / 80 s 这些最坏案例） |
+| front20 ≥ 0.65 m | 133 段（88%） |
+| 停滞段内 nav/模式 | `blocked_waiting_clearance` 775 tick、`mode=safety_stop` 803 tick |
+| 停滞段内 cmd 平均 |vx| | 0.004（车端已零速） |
+| `blocked/safety_stop` 连续段时长（89 轮、193 段） | p50 4.0 s / p75 5.3 s / p90 23 s / max 326 s |
+| 这些段内 front 最小 | p50 0.50 m / p90 2.8 m；`<0.70` 占 **68%** |
+
+结论：吸收态几乎总是"**有活跃目标 + 车端闸按住 + cmd≈0**"，而车常在做原地微转，
+即时运动锚点被不断清零 → 老口径的"非 busy + 真静止 + front<0.34"三条同时成立的概率≈0。
+另外 `front<0.34` 还与车端安全闸 `front_stop_distance=0.65` 之间留了一整段死区。
+
+### 15.2 C v2 口径（`5e6797b`，默认关）
+
+* 触发 = 车端闸按住（`blocked_waiting_clearance` / `blocked_precheck_pending` / `mode=safety_stop`）
+  **且** 车端已静默 ≥1 s 的连续时长 ≥ `explore_reverse_block_sec`（**6.0 s**，取在 p75 5.3 之上）
+  **且** `front20 ≤ 0.70`（车端闸 0.65 + 余量）**且** 扫描新鲜；
+* 允许"有活跃目标"时接管（`explore_reverse_takeover_busy=true`）——吸收态本来就带着活跃目标；
+* 倒车动作不变：单步 ≤0.15 m @0.06 m/s、后方 ±30° 需 ≥20 点且 ≥0.40 m、每局 ≤4 步；
+* `reverse_assist_start` 日志带 `wedge` 快照（front/block_s/nav/mode/busy）便于归因。
+
+### 15.3 首批实测（`c1r1`/`c1r2`，监督已修活的当前口径；`c2smk`，C 打开）
+
+| 轮 | 接触 | blocked 段 | 探针 would_fire | 结论 |
+| --- | --- | --- | --- | --- |
+| c1r1 | 0 | 多为"等目标"（front 0.82） | 0 | 新口径正确地不触发 |
+| c1r2 | **11**（床头柜，chassis） | 1 段 14 s，front 0.52→0.15 | 0（hold 未达 6 s） | 角落插入，6 s 门槛偏慢 |
+| c2smk（C 开） | 3（椅子，wheel） | 1 段 6 s，front 0.48→转开 | 0 | manager 自己转开，C 不需要 |
+
+要点：
+1. **C 的覆盖稀疏**（≥6 s 的 blocked 段约 0.3 段/轮），5 轮 A/B 触发次数预期 1~2 次，
+   统计上很难显著 —— 这正是"A 比 C 更值得投入"的数据依据。
+2. c1r2 的接触暴露了 C 的**时序**问题：从"闸按住"到"撞上"只有 ~6 s，6 s 门槛来不及。
+   若 Q 后续要更激进，方向是把 block_sec 降到 3 s（静默门槛保证不与 manager 自转抢），
+   而不是放宽 front 或后方净空。
