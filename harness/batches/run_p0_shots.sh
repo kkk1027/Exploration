@@ -66,8 +66,10 @@ for i in $(seq "$START" "$(( START + N - 1 ))") ; do
   kill -9 $PPID_PROBE $SPID 2>/dev/null
   echo "DONE $TAG $(date +%H:%M:%S) dir=$D shots=$(ls "$D/shots" 2>/dev/null | wc -l)" >> "$PROG"
   # 起栈期失败（gzserver 没起来 → preflight 超时）不算实验数据：删掉重来一次
-  if grep -qE "sensor preflight timed out|gzserver 已退出|nav2 生命周期未在 guard 超时内激活" "$D/launch.log" 2>/dev/null \
-     || ! [ -s "$D/timeline.jsonl" ]; then
+  # 注意：不能匹配 "gzserver 已退出" —— 那是 round.sh 正常的收尾打印（踩过一次，
+  # 把跑完整的轮次误判成起栈失败又重跑了一遍，白花 5 分钟）。只认"真起不来"的特征。
+  if grep -qE "sensor preflight timed out|Core sensor preflight failed|nav2 生命周期未在 guard 超时内激活" "$D/launch.log" 2>/dev/null \
+     || ! [ -s "$D/timeline.jsonl" ] || ! [ -s "$D/digest.md" ]; then
     echo "  ↻ $TAG 起栈失败，重跑一次" >> "$PROG"
     rm -rf "$D"
     pkill -x gzserver 2>/dev/null; rm -f /dev/shm/fastrtps_* 2>/dev/null; sleep 5
