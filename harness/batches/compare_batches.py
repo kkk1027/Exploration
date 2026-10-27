@@ -24,6 +24,8 @@ RE_DISP = re.compile(r'派发来源: (.+)')
 RE_CONT = re.compile(r'接触段/时长: (\d+) 段 / ([\d.]+) s')
 RE_STALLSET = re.compile(r'停滞总秒数: \*\*([\d.]+) s\*\*　≥30 s: \*\*(\d+)\*\* 条')
 RE_MISC = re.compile(r'（本轮"前沿全灭→脱困目标"触发 (\d+) 次；时间线采样 (\d+) 拍')
+# 2026-10-27 新增：候选供给断流的量化（用户口径的"路径已生成但车不动"）
+RE_WAIT = re.compile(r'等候选\(waiting_for_rrt_goal\): \*\*([\d.]+) s\*\*　最长一段 \*\*([\d.]+) s\*\*')
 
 
 def rounds_for(prefix):
@@ -62,6 +64,10 @@ def one(d):
         if m:
             r['stall_s'] = float(m.group(1))
             r['stall30'] = int(m.group(2))
+        m = RE_WAIT.search(t)
+        if m:
+            r['wait_goal_s'] = float(m.group(1))
+            r['wait_goal_max_s'] = float(m.group(2))
         m = RE_DISP.search(t)
         if m:
             r['dispatch'] = m.group(1).strip()
@@ -190,7 +196,7 @@ def main():
             L.append('- 无数据'); L.append(''); continue
         hdr = ['tag', 'verdict', '失败项', 'S0', 'S1', 'S2', '卡死', '卡住', '最长s',
                '接触', '倒车m', '派发来源', '覆盖格', '最远m', '探针行', '旋转行',
-               '旋转增格', 'raw_occ_max', '截图']
+               '旋转增格', 'raw_occ_max', '截图', '等候选s', '等候选最长s']
         L.append('| ' + ' | '.join(hdr) + ' |')
         L.append('| ' + ' | '.join(['---'] * len(hdr)) + ' |')
         for r in rows:
@@ -204,11 +210,14 @@ def main():
                 g('stuck'), g('stuck_cmd'), g('stuck_max_s'), g('contact'),
                 g('reverse_m'), g('dispatch'), g('cells_05m'), g('max_range_m'),
                 g('probe_rows'), g('probe_rot_rows'),
-                g('probe_rot_grew_cells'), g('probe_occ_max'), g('shots')]) + ' |')
+                g('probe_rot_grew_cells'), g('probe_occ_max'), g('shots'),
+                g('wait_goal_s'), g('wait_goal_max_s')]) + ' |')
         L.append('')
-        L.append('**均值**：卡死 %s 轮/轮，卡住 %s，接触 %s，覆盖格 %s，倒车 %s m'
+        L.append('**均值**：卡死 %s 轮/轮，卡住 %s，接触 %s，覆盖格 %s，倒车 %s m，'
+                 '等候选 %s s（最长 %s s）'
                  % (agg(rows, 'stuck'), agg(rows, 'stuck_cmd'), agg(rows, 'contact'),
-                    agg(rows, 'cells_05m'), agg(rows, 'reverse_m')))
+                    agg(rows, 'cells_05m'), agg(rows, 'reverse_m'),
+                    agg(rows, 'wait_goal_s'), agg(rows, 'wait_goal_max_s')))
         npass = sum(1 for r in rows if r.get('verdict') == 'PASS')
         L.append(f'**PASS**：{npass}/{len(rows)}')
         L.append('')
@@ -221,6 +230,7 @@ def main():
         L.append('| 指标 | ' + ' | '.join(a.prefixes) + ' |')
         L.append('| --- ' * (len(a.prefixes) + 1) + '|')
         KEYS = [('卡死/轮', 'stuck'), ('其中卡住(cmd≠0)/轮', 'stuck_cmd'),
+                ('等候选 s/轮', 'wait_goal_s'), ('等候选最长 s', 'wait_goal_max_s'),
                 ('最长卡死 s', 'stuck_max_s'), ('接触/轮', 'contact'),
                 ('倒车 m/轮', 'reverse_m'), ('覆盖格', 'cells_05m'),
                 ('最短 m', 'max_range_m'), ('旋转增格/轮', 'probe_rot_grew_cells'),
