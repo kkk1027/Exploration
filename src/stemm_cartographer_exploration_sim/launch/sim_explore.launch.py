@@ -149,6 +149,12 @@ def generate_launch_description():
                                 'failfast_comp_radius_m': LaunchConfiguration('failfast_comp_radius'),
                                 # V1 闸门（落点级）：与 veto 搭配才覆盖全部派发通道
                                 'gate_enabled': LaunchConfiguration('gate'),
+                                # 后置否决改为"迁移"：命中不取消落点，改投合格点
+                                'veto_migrate': LaunchConfiguration('veto_migrate'),
+                                'veto_migrate_mode': LaunchConfiguration('veto_migrate_mode'),
+                                'veto_migrate_radius_m': LaunchConfiguration('veto_migrate_r'),
+                                'veto_migrate_samples': LaunchConfiguration('veto_migrate_n'),
+                                'veto_migrate_min_move_m': LaunchConfiguration('veto_migrate_move'),
                                 # 候选后验门（2026-10-27）：用当前全局代价地图复核落点
                                 'cost_gate': LaunchConfiguration('cost_gate'),
                                 'cost_gate_hard': LaunchConfiguration('cost_gate_hard'),
@@ -418,6 +424,16 @@ def generate_launch_description():
         #   基线（无 veto）∶静止超时 28（1.40/轮）、归因率 24%
         #   有 veto（额度 6、冷却 10 s）∶静止超时 19（0.95/轮，−32%）、归因率 11.5%
         #   两组全绿率同为 19/20 —— 也就是说这是三步里唯一"既降卡死又不退化"的改动。
+        DeclareLaunchArgument('veto_migrate', default_value='true',
+            description='后置否决命中时改为"迁移到合格点"而不是取消目标'),
+        DeclareLaunchArgument('veto_migrate_mode', default_value='random',
+            description='迁移策略：random(就近随机合格点) / rollback(沿当前计划回退)'),
+        DeclareLaunchArgument('veto_migrate_r', default_value='2.0',
+            description='random 档采样半径 m'),
+        DeclareLaunchArgument('veto_migrate_n', default_value='32',
+            description='random 档采样次数'),
+        DeclareLaunchArgument('veto_migrate_move', default_value='1.0',
+            description='迁移落点与车的最近距离 m（太近等于原地）'),
         DeclareLaunchArgument('veto', default_value='true',
             description='V2-③ 后置 veto：对非本节点派发的目标做硬闸门否决（只在探索期，默认关）'),
         DeclareLaunchArgument('veto_min_esc', default_value='3',

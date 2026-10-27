@@ -469,6 +469,19 @@ class Arbiter(Node):
         self.veto_max = int(p('veto_max_per_session', 2).value)
         self.veto_cooldown = float(p('veto_cooldown_sec', 30.0).value)
         self.veto_home_guard = float(p('veto_home_guard_m', 0.80).value)
+        # ==== 后置否决改为"迁移"（2026-10-27 用户方案）====
+        # 原始 V2-③ 命中就取消 → 车停车等下一个候选（实测等候选最长 27~92 s）。
+        # 改成：命中后**不取消落点本身**，而是把它迁到一个合格点继续执行。
+        # 两档策略（可切换）：
+        #   random   ：在原落点附近随机采样，取最近的合格点（用户方案，默认）
+        #   rollback ：在正在执行的 /plan 上从末位往回，取最后一个合格位姿
+        # 两档都失败才回落成"取消"。合格判据与后置否决同一套（esc_dirs/occ），
+        # 代价地图可用时再叠加落点代价判据。配额/冷却沿用 veto 的（默认每局 2 次）。
+        self.veto_migrate = self._as_bool(p('veto_migrate', True).value)
+        self.veto_migrate_mode = str(p('veto_migrate_mode', 'random').value).lower()
+        self.veto_migrate_r = float(p('veto_migrate_radius_m', 2.0).value)
+        self.veto_migrate_samples = int(p('veto_migrate_samples', 32).value)
+        self.veto_migrate_min_move = float(p('veto_migrate_min_move_m', 1.0).value)
         self._veto_last = 0.0
         self._veto_count = 0
         self._veto_prev = None         # (x, y, ts) 上一次 veto 的目标
@@ -614,6 +627,7 @@ class Arbiter(Node):
         self.retry_radius = float(p('retry_radius_m', 1.2).value)
         self.retry_window = float(p('retry_window_sec', 300.0).value)
         self.pub_history = []        # [(x, y, ts)] 已派发过的目标（用于"反复拉锯"降权）
+        self._last_plan = None       # 最近一条 /plan 的位姿序列（供后置迁移的 rollback 档）
         # D13：区域级（1 m 网格）被拒计数 —— 同一片"陷阱区"会持续生产候选，
         # 点级黑名单压不住，这里按区域整体降权（仍是罚分，不做硬拒）
         self.region_sec = float(p('region_penalty_sec', 120.0).value)
@@ -1174,6 +1188,11 @@ class Arbiter(Node):
         """
         if not m.poses:
             return
+        # 供 veto 迁移的 rollback 档使用：保留最近一条计划的位姿序列
+        try:
+            self._last_plan = [(p.pose.position.x, p.pose.position.y) for p in m.poses]
+        except Exception:                       # noqa: BLE001
+            pass
         if self.plan_guard_log or self.plan_guard_veto:
             prof = self.plan_width_profile(m.poses)
             if prof is not None:
@@ -1296,6 +1315,47 @@ class Arbiter(Node):
                 return (wx, wy, c)
         return None
 
+    def _veto_ok(self, x, y):
+        """后置否决判据的反面：该点是否**合格**（用于迁移目标）。"""
+        field = self.clearance_field()
+        if field is None:
+            return False
+        try:
+            f = self.region_complexity(field, x, y)
+        except Exception:                       # noqa: BLE001
+            return False
+        if not f:
+            return False
+        if f['esc_dirs'] < self.veto_min_esc:
+            return False
+        if f['occ_frac_r2'] >= self.veto_occ_max:
+            return False
+        if self.costmap is not None and self.cost_gate_reject(x, y, None, count=False):
+            return False
+        if self.pose is not None and math.hypot(x - self.pose[0], y - self.pose[1]) < self.veto_migrate_min_move:
+            return False
+        return True
+
+    def _veto_migrate_point(self, gx, gy, mode):
+        """找一个合格的迁移落点；找不到返回 None。mode: random / rollback。"""
+        if mode == 'rollback':
+            plan = getattr(self, '_last_plan', None) or []
+            for (px, py) in reversed(plan):
+                if self._veto_ok(px, py):
+                    return px, py
+            return None
+        best = None
+        for _ in range(max(1, self.veto_migrate_samples)):
+            ang = random.uniform(0.0, 2.0 * math.pi)
+            rad = self.veto_migrate_r * math.sqrt(random.random())
+            nx, ny = gx + rad * math.cos(ang), gy + rad * math.sin(ang)
+            if not self._veto_ok(nx, ny):
+                continue
+            d = math.hypot(nx - gx, ny - gy)
+            if best is None or d < best[0]:
+                best = (d, nx, ny)
+        return (best[1], best[2]) if best else None
+
     def veto_probe(self, gx, gy, tag=''):
         """对一个外部目标做后置否决判定（拆出来便于离线自测）。"""
         if not self.veto_enabled or self.pose is None:
@@ -1336,6 +1396,30 @@ class Arbiter(Node):
         if not why:
             return None
         reason = ','.join(why)
+        # ---- 迁移优先：把落点换成一个合格点继续走，而不是停车 ----
+        if self.veto_migrate:
+            modes = [self.veto_migrate_mode] + [m for m in ('random', 'rollback')
+                                                if m != self.veto_migrate_mode]
+            for mode in modes:
+                rep = self._veto_migrate_point(gx, gy, mode)
+                if rep is None:
+                    continue
+                if not self._do_veto_cancel():
+                    continue                      # 取消不掉就别改投（否则两个目标打架）
+                self._veto_last = now
+                self._veto_prev = (gx, gy, now)
+                self._veto_count += 1
+                self.stats['veto_migrate'] = self.stats.get('veto_migrate', 0) + 1
+                self.stats['veto_migrate_' + mode] = \
+                    self.stats.get('veto_migrate_' + mode, 0) + 1
+                self.publish_goal(rep[0], rep[1], None)
+                self.get_logger().warn(
+                    'V2-③ 后置迁移（%s，%s）(%.2f,%.2f) → (%.2f,%.2f) 距离 %.2f m；'
+                    '本轮第 %d/%d 次'
+                    % (mode, reason, gx, gy, rep[0], rep[1],
+                       math.hypot(rep[0] - gx, rep[1] - gy),
+                       self._veto_count, self.veto_max))
+                return reason
         ok = self._do_veto_cancel()
         self._veto_last = now
         self._veto_prev = (gx, gy, now)
