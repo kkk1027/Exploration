@@ -25,7 +25,7 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, TimerAction
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
@@ -88,6 +88,12 @@ def generate_launch_description():
                     parameters=[{'use_sim_time': use_sim_time,
                                  'log_path': LaunchConfiguration('contact_log')}])
 
+    # 2026-10-27 踩坑：nav2 与 map_server 同时起时，StaticLayer 还没收到 latch 的 /map，
+    # 全局代价地图就按最小尺寸初始化 → 之后任何目标都是 "Goal pose is out of costmap!"。
+    # 故把 nav2 延后启动（默认 8 s）。
+    nav2_delayed = TimerAction(period=LaunchConfiguration('nav_start_delay'),
+                               actions=[nav2])
+
     rviz = Node(package='rviz2', executable='rviz2', name='rviz2', output='screen',
                 arguments=['-d', rviz_cfg],
                 parameters=[{'use_sim_time': use_sim_time}],
@@ -105,5 +111,6 @@ def generate_launch_description():
         DeclareLaunchArgument('plan_veto', default_value='false'),
         DeclareLaunchArgument('plan_audit_log', default_value=''),
         DeclareLaunchArgument('contact_log', default_value=''),
-        sim, map_server, lifecycle_maps, map_to_odom, nav2, audit, contacts, rviz,
+        DeclareLaunchArgument('nav_start_delay', default_value='8.0'),
+        sim, map_server, lifecycle_maps, map_to_odom, nav2_delayed, audit, contacts, rviz,
     ])
