@@ -164,7 +164,7 @@ if [ "$(python3 -c "print(1 if float('$GRACE_SEC')>0 else 0)")" = "1" ]; then
 RECOVERY_BT="${RECOVERY_BT:-none}"
 case "$RECOVERY_BT" in
   replan)
-    python3 harness/patch_recovery_bt.py --apply --spin off --replan-hz "${REPLAN_HZ:-1.0}" 2>&1 | tee -a "$OUT/harness.log"
+    python3 harness/patch_recovery_bt.py --apply --spin off --replan-hz "${REPLAN_HZ:-1.0}" --backup "${BACKUP:-0}" 2>&1 | tee -a "$OUT/harness.log"
     rec '"check":"recovery_bt","mode":"replan"';;
   spin)
     python3 harness/patch_recovery_bt.py --apply --spin on --spin-dist "${SPIN_DIST:-0.6}" --spin-time "${SPIN_TIME:-6.0}" --replan-hz "${REPLAN_HZ:-1.0}" 2>&1 | tee -a "$OUT/harness.log"
@@ -189,6 +189,18 @@ if [ "$VISION" = "1" ]; then
   if [ -n "${VX_MAX:-}" ] && [ "${VX_MAX}" != "0" ]; then
     # 统一注入器：一次生成整份 nav2 参数（vx / 膨胀 / 规划器），逐字节可回退
     NAV_ARGS=(--vx-max "$(as_float "${VX_MAX:-0.35}")")
+    # 统一口径总开关（2026-10-27 用户批准）：规划器与车端用同一个"能过"的几何判据
+    #   规划器：footprint = 车体(半宽0.235) + 每侧安全余量0.25 ⇒ 0.97 m 宽 ⇒ 通道需 >=0.97 m
+    #   车端  ：front_stop 由 0.65 降到 0.45（侧向余量已由 footprint 承担，前向闸只兜底）
+    #   倒车  ：vx_min=-0.08，让"原地打转"退化成"退一点再调"
+    #   未知  ：allow_unknown=false（只规划看清的地方）
+    if [ "${UNIFY:-0}" = "1" ]; then
+      NAV_ARGS+=(--footprint "${UNIFY_FP:-[[-0.18,-0.485],[-0.18,0.485],[0.32,0.485],[0.32,-0.485]]}"
+                 --pad "$(as_float "${PAD_UNIFY:-0.0}")"
+                 --vx-min "-$(as_float "${VX_MIN:-0.08}")"
+                 --allow-unknown false)
+      say "统一口径：footprint=${UNIFY_FP:-0.97m宽} padding=${PAD_UNIFY:-0.0} vx_min=-$(as_float "${VX_MIN:-0.08}") allow_unknown=false"
+    fi
     [ -n "${VX_MIN:-}" ] && NAV_ARGS+=(--vx-min "$VX_MIN")
     if [ "${COST_INFL:-0}" = "1" ]; then
       NAV_ARGS+=(--infl-radius "${GLOBE_R:-1.00}" --infl-scaling "${GLOBE_S:-1.2}" --pad "${PAD:-0.10}")

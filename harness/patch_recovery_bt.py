@@ -44,7 +44,7 @@ def journal():
     return os.path.join(CACHE, 'recovery_bt.journal.json')
 
 
-def build(pristine, spin, spin_dist, spin_time, replan_hz):
+def build(pristine, spin, spin_dist, spin_time, replan_hz, backup=None):
     """从 pristine 构造目标文本：只做两件（可分别关掉的）替换。"""
     new = pristine
     if spin:
@@ -53,6 +53,16 @@ def build(pristine, spin, spin_dist, spin_time, replan_hz):
         new = new.replace(
             WAIT2,
             SENT_B + f'        <Spin spin_dist="{spin_dist}" time_allowance="{spin_time}"/>\n' + SENT_E,
+            1)
+    elif backup is not None and backup > 0:
+        # 统一口径（2026-10-27）：恢复动作里必须有"能改变位置"的一项。原来只剩 Wait，
+        # 车在窄处只会原地打转；这里把空闲的 <Wait 2/> 位替换成 BackUp(+保留 Wait)。
+        if WAIT2 not in new:
+            raise SystemExit('✗ pristine 里找不到 `<Wait wait_duration="2"/>`；无法插入 BackUp')
+        new = new.replace(
+            WAIT2,
+            SENT_B + f'        <BackUp backup_dist="{backup}" backup_speed="0.05"'
+                     ' time_allowance="20"/>\n' + SENT_E + WAIT2,
             1)
     new = new.replace(f'<RateController hz="{HZ_ORIG}">', f'<RateController hz="{replan_hz}">', 1)
     import xml.etree.ElementTree as ET
@@ -66,6 +76,8 @@ def main():
     ap.add_argument('--restore', action='store_true')
     ap.add_argument('--check', action='store_true')
     ap.add_argument('--spin', choices=['on', 'off'], default='on')
+    ap.add_argument('--backup', type=float, default=0.0,
+                    help='在恢复子树里插入 BackUp（米，0=不插；仅 --spin off 时生效）')
     ap.add_argument('--spin-dist', type=float, default=0.6,
                     help='受限自转角（rad）；原厂 BT 是 1.57')
     ap.add_argument('--spin-time', type=float, default=6.0)
@@ -101,13 +113,17 @@ def main():
         print(f'  已保存原始备份：{PRISTINE}')
     pristine = open(PRISTINE, encoding='utf-8').read()
     spin = (a.spin == 'on')
-    new = build(pristine, spin, a.spin_dist, a.spin_time, a.replan_hz)
+    new = build(pristine, spin, a.spin_dist, a.spin_time, a.replan_hz,
+                None if spin else a.backup)
     json.dump({'file': real, 'spin': spin, 'spin_dist': a.spin_dist,
-               'spin_time': a.spin_time, 'replan_hz': a.replan_hz},
+               'spin_time': a.spin_time, 'replan_hz': a.replan_hz,
+               'backup': None if spin else a.backup},
               open(journal(), 'w', encoding='utf-8'), ensure_ascii=False, indent=1)
     open(real, 'w', encoding='utf-8').write(new)
     print('  ✓ 已写入：恢复动作=%s  重规划=%.1f Hz'
-          % ('Spin(%.2f rad/%.0fs)' % (a.spin_dist, a.spin_time) if spin else 'Wait(2)', a.replan_hz))
+          % ('Spin(%.2f rad/%.0fs)' % (a.spin_dist, a.spin_time) if spin
+             else ('BackUp(%.2fm)+Wait(2)' % a.backup if (a.backup or 0) > 0 else 'Wait(2)'),
+             a.replan_hz))
     return 0
 
 

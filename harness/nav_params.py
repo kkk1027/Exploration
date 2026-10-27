@@ -91,6 +91,10 @@ def patch_text(txt, a):
             # 离开 costmap 段后必须复位，否则后面的其它节点也会被塞 footprint_padding
             in_global = in_local = False
         # 记录当前处于哪个 costmap 段（第一层缩进里的 inflation 块按段判断）
+        if st.startswith('footprint:') and a.footprint is not None:
+            out.append(f'{ind}footprint: "{a.footprint}"    # sim_patch(footprint)：统一口径（车体+安全余量）\n')
+            done.append('footprint')
+            continue
         if st.startswith('vx_max:') and a.vx_max is not None:
             out.append(f'{ind}vx_max: {a.vx_max}    # sim_patch\n')
             done.append('vx_max')
@@ -138,6 +142,9 @@ def main():
     ap.add_argument('--infl-radius', type=float, default=None)
     ap.add_argument('--infl-scaling', type=float, default=None)
     ap.add_argument('--pad', type=float, default=None)
+    ap.add_argument('--footprint', default=None,
+                    help='车体轮廓（统一口径用）：形如 "[[-0.18,-0.485],[-0.18,0.485],'
+                         '[0.32,0.485],[0.32,-0.485]]"。两张 costmap 一起改，逐字节可回退。')
     ap.add_argument('--allow-unknown', choices=['true', 'false'], default=None)
     ap.add_argument('--motion', default=None,
                     choices=['DUBIN', 'REEDS_SHEPP', 'GRID_A_STAR', 'STATE_LATTICE'])
