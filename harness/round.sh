@@ -199,40 +199,11 @@ fi
 say "视觉层 VISION=$VISION（global-mode=$VISION_MODE）｜候选后验 COST_GATE=$COST_GATE GOAL_GATE=$GOAL_GATE｜修复 REPAIR_ON=${REPAIR_ON:-1} R=${REPAIR_R:-1.20} N=${REPAIR_N:-24} KEEP=${REPAIR_KEEP:-0.30} MINUNK=${REPAIR_MIN_UNK:-20}"
 rec "\"check\":\"vision\",\"enabled\":$VISION,\"global_mode\":\"$VISION_MODE\",\"cost_gate\":$COST_GATE,\"goal_gate\":$GOAL_GATE"
 trap 'python3 /home/kbf/stemm_exploration_sim_ws/harness/vision_nav_params.py --restore >/dev/null 2>&1' EXIT INT TERM
-if [ "$VISION" = "1" ]; then
-  python3 harness/vision_nav_params.py --apply --global-mode "$VISION_MODE" 2>&1 | tee -a "$OUT/harness.log"
-  VISION_APPLY_RC=${PIPESTATUS[0]}
-  if [ "$VISION_APPLY_RC" != "0" ]; then
-    say "✗ 视觉图层注入失败，放弃本轮（参数文件未被改动）"
-    rec '"verdict":"FAIL_vision_params"'
-    exit 11
-  fi
-  # 2026-10-27 新增：注入后**回读校验**。nav2 的 plugins 只在 configure 时生效，
-  # 注入没落盘/被别处覆盖时会静默退化成纯雷达基线（此前 nav_only 就是这样被骗过一次）。
-  VISION_CHK=$(python3 harness/vision_nav_params.py --check 2>&1)
-  if ! echo "$VISION_CHK" | grep -q 'local_costmap.plugins = .*vision_voxel_layer' \
-     || ! echo "$VISION_CHK" | grep -q 'global_costmap.plugins = .*vision_obstacle_layer'; then
-    say "✗ 视觉图层回读校验失败：costmap plugins 里没有视觉图层，放弃本轮"
-    echo "$VISION_CHK" | tail -4 | tee -a "$OUT/harness.log"
-    python3 harness/vision_nav_params.py --restore >/dev/null 2>&1
-    rec '"verdict":"FAIL_vision_layers"'
-    exit 12
-  fi
-  say "✓ 视觉图层回读校验通过"
-  echo "$VISION_CHK" | grep -E '\.plugins = ' | tee -a "$OUT/harness.log"
-  rec '"check":"vision_layers","ok":true'
   # 一次性固定参数决策：速度上限 0.35 m/s（VX_MAX=0 表示不注入、用车端原值 0.5）
   # 依据：P0 4v4（docs/P8 第 4.2 节）——卡住事件 8→5、接触 0、全绿 3/4→4/4。
-  # 这是**全局固定值**，不按房间/世界调；改它就是一次全局决策。
   VX_MAX="${VX_MAX:-0.35}"
   if [ -n "${VX_MAX:-}" ] && [ "${VX_MAX}" != "0" ]; then
-    # 统一注入器：一次生成整份 nav2 参数（vx / 膨胀 / 规划器），逐字节可回退
     NAV_ARGS=(--vx-max "$(as_float "${VX_MAX:-0.35}")")
-    # 统一口径总开关（2026-10-27 用户批准）：规划器与车端用同一个"能过"的几何判据
-    #   规划器：footprint = 车体(半宽0.235) + 每侧安全余量0.25 ⇒ 0.97 m 宽 ⇒ 通道需 >=0.97 m
-    #   车端  ：front_stop 由 0.65 降到 0.45（侧向余量已由 footprint 承担，前向闸只兜底）
-    #   倒车  ：vx_min=-0.08，让"原地打转"退化成"退一点再调"
-    #   未知  ：allow_unknown=false（只规划看清的地方）
     if [ "${UNIFY:-0}" = "1" ]; then
       NAV_ARGS+=(--footprint "${UNIFY_FP:-[[-0.18,-0.485],[-0.18,0.485],[0.32,0.485],[0.32,-0.485]]}"
                  --pad "$(as_float "${PAD_UNIFY:-0.0}")"
@@ -249,16 +220,47 @@ if [ "$VISION" = "1" ]; then
                  --reverse-penalty "${REV_PENALTY:-3.0}")
     fi
     python3 harness/nav_params.py --apply "${NAV_ARGS[@]}" 2>&1 | tee -a "$OUT/harness.log"
+    NAV_RC=${PIPESTATUS[0]}
+    if [ "$NAV_RC" != "0" ]; then
+      say "✗ nav2 参数注入失败，放弃本轮"
+      python3 harness/vision_nav_params.py --restore >/dev/null 2>&1
+      rec '"verdict":"FAIL_nav_params"'
+      exit 13
+    fi
   fi
-  if [ "${PIPESTATUS[0]}" != "0" ]; then
-    say "✗ 视觉图层注入失败，放弃本轮（参数文件未被改动）"
-    rec '"verdict":"FAIL_vision_params"'
-    exit 11
+
+  # ★★ 2026-10-27 顺序修正（当天最重要的 bug）★★
+  # nav_params.py 按 pristine 快照**整份重写** nav2 参数文件；如果视觉图层先注入，
+  # 就会被这次重写**整块抹掉** ⇒ 探索建图的 nav2 从来没有 vision_* 层
+  # ⇒ 视觉障碍不进全局代价地图 ⇒ 规划路径横穿"雷达看不见的视觉障碍"。
+  # nav_only 不跑 nav_params，所以那边没有这个症状（用户实测对比即由此而来）。
+  # 因此顺序必须是：nav_params → 视觉注入 → 回读校验。
+  if [ "$VISION" = "1" ]; then
+    python3 harness/vision_nav_params.py --apply --global-mode "$VISION_MODE" 2>&1 | tee -a "$OUT/harness.log"
+    VISION_APPLY_RC=${PIPESTATUS[0]}
+    if [ "$VISION_APPLY_RC" != "0" ]; then
+      say "✗ 视觉图层注入失败，放弃本轮（参数文件未被改动）"
+      rec '"verdict":"FAIL_vision_params"'
+      exit 11
+    fi
+    VISION_CHK=$(python3 harness/vision_nav_params.py --check 2>&1)
+    if ! echo "$VISION_CHK" | grep -q 'local_costmap.plugins = .*vision_voxel_layer' \
+       || ! echo "$VISION_CHK" | grep -q 'global_costmap.plugins = .*vision_obstacle_layer'; then
+      say "✗ 视觉图层回读校验失败：costmap plugins 里没有视觉图层，放弃本轮"
+      echo "$VISION_CHK" | tail -4 | tee -a "$OUT/harness.log"
+      python3 harness/vision_nav_params.py --restore >/dev/null 2>&1
+      rec '"verdict":"FAIL_vision_layers"'
+      exit 12
+    fi
+    say "✓ 视觉图层回读校验通过（已确认在 nav_params 之后落盘）"
+    echo "$VISION_CHK" | grep -E '\.plugins = ' | tee -a "$OUT/harness.log"
+    rec '"check":"vision_layers","ok":true'
+  else
+    python3 harness/vision_nav_params.py --restore 2>&1 | tee -a "$OUT/harness.log" || true
+    python3 harness/patch_car_launch.py --restore 2>&1 | tee -a "$OUT/harness.log" || true
   fi
-else
-  python3 harness/vision_nav_params.py --restore 2>&1 | tee -a "$OUT/harness.log" || true
-python3 harness/patch_car_launch.py --restore 2>&1 | tee -a "$OUT/harness.log" || true
-fi
+
+
 setsid bash -c "echo \$\$ > '$OUT/pgid'; exec ros2 launch stemm_cartographer_exploration_sim sim_explore.launch.py explore_sec:=$EXPLORE_F world:=${WORLD:-$DEFAULT_WORLD} spawn_x:=$SX spawn_y:=$SY spawn_yaw:=$SYAW disable_retreat:=$DISABLE_RETREAT escape_supervisor:=$SUPERVISOR car_escape:=$CAR_ESCAPE rviz:=${RVIZ:-false} gazebo_gui:=${GUI:-false} stack_delay:=$(as_float "${STACK_DELAY:-0.0}") scoring:=${SCORING:-v1} veto:=$([ "${VETO:-true}" = "1" ] || [ "${VETO:-true}" = "true" ] && echo true || echo false) plan_guard_log:=$([ "${PLAN_GUARD_LOG:-0}" = "1" ] && echo true || echo false) plan_guard_veto:=$([ "${PLAN_GUARD_VETO:-0}" = "1" ] && echo true || echo false) failfast:=$([ "${FAILFAST:-0}" = "1" ] && echo true || echo false) failfast_window:=$(as_float "${FF_WINDOW:-20.0}") failfast_drift:=$(as_float "${FF_DRIFT:-0.20}") failfast_front:=$(as_float "${FF_FRONT:-0.60}") failfast_confirm:=${FF_CONFIRM:-2} failfast_ttl:=$(as_float "${FF_TTL:-60.0}") failfast_hard_radius:=$(as_float "${FF_HARD_R:-1.2}") failfast_zone_radius:=$(as_float "${FF_ZONE_R:-2.0}") failfast_max_actions:=${FF_MAX:-8} failfast_escalate:=$(as_float "${FF_ESC:-40.0}") failfast_comp_radius:=$(as_float "${FF_COMP_R:-6.0}") return_wait_goal_sec:=$(as_float "${RWG_SEC:-20.0}") veto_max:=${VETO_MAX:-6} veto_cooldown:=$VETO_CD_F veto_migrate:=$([ "${VETO_MIGRATE:-1}" = "1" ] && echo true || echo false) veto_migrate_mode:=${VETO_MIGRATE_MODE:-random} veto_migrate_r:=${VETO_MIGRATE_R:-2.0} veto_migrate_n:=${VETO_MIGRATE_N:-32} veto_migrate_move:=${VETO_MIGRATE_MOVE:-1.0} gate:=${GATE:-false} corridor_width:=$CORRIDOR_W_F max_candidates:=${MAX_CAND:-14} retreat_max:=${RETREAT_MAX:-2} retreat_interval:=$(as_float "${RETREAT_IVL:-8.0}") pass_width:=$(as_float "${PASS_W:-0.90}") narrow_len_max:=$(as_float "${NARROW_LEN_MAX:-1.00}") unknown_span_max:=$(as_float "${UNK_SPAN_MAX:-0.35}") unknown_block:=$([ "${UNKNOWN_BLOCK:-0}" = "1" ] && echo true || echo false) width_unknown_block:=$([ "${WIDTH_UNK_BLOCK:-0}" = "1" ] && echo true || echo false) noexit_enabled:=$([ "${NOEXIT:-0}" = "1" ] && echo true || echo false) noexit_pinch_m:=$(as_float "${NOEXIT_PINCH:-0.752}") noexit_short_m:=$(as_float "${NOEXIT_SHORT:-0.35}") noexit_retreat_m:=$(as_float "${NOEXIT_RETREAT:-1.20}") noexit_turn_m:=$(as_float "${NOEXIT_TURN:-0.81}") noexit_retreat_need_m:=$(as_float "${NOEXIT_RETREAT_NEED:-1.00}") noexit_turn_hold_m:=$(as_float "${NOEXIT_TURN_HOLD:-0.30}") supervisor_rotate_min_range:=$(as_float "${SUP_ROT_MIN:-0.34}") supervisor_advance_stop_range:=$(as_float "${SUP_ADV_STOP:-0.34}") supervisor_explore_reverse:=$([ "${SUP_EXPLORE_REV:-0}" = "1" ] && echo true || echo false) supervisor_explore_reverse_max_m:=$(as_float "${SUP_EXPLORE_REV_M:-0.15}") supervisor_explore_reverse_speed:=$(as_float "${SUP_EXPLORE_REV_V:-0.06}") supervisor_explore_reverse_max_count:=${SUP_EXPLORE_REV_N:-4} supervisor_explore_reverse_front:=$(as_float "${SUP_EXPLORE_REV_FRONT:-0.70}") supervisor_explore_reverse_block_sec:=$(as_float "${SUP_EXPLORE_REV_BLOCK:-6.0}") supervisor_explore_reverse_takeover:=$([ "${SUP_EXPLORE_REV_TAKEOVER:-1}" = "1" ] && echo true || echo false) supervisor_explore_reverse_rear_clear:=$(as_float "${SUP_EXPLORE_REV_REAR:-0.40}") supervisor_contact_reverse:=$([ "${CONTACT_REV:-0}" = "1" ] && echo true || echo false) supervisor_contact_reverse_window:=$(as_float "${CONTACT_REV_WIN:-5.0}") supervisor_contact_reverse_max:=${CONTACT_REV_MAX:-3} supervisor_contact_reverse_cool:=$(as_float "${CONTACT_REV_COOL:-3.0}") supervisor_contact_reverse_front:=$(as_float "${CONTACT_REV_FRONT:-0.90}") contact_fail:=$([ "${CONTACT_FAIL:-0}" = "1" ] && echo true || echo false) contact_fail_max:=${CONTACT_FAIL_MAX:-6} contact_fail_cooldown:=$(as_float "${CONTACT_FAIL_COOL:-3.0}") goal_merge:=$([ "$GOAL_GATE" = "1" ] && echo true || echo false) merge_ttl:=${MERGE_TTL:-5.0} merge_raw_period:=${MERGE_RAW_PERIOD:-0.5} merge_dedupe_r:=${MERGE_DEDUPE_R:-0.0} merge_dedupe_sec:=${MERGE_DEDUPE_SEC:-0.0} merge_log:=$OUT/merge.jsonl cost_gate:=$([ "$COST_GATE" = "1" ] && echo true || echo false) cost_gate_hard:=${COST_GATE_HARD:-99} cost_gate_disc:=${COST_GATE_DISC:-0.35} cost_gate_free:=${COST_GATE_FREE:-0.80} cost_repair:=$([ "${REPAIR_ON:-1}" = "1" ] && echo true || echo false) cost_repair_radius:=${REPAIR_R:-1.20} cost_repair_samples:=${REPAIR_N:-24} cost_repair_keep_unknown:=${REPAIR_KEEP:-0.30} cost_repair_min_unknown:=${REPAIR_MIN_UNK:-20} corridor_block:=$([ "${CORR:-0}" = "1" ] && echo true || echo false) corridor_radius:=$(as_float "${CORR_R:-0.35}") corridor_ttl:=$(as_float "${CORR_TTL:-30.0}") corridor_ttl_max:=$(as_float "${CORR_TTL_MAX:-180.0}") probe_log:=$OUT/probe.jsonl supervisor_log:=$OUT/supervisor.jsonl vision:=$VISION vision_decay_sec:=$(as_float "${VISION_DECAY:-0.0}") vision_accum_decay_sec:=$(as_float "${VISION_ACCUM_DECAY:-$([ "$VISION_MODE" = "accum" ] && echo 120.0 || echo -1.0)}") vision_low_accum_decay_sec:=$(as_float "${VISION_LOW_DECAY:-$([ "$VISION_MODE" = "lowaccum" ] && echo 120.0 || echo 0.0)}") vision_dump:=$OUT/vision_grid   # 不再允许为空：空值会让 launch 报 malformed launch argument（踩过两次） watchdog_log:=$OUT/watchdog.jsonl nudge_log:=$OUT/nudge.jsonl candidate_probe_log:=$OUT/candidate_probe.jsonl timeline_log:=$OUT/timeline.jsonl" \
   > "$OUT/launch.log" 2>&1 < /dev/null 9>&- &
 sleep 3; PGID=$(cat "$OUT/pgid" 2>/dev/null || echo "")
