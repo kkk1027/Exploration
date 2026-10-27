@@ -323,7 +323,7 @@ def generate_launch_description():
             description='P9-S0：物理接触时取消当前目标（默认关）'),
         DeclareLaunchArgument('contact_fail_max', default_value='6',
             description='P9-S0：每轮最多因接触取消几次目标'),
-        DeclareLaunchArgument('corridor_block', default_value='true',
+        DeclareLaunchArgument('corridor_block', default_value='false',
             description='P9-CORR：把"穿窄处"的窄点记成不可通行走廊并拒绝穿过（本轮内存）'),
         DeclareLaunchArgument('corridor_radius', default_value='0.35',
             description='P9-CORR：走廊半径（m）'),
