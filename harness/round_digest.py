@@ -363,6 +363,28 @@ def main():
     _st = sum(s["dur"] for s in stuck)
     _st30 = sum(1 for s in stuck if s["dur"] >= 30)
     lines.append(f'- 停滞总秒数: **{_st:.0f} s**　≥30 s: **{_st30}** 条')
+    # 2026-10-27 新增 KPI：候选供给断流（manager 停在 waiting_for_rrt_goal）。
+    # 用户口径的"路径已生成但车不动"就是这一段：没有目标可执行 → cmd=0 → 车静止，
+    # 而 RViz 里还留着上一条 /plan。旧版 digest 完全看不到它，所以反复被浪费时间。
+    _wg_tot, _wg_max = 0.0, 0.0
+    try:
+        _t0 = None
+        for _r in tl:
+            _s = _r.get('sim') or 0
+            if 'waiting_for_rrt' in str(_r.get('nav')):
+                if _t0 is None:
+                    _t0 = _s
+                _wg_max = max(_wg_max, _s - _t0)
+            else:
+                if _t0 is not None:
+                    _wg_tot += _s - _t0
+                _t0 = None
+        if _t0 is not None:
+            _wg_tot += (tl[-1].get('sim') or 0) - _t0
+            _wg_max = max(_wg_max, _wg_tot)
+    except Exception:                       # noqa: BLE001
+        pass
+    lines.append(f'- 等候选(waiting_for_rrt_goal): **{_wg_tot:.0f} s**　最长一段 **{_wg_max:.0f} s**')
     lines.append(f'- 派发来源: ' + '　'.join(
         f'{k}={v}({100*v//total_src}%)' for k, v in src.most_common()) if src else '- 派发: 无记录')
     lines.append('')

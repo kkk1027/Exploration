@@ -168,6 +168,22 @@ def generate_launch_description():
                  parameters=[{'use_sim_time': use_sim_time,
                               'log_path': LaunchConfiguration('probe_log')}])
 
+    # 候选合并器（2026-10-27）：仲裁合格目标优先，TTL 到期回落到 RRT 原始样本。
+    # 背景：把 manager 直接指到 /validated_frontier_goal（单源化）后，manager 会长时间
+    # 停在 waiting_for_rrt_goal（实测一轮里连续 93 s）：仲裁器窄道预检一拍没找到候选就
+    # 不发布，而 manager 只认这一个源 ⇒ 供给断流 ⇒ 车静止但 RViz 还留着上一条 /plan。
+    merge = Node(package='stemm_cartographer_exploration_sim',
+                 executable='frontier_merge', name='frontier_merge',
+                 output='screen',
+                 condition=IfCondition(LaunchConfiguration('goal_merge')),
+                 parameters=[{'use_sim_time': use_sim_time,
+                              'validated_topic': '/validated_frontier_goal',
+                              'raw_topic': '/assigned_frontier_goal',
+                              'out_topic': '/merged_frontier_goal',
+                              'validated_ttl': LaunchConfiguration('merge_ttl'),
+                              'raw_min_period': LaunchConfiguration('merge_raw_period'),
+                              'log_path': LaunchConfiguration('merge_log')}])
+
     # 方案A：深度相机 → 视觉障碍（补 2D 雷达的结构性盲区，见 P0_验收记录 §3b）
     #   节点本身只发话题；nav2 侧的图层注入由 harness/vision_nav_params.py 在启动前完成
     #   （nav2 的 plugins 列表只能在启动时生效），两侧都用 vision:= 开关，一键回退。
@@ -360,6 +376,14 @@ def generate_launch_description():
             description='闸门复杂区软惩罚阈值（2 m 内障碍占比）'),
         # 候选后验门（2026-10-27）：候选是在"当时的地图"上选的，等雷达/视觉扫到那一带，
         # 同一位置可能已被膨胀/占据/视觉障碍覆盖。下发前用当前全局代价地图复核落点。
+        DeclareLaunchArgument('goal_merge', default_value='false',
+            description='起候选合并器 frontier_merge（仲裁优先 + RRT 兜底）'),
+        DeclareLaunchArgument('merge_ttl', default_value='5.0',
+            description='仲裁合格目标的独占秒数'),
+        DeclareLaunchArgument('merge_raw_period', default_value='0.5',
+            description='原始样本限速（秒/条）'),
+        DeclareLaunchArgument('merge_log', default_value='',
+            description='合并器统计 jsonl 路径（空=只打印）'),
         DeclareLaunchArgument('cost_gate', default_value='false',
             description='候选后验门开关'),
         DeclareLaunchArgument('cost_gate_hard', default_value='99',
@@ -487,6 +511,7 @@ def generate_launch_description():
                         '（ready_guard 90 s 内未激活、整轮被打断），故恢复固定延迟。'),
         robot,
         probe,
+        merge,
         # 2026-10-23 起栈降载：视觉源/看门狗/nudge 都挪到"栈启动之后"再起。
         # 实测起栈窗口（gzserver+cartographer+nav2 生命周期）对 CPU 极敏感，
         # 多压一个点云节点/一个 rviz 就可能让 controller_server 停在 inactive、

@@ -1,0 +1,142 @@
+#!/usr/bin/env python3
+"""frontier_merge —— 候选合并器：仲裁合格目标优先，TTL 到期回落到 RRT 原始样本。
+
+为什么要有它（2026-10-27 实测）
+--------------------------------
+把 manager 的 `frontier_goal_topic` 直接指到仲裁器输出 `/validated_frontier_goal`
+（单源化）之后，manager 会长时间停在 `waiting_for_rrt_goal`：
+
+    gate10r1：等候选合计 119 s / 219 s，其中一段连续 93 s
+              该段 cmd=[0,0]、front=1.35 m（前方通畅）、目标坐标不变
+              RViz 里仍显示上一条 /plan 的线 ⇒ 用户口径"路径已生成但车不动"
+
+原因是仲裁器一拍里若找不到过窄道预检的候选就**不发布**（该轮 published=32，
+rejected_narrow=877），而 manager 只认这一个源 → 供给断流。历史基线（GOAL_GATE=0）
+本来也有 3–27 s 空窗，单源化把它放大到 92 s。
+
+本节点的策略
+------------
+  两个输入：/validated_frontier_goal（仲裁合格）、/assigned_frontier_goal（RRT 原始）
+  一个输出：/merged_frontier_goal（manager 订阅它）
+
+  * 收到仲裁合格目标 → 立即转发，并在此后 `validated_ttl` 秒内独占输出；
+  * 独占期外的原始样本 → 限速转发（`raw_min_period` 秒一条），保证不断供；
+  * 独占期内到达的原始样本 → 压掉并计数（merge_suppressed）。
+
+统计（每 `report_period` 秒打印一行；`log_path` 非空时同时写 jsonl）
+  merge_validated / merge_raw / merge_suppressed / gap_max_s（最长无输出间隔）
+"""
+import argparse
+import json
+import time
+
+import rclpy
+from geometry_msgs.msg import PoseStamped
+from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+
+
+class FrontierMerge(Node):
+    def __init__(self):
+        super().__init__('frontier_merge')
+        d = self.declare_parameter
+        d('validated_topic', '/validated_frontier_goal')
+        d('raw_topic', '/assigned_frontier_goal')
+        d('out_topic', '/merged_frontier_goal')
+        d('validated_ttl', 5.0)
+        d('raw_min_period', 0.5)
+        d('report_period', 10.0)
+        d('log_path', '')
+        g = self.get_parameter
+        self.v_topic = str(g('validated_topic').value)
+        self.r_topic = str(g('raw_topic').value)
+        self.o_topic = str(g('out_topic').value)
+        self.ttl = float(g('validated_ttl').value)
+        self.raw_period = float(g('raw_min_period').value)
+        self.report_period = float(g('report_period').value)
+        self.log_path = str(g('log_path').value)
+
+        self.pub = self.create_publisher(PoseStamped, self.o_topic, 10)
+        q = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE,
+                       durability=DurabilityPolicy.VOLATILE)
+        self.create_subscription(PoseStamped, self.v_topic, self.on_validated, q)
+        self.create_subscription(PoseStamped, self.r_topic, self.on_raw, q)
+
+        self.stats = {'merge_validated': 0, 'merge_raw': 0, 'merge_suppressed': 0,
+                      'gap_max_s': 0.0}
+        self._last_validated = None      # 秒（ros 时间）
+        self._last_raw = None
+        self._last_out = None
+        self._t_report = time.time()
+        self._fh = open(self.log_path, 'a', encoding='utf-8') if self.log_path else None
+        self.get_logger().info(
+            '候选合并器：%s(ttl=%.1fs 优先) + %s(限速 %.1fs) → %s'
+            % (self.v_topic, self.ttl, self.r_topic, self.raw_period, self.o_topic))
+
+    # ---- 时间：优先用仿真时间（/clock），取不到退回单调时钟 ----
+    def now_s(self):
+        try:
+            return self.get_clock().now().nanoseconds / 1e9
+        except Exception:                       # noqa: BLE001
+            return time.monotonic()
+
+    def _emit(self, msg, kind):
+        self.pub.publish(msg)
+        now = self.now_s()
+        if self._last_out is not None:
+            gap = now - self._last_out
+            if gap > self.stats['gap_max_s']:
+                self.stats['gap_max_s'] = round(gap, 1)
+        self._last_out = now
+        self.stats['merge_' + kind] += 1
+
+    def on_validated(self, m):
+        self._last_validated = self.now_s()
+        self._emit(m, 'validated')
+
+    def on_raw(self, m):
+        now = self.now_s()
+        if self._last_validated is not None and (now - self._last_validated) < self.ttl:
+            self.stats['merge_suppressed'] += 1
+            return
+        if self._last_raw is not None and (now - self._last_raw) < self.raw_period:
+            return
+        self._last_raw = now
+        self._emit(m, 'raw')
+
+    def report(self):
+        if time.time() - self._t_report < self.report_period:
+            return
+        self._t_report = time.time()
+        row = dict(self.stats)
+        row['sim'] = round(self.now_s(), 1)
+        self.get_logger().info(
+            'merge: validated=%d raw=%d suppressed=%d gap_max=%.1fs'
+            % (row['merge_validated'], row['merge_raw'], row['merge_suppressed'],
+               row['gap_max_s']))
+        if self._fh:
+            self._fh.write(json.dumps(row) + '\n')
+            self._fh.flush()
+
+
+def main():
+    rclpy.init()
+    n = FrontierMerge()
+    n.create_timer(1.0, n.report)
+    try:
+        rclpy.spin(n)
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    except Exception:                           # noqa: BLE001
+        # ExternalShutdownException 等：launch 结束时的正常路径
+        pass
+    finally:
+        if n._fh:
+            n._fh.close()
+        n.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
