@@ -541,6 +541,17 @@ class Arbiter(Node):
         self.contact_hits = {}
         self._cf_count = 0
         self._cf_last = 0.0
+        # P9-CORR（2026-10-27 用户批准机制 1/2/4，**不跨轮持久**）：
+        #   1) 计划体检授权：/plan 穿 <pass_width 的缝 → 直接取消（plan_guard_veto）
+        #   2) 走廊级记忆：把"穿窄处"的窄点记成不可通行走廊（本轮内存，命中递增 TTL）
+        #   4) 统一入口：在 on_plan 里对所有来源的 /plan 都查走廊，不只查我方候选
+        self.corridor_block_enabled = self._as_bool(p('corridor_block_enabled', True).value)
+        self.corridor_radius_m = float(p('corridor_radius_m', 0.35).value)
+        self.corridor_ttl_sec = float(p('corridor_ttl_sec', 30.0).value)
+        self.corridor_ttl_max_sec = float(p('corridor_ttl_max_sec', 180.0).value)
+        self.corridors = []        # [{x,y,r,w,exp,hits}] 仅本轮内存（用户明确不跨轮持久）
+        self._corr_last = 0.0
+        self._corr_veto_min_gap = float(p('corridor_veto_min_gap', 2.0).value)
         self._last_path_reject = None
         # 半径取 0.6 m："这一脚到那儿能不能转过身"，而不是"附近某处有片空地"。
         # 取 1.2 m 时实测 3 轮里一次都没触发（房间尺度上总能找到空地），等于没生效。
@@ -1164,6 +1175,9 @@ class Arbiter(Node):
                         % (n_pts, min_w, min_i, xy, first_w, narrow_run, oob,
                            self.pass_width, self.narrow_len_max,
                            '穿窄处' if bad else 'OK'))
+                    if bad and (self.plan_guard_veto or self.corridor_block_enabled):
+                        if min_xy is not None:
+                            self._corridor_add(min_xy[0], min_xy[1], min_w)
                     if bad and self.plan_guard_veto \
                             and self._pg_cancels < self.plan_guard_max_cancel:
                         self._pg_cancels += 1
@@ -1173,6 +1187,27 @@ class Arbiter(Node):
                             % (min_w, narrow_run, self._pg_cancels))
                         self._do_veto_cancel()
                         return
+        # P9-CORR 机制4：**所有来源**的 /plan 都先查走廊（含车端 RRT 派发的目标），
+        # 不必等逐点体检；命中就取消，并对同一走廊做 2 s 限速，避免与 manager 拉锯。
+        if self.corridor_block_enabled and self.corridors and self._explore_phase():
+            pts = [m.poses[0].pose.position, m.poses[-1].pose.position]
+            hit = None
+            for pp in pts:
+                hit = self._corridor_hit(float(pp.x), float(pp.y))
+                if hit is not None:
+                    break
+            if hit is not None:
+                now_c = time.monotonic()
+                if now_c - self._corr_last >= self._corr_veto_min_gap \
+                        and self._pg_cancels < self.plan_guard_max_cancel + 6:
+                    if self._do_veto_cancel():
+                        self._corr_last = now_c
+                        self._pg_cancels += 1
+                        self.stats['corridor_veto'] = self.stats.get('corridor_veto', 0) + 1
+                        self.get_logger().warn(
+                            '✗ 目标落在已知不可通行走廊内（净宽 %.2f m @(%.2f,%.2f)）→ 取消'
+                            % (hit['w'], hit['x'], hit['y']))
+                        return
         if not self.veto_enabled:
             return
         try:
@@ -1181,6 +1216,65 @@ class Arbiter(Node):
         except Exception:                       # noqa: BLE001
             return
         self.veto_probe(gx, gy, tag='plan')
+
+    # ---------------- P9-CORR：走廊级记忆（本轮内存） ----------------
+    def _corridor_add(self, x, y, w):
+        """把"穿窄处"的窄点记成不可通行走廊；同一处重复命中则延长失效时间。"""
+        if not self.corridor_block_enabled:
+            return
+        now = time.monotonic()
+        for c in self.corridors:
+            if math.hypot(x - c['x'], y - c['y']) <= 0.6:
+                c['hits'] = int(c.get('hits', 1)) + 1
+                c['w'] = min(float(c.get('w', w)), float(w))
+                ttl = min(self.corridor_ttl_max_sec, self.corridor_ttl_sec * c['hits'])
+                c['exp'] = now + ttl
+                self.get_logger().warn(
+                    '走廊记忆更新：(%.2f,%.2f) 净宽 %.2f m，第 %d 次，记忆 %.0fs'
+                    % (c['x'], c['y'], c['w'], c['hits'], ttl))
+                return
+        self.corridors.append({'x': x, 'y': y, 'r': self.corridor_radius_m,
+                               'w': float(w), 'hits': 1,
+                               'exp': now + self.corridor_ttl_sec})
+        if len(self.corridors) > 30:
+            self.corridors = self.corridors[-30:]
+        self.get_logger().warn(
+            '走廊记忆新增：(%.2f,%.2f) 净宽 %.2f m（本轮内存，%0.f s）'
+            % (x, y, w, self.corridor_ttl_sec))
+
+    def _corridor_prune(self):
+        if not self.corridors:
+            return
+        now = time.monotonic()
+        keep = [c for c in self.corridors if c['exp'] > now]
+        if len(keep) != len(self.corridors):
+            self.corridors = keep
+            self.stats['corridors_active'] = len(keep)
+
+    def _corridor_hit(self, x, y):
+        """点是否落在某条"不可通行走廊"里（本轮内存、带 TTL）。"""
+        if not self.corridor_block_enabled or not self.corridors:
+            return None
+        now = time.monotonic()
+        for c in self.corridors:
+            if c['exp'] <= now:
+                continue
+            if math.hypot(x - c['x'], y - c['y']) <= max(c['r'], 0.3):
+                return c
+        return None
+
+    def _corridor_blocked_path(self, path, res, ox, oy, w):
+        """BFS 路径是否穿过任一条走廊（每隔 4 个点采样）。"""
+        if not self.corridor_block_enabled or not self.corridors:
+            return None
+        for i in range(0, len(path), 4):
+            idx = path[i]
+            wx = (idx % w) * res + ox
+            wy = (idx // w) * res + oy
+            c = self._corridor_hit(wx, wy)
+            if c is not None:
+                return (wx, wy, c)
+        return None
 
     def veto_probe(self, gx, gy, tag=''):
         """对一个外部目标做后置否决判定（拆出来便于离线自测）。"""
@@ -1461,6 +1555,9 @@ class Arbiter(Node):
                 'rejected_oneway': self.stats.get('rejected_oneway', 0),
                 # P9-A 观测：A 打开后必须能看到"救回多少供给 / 否决多少不可退出"
                 'contact_fail_cancel': self.stats.get('contact_fail_cancel', 0),
+                'corridor_veto': self.stats.get('corridor_veto', 0),
+                'reject_corridor': self.stats.get('reject_corridor', 0),
+                'corridors_active': len(self.corridors),
                 'reject_noexit': self.stats.get('reject_noexit', 0),
                 'noexit_passed': self.stats.get('noexit_passed', 0),
                 'noexit_checked': self.stats.get('noexit_checked', 0),
@@ -1686,6 +1783,15 @@ class Arbiter(Node):
                 return 100
             return odata[my * ow + mx]
 
+        # P9-CORR：路径穿过已知"不可通行走廊" → 直接否决（机制2 的消费端）
+        self._corridor_prune()
+        if self.corridor_block_enabled and self.corridors:
+            blk = self._corridor_blocked_path(path, res, ox, oy, w)
+            if blk is not None:
+                self.stats['reject_corridor'] = self.stats.get('reject_corridor', 0) + 1
+                self._note_uniq('reject_corridor', blk[0], blk[1])
+                self._last_path_reject = 'corridor'
+                return True, (blk[0], blk[1]), None, 0.0
         # ---- D1/D2/D3：优先用"到最近障碍的距离场"（含视觉障碍，且整条路径到末端都查）----
         field = self.clearance_field() if self.clearance_mode == 'distance' else None
         if field is not None:
