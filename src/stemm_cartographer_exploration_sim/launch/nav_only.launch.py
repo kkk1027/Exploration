@@ -62,10 +62,31 @@ def generate_launch_description():
                           parameters=[{'use_sim_time': use_sim_time,
                                        'autostart': True,
                                        'node_names': ['map_server']}])
-    map_to_odom = Node(package='tf2_ros', executable='static_transform_publisher',
-                       name='map_to_odom_static', output='screen',
-                       arguments=['0', '0', '0', '0', '0', '0',
-                                  'map', 'odom_combined'])
+    # 2026-10-27：**不能**用 map→odom 单位变换硬指。实测雷达与静态地图完全对不上
+    # （左/右/前/后距离无任何一致项 ⇒ 车并不在静态地图的原点）。
+    # 正确做法：用 AMCL 对静态地图做定位，由它发布 map→odom。
+    amcl = Node(package='nav2_amcl', executable='amcl', name='amcl', output='screen',
+                parameters=[{'use_sim_time': use_sim_time,
+                             'alpha1': 0.2, 'alpha2': 0.2, 'alpha3': 0.2, 'alpha4': 0.2,
+                             'alpha5': 0.2,
+                             'base_frame_id': 'base_footprint',
+                             'global_frame_id': 'map',
+                             'odom_frame_id': 'odom_combined',
+                             'scan_topic': 'scan',
+                             'laser_max_range': 30.0,
+                             'laser_min_range': 0.15,
+                             'laser_model_type': 'likelihood_field',
+                             'max_particles': 2000, 'min_particles': 500,
+                             'tf_broadcast': True,
+                             # 初始位姿 = 建图那一轮的出生点 (0,0,0)
+                             'set_initial_pose': True,
+                             'initial_pose': {'x': 0.0, 'y': 0.0, 'z': 0.0,
+                                              'yaw': 0.0}}])
+    lifecycle_amcl = Node(package='nav2_lifecycle_manager', executable='lifecycle_manager',
+                          name='lifecycle_manager_amcl', output='screen',
+                          parameters=[{'use_sim_time': use_sim_time,
+                                       'autostart': True,
+                                       'node_names': ['amcl']}])
 
     # 3) 只要 nav2（车端那份参数；不起 manager/RRT/watchdog/session/tf_guard）
     nav2 = IncludeLaunchDescription(
@@ -112,5 +133,5 @@ def generate_launch_description():
         DeclareLaunchArgument('plan_audit_log', default_value=''),
         DeclareLaunchArgument('contact_log', default_value=''),
         DeclareLaunchArgument('nav_start_delay', default_value='8.0'),
-        sim, map_server, lifecycle_maps, map_to_odom, nav2_delayed, audit, contacts, rviz,
+        sim, map_server, lifecycle_maps, amcl, lifecycle_amcl, nav2_delayed, audit, contacts, rviz,
     ])
