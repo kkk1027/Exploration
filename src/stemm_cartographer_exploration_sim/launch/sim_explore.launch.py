@@ -188,6 +188,8 @@ def generate_launch_description():
                               'out_topic': '/merged_frontier_goal',
                               'validated_ttl': LaunchConfiguration('merge_ttl'),
                               'raw_min_period': LaunchConfiguration('merge_raw_period'),
+                              'raw_dedupe_radius': LaunchConfiguration('merge_dedupe_r'),
+                              'raw_dedupe_sec': LaunchConfiguration('merge_dedupe_sec'),
                               'log_path': LaunchConfiguration('merge_log')}])
 
     # 方案A：深度相机 → 视觉障碍（补 2D 雷达的结构性盲区，见 P0_验收记录 §3b）
@@ -388,6 +390,10 @@ def generate_launch_description():
             description='仲裁合格目标的独占秒数'),
         DeclareLaunchArgument('merge_raw_period', default_value='0.5',
             description='原始样本限速（秒/条）'),
+        DeclareLaunchArgument('merge_dedupe_r', default_value='0.50',
+            description='原始样本去重半径 m（与近期已转发点重合即丢弃）'),
+        DeclareLaunchArgument('merge_dedupe_sec', default_value='8.0',
+            description='原始样本去重时间窗 s'),
         DeclareLaunchArgument('merge_log', default_value='',
             description='合并器统计 jsonl 路径（空=只打印）'),
         DeclareLaunchArgument('cost_gate', default_value='false',

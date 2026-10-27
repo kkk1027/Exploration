@@ -28,6 +28,7 @@ rejected_narrow=877），而 manager 只认这一个源 → 供给断流。历�
 """
 import argparse
 import json
+import math
 import time
 
 import rclpy
@@ -45,6 +46,13 @@ class FrontierMerge(Node):
         d('out_topic', '/merged_frontier_goal')
         d('validated_ttl', 5.0)
         d('raw_min_period', 0.5)
+        # (a) 治理"候选源重复样本"：实测 RRT 会每隔 ~8 s 重投同一个投影点
+        #   （projected RRT boundary sample from (5.13,-4.96) to known-free (5.15,-4.56)），
+        #   而 manager 收到→取消→回到 waiting_for_rrt_goal 空转。
+        #   这里把"与最近 raw_dedupe_sec 秒内已转发过的点重合（raw_dedupe_radius 内）"的
+        #   原始样本丢掉，避免同一坐标反复触发派发/取消循环；新坐标照常放行。
+        d('raw_dedupe_radius', 0.50)
+        d('raw_dedupe_sec', 8.0)
         d('report_period', 10.0)
         d('log_path', '')
         g = self.get_parameter
@@ -53,6 +61,8 @@ class FrontierMerge(Node):
         self.o_topic = str(g('out_topic').value)
         self.ttl = float(g('validated_ttl').value)
         self.raw_period = float(g('raw_min_period').value)
+        self.dedupe_r = float(g('raw_dedupe_radius').value)
+        self.dedupe_sec = float(g('raw_dedupe_sec').value)
         self.report_period = float(g('report_period').value)
         self.log_path = str(g('log_path').value)
 
@@ -63,15 +73,17 @@ class FrontierMerge(Node):
         self.create_subscription(PoseStamped, self.r_topic, self.on_raw, q)
 
         self.stats = {'merge_validated': 0, 'merge_raw': 0, 'merge_suppressed': 0,
-                      'gap_max_s': 0.0}
+                      'merge_dup': 0, 'gap_max_s': 0.0}
+        self._recent_raw = []            # [(t, x, y)] 最近转发过的原始样本坐标
         self._last_validated = None      # 秒（ros 时间）
         self._last_raw = None
         self._last_out = None
         self._t_report = time.time()
         self._fh = open(self.log_path, 'a', encoding='utf-8') if self.log_path else None
         self.get_logger().info(
-            '候选合并器：%s(ttl=%.1fs 优先) + %s(限速 %.1fs) → %s'
-            % (self.v_topic, self.ttl, self.r_topic, self.raw_period, self.o_topic))
+            '候选合并器：%s(ttl=%.1fs 优先) + %s(限速 %.1fs, 去重 %.2fm/%.0fs) → %s'
+            % (self.v_topic, self.ttl, self.r_topic, self.raw_period,
+               self.dedupe_r, self.dedupe_sec, self.o_topic))
 
     # ---- 时间：优先用仿真时间（/clock），取不到退回单调时钟 ----
     def now_s(self):
@@ -101,6 +113,15 @@ class FrontierMerge(Node):
             return
         if self._last_raw is not None and (now - self._last_raw) < self.raw_period:
             return
+        px, py = m.pose.position.x, m.pose.position.y
+        self._recent_raw = [r for r in self._recent_raw if now - r[0] < self.dedupe_sec]
+        for (t, rx, ry) in self._recent_raw:
+            if math.hypot(px - rx, py - ry) <= self.dedupe_r:
+                self.stats['merge_dup'] += 1
+                return
+        self._recent_raw.append((now, px, py))
+        if len(self._recent_raw) > 60:
+            self._recent_raw = self._recent_raw[-60:]
         self._last_raw = now
         self._emit(m, 'raw')
 
@@ -111,9 +132,9 @@ class FrontierMerge(Node):
         row = dict(self.stats)
         row['sim'] = round(self.now_s(), 1)
         self.get_logger().info(
-            'merge: validated=%d raw=%d suppressed=%d gap_max=%.1fs'
-            % (row['merge_validated'], row['merge_raw'], row['merge_suppressed'],
-               row['gap_max_s']))
+            'merge: validated=%d raw=%d dup=%d suppressed=%d gap_max=%.1fs'
+            % (row['merge_validated'], row['merge_raw'], row['merge_dup'],
+               row['merge_suppressed'], row['gap_max_s']))
         if self._fh:
             self._fh.write(json.dumps(row) + '\n')
             self._fh.flush()
