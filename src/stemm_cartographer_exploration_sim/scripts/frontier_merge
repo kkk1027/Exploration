@@ -51,8 +51,12 @@ class FrontierMerge(Node):
         #   而 manager 收到→取消→回到 waiting_for_rrt_goal 空转。
         #   这里把"与最近 raw_dedupe_sec 秒内已转发过的点重合（raw_dedupe_radius 内）"的
         #   原始样本丢掉，避免同一坐标反复触发派发/取消循环；新坐标照常放行。
-        d('raw_dedupe_radius', 0.50)
-        d('raw_dedupe_sec', 8.0)
+        # 2026-10-27 实测（dd5 vs rep5，各 5 轮）：去重反而更差——
+        #   停滞中位 29→52 s、等候选 52→62 s（最长段 12→17 s）、覆盖 60.6k→56.5k（−7%）。
+        #   原因：被丢的是"唯一在手的兜底供给"，而 RRT 并不会因此换点。
+        # 故默认**关闭**（0=不去重）；要再试可传 RAW_DEDUPE_R / MERGE_DEDUPE_SEC。
+        d('raw_dedupe_radius', 0.0)
+        d('raw_dedupe_sec', 0.0)
         d('report_period', 10.0)
         d('log_path', '')
         g = self.get_parameter
@@ -114,7 +118,10 @@ class FrontierMerge(Node):
         if self._last_raw is not None and (now - self._last_raw) < self.raw_period:
             return
         px, py = m.pose.position.x, m.pose.position.y
-        self._recent_raw = [r for r in self._recent_raw if now - r[0] < self.dedupe_sec]
+        if self.dedupe_sec > 0 and self.dedupe_r > 0:
+            self._recent_raw = [r for r in self._recent_raw if now - r[0] < self.dedupe_sec]
+        else:
+            self._recent_raw = []
         for (t, rx, ry) in self._recent_raw:
             if math.hypot(px - rx, py - ry) <= self.dedupe_r:
                 self.stats['merge_dup'] += 1
