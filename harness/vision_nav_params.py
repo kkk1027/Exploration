@@ -135,12 +135,43 @@ BLOCK_G_LOWACCUM = f'''{SENT % "begin(global)"}
 '''
 
 
+# P9-⑨（2026-10-27）：隔离变量 —— **live 云 + 不清除**。
+# 为什么还要这一档：实测（nav_only + corridor_fixed 图、车停在健身区）同一时刻
+#   /vision/live_cloud 的点 86% 在全局代价图上已是致命格 ⇒ 视觉层确实在喂数据；
+#   但视觉累积记忆的 1441 格里，任一时刻只有 22.5% 致命、15.3% 膨胀、61.7% 又回到空闲，
+#   最近 6 次航点导航的"最窄点"距视觉格只有 0.02~0.13 m、且此刻代价仅 58~94（可通行）
+#   ⇒ Smac 只把致命格当碰撞，膨胀格可走 ⇒ 路径从视觉障碍的格子缝里穿过去。
+# 怀疑主因是 live 源的 raytrace 把物体格子"同帧标上、又被更远点的射线擦掉"。
+# livemark 只关掉 clearing（云的来源不变），是判定该主因的单一变量档。
+BLOCK_G_LIVEMARK = f'''{SENT % "begin(global)"}
+      {TAG_G}:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        combination_method: 1
+        # P9-⑨：live 云、只标记不清除、无 raytrace —— 隔离"射线擦除"这一项
+        observation_sources: vision_live_mark
+        vision_live_mark:
+          topic: /vision/live_cloud
+          data_type: "PointCloud2"
+          marking: True
+          clearing: False
+          min_obstacle_height: 0.05
+          max_obstacle_height: 0.85
+          obstacle_max_range: 5.0
+          obstacle_min_range: 0.0
+          raytrace_max_range: 0.0
+          raytrace_min_range: 0.0
+{SENT % "end(global)"}
+'''
+
+
 MODE = 'live'
 
 
 def sections():
     g = {'live': BLOCK_G, 'accum': BLOCK_G_ACCUM,
-         'lowaccum': BLOCK_G_LOWACCUM}.get(MODE, BLOCK_G)
+         'lowaccum': BLOCK_G_LOWACCUM,
+         'livemark': BLOCK_G_LIVEMARK}.get(MODE, BLOCK_G)
     return [('local_costmap', TAG_L, BLOCK_L), ('global_costmap', TAG_G, g)]
 
 
@@ -311,10 +342,12 @@ def main():
     ap.add_argument('--apply', action='store_true')
     ap.add_argument('--restore', action='store_true')
     ap.add_argument('--check', action='store_true')
-    ap.add_argument('--global-mode', choices=('live', 'accum', 'lowaccum'), default='live',
-                    help='global_costmap 的视觉层源：live=实时云+清除（旧行为）；'
+    ap.add_argument('--global-mode',
+                    choices=('live', 'accum', 'lowaccum', 'livemark'), default='live',
+                    help='global_costmap 的视觉层源：live=实时云+清除（旧行为，实测路径会穿过视觉障碍）；'
                          'accum=全带累积云+不清除（P9-⑧，覆盖退化）；'
-                         'lowaccum=仅低矮带累积（P9-⑧b，推荐试）')
+                         'lowaccum=仅低矮带累积（P9-⑧b）；'
+                         'livemark=实时云+不清除（P9-⑨，隔离 raytrace 擦除）')
     a = ap.parse_args()
     global MODE
     MODE = a.global_mode

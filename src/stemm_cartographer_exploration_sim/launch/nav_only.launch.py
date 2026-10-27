@@ -203,13 +203,16 @@ def generate_launch_description():
         # 视觉层（与 sim_explore.launch.py 的默认值逐项对齐，便于两份测试台互相对照）
         DeclareLaunchArgument('vision', default_value='true',
                               description='false = 纯雷达基线（代价地图不含视觉层）'),
-        DeclareLaunchArgument('vision_mode', default_value='live',
-                              description='global 层视觉源：live / accum / lowaccum'),
+        DeclareLaunchArgument('vision_mode', default_value='accum',
+                              description='global 层视觉源：accum(默认，累积云+不清除) / '
+                                          'livemark(实时云+不清除) / live(实时云+清除，'
+                                          '实测路径会穿过视觉障碍) / lowaccum'),
         DeclareLaunchArgument('vision_dump', default_value='/tmp/navonly_vision',
                               description='视觉栅格落盘前缀（留空会让 launch 报 malformed arg，踩过）'),
         DeclareLaunchArgument('vision_self_radius', default_value='0.38'),
         DeclareLaunchArgument('vision_decay_sec', default_value='0.0'),
-        DeclareLaunchArgument('vision_accum_decay_sec', default_value='-1.0'),
+        DeclareLaunchArgument('vision_accum_decay_sec', default_value='120.0',
+                              description='累积云衰减秒数(-1=永不衰减；120=与 round.sh 的 accum 档一致)'),
         DeclareLaunchArgument('vision_low_accum_decay_sec', default_value='0.0'),
         sim, map_server, lifecycle_maps, amcl, lifecycle_amcl, nav2_delayed, audit, contacts, rviz,
         OpaqueFunction(function=_vision_setup),
