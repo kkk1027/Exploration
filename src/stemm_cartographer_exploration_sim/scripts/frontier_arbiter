@@ -590,6 +590,14 @@ class Arbiter(Node):
         self.cost_gate_hard = int(p('cost_gate_hard', 99).value)
         self.cost_gate_disc = float(p('cost_gate_disc_m', 0.35).value)
         self.cost_gate_free_ratio = float(p('cost_gate_free_ratio', 0.80).value)
+        # ==== 方向黏性"软约束"（2026-10-27 用户决策：方向不得一票否决候选）====
+        # 车端原来的 ±80° 转角门禁把"车后/侧后、需 ~150° 掉头"的候选整片拒掉，
+        # 连拒 4 次才解锁、解锁后又去吃队列里的远点（12~15 m）→ 规划超迭代失败 →
+        # 车原地等。实测 10 轮里这样被拒 79 次（中位 151°、≤3 m 占 27%）。
+        # 这里改为：转角只作为**打分惩罚**，永不拒；并加"近处可执行优先"。
+        self.turn_pen_k = float(p('turn_penalty_k', 60.0).value)
+        self.near_first = self._as_bool(p('near_first', True).value)
+        self.near_first_r = float(p('near_first_radius_m', 3.0).value)
         # 候选后验"修复"（2026-10-27 用户方案）：后验不合格**不再一律否决**，
         # 而是在原候选附近随机采样，改投最近的合格点位。理由：否决会掐断供给
         # （实测单源化后 manager 连续 93 s 无目标），修复则保留仲裁通道的主导地位
@@ -1314,6 +1322,37 @@ class Arbiter(Node):
             if c is not None:
                 return (wx, wy, c)
         return None
+
+    def _turn_to(self, x, y):
+        """车头朝向量与"车→候选"方向的夹角（0..π）。位姿不可用时返回 0。"""
+        if self.pose is None or len(self.pose) < 3:
+            return 0.0
+        dx, dy = x - self.pose[0], y - self.pose[1]
+        if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+            return 0.0
+        want = math.atan2(dy, dx)
+        d = abs(math.atan2(math.sin(want - self.pose[2]),
+                           math.cos(want - self.pose[2])))
+        return min(d, math.pi)
+
+    def near_first_reorder(self, top):
+        """近处可执行优先（2026-10-27 用户要求 2）。
+
+        top 里若有"距车 <= near_first_r"的候选，则把它们提到最前面（按距离升序），
+        其余保持原打分顺序。依据：车就在旁边却干等 30 s，比掉头 4~7 s 贵得多。
+        """
+        if not self.near_first or self.pose is None or not top:
+            return top
+        near, far = [], []
+        for item in top:
+            x, y = item[2], item[3]
+            d = math.hypot(x - self.pose[0], y - self.pose[1])
+            (near if d <= self.near_first_r else far).append((d, item))
+        if not near:
+            return top
+        near.sort(key=lambda t: t[0])
+        self.stats['near_first_pick'] = self.stats.get('near_first_pick', 0) + 1
+        return [it for _, it in near] + [it for _, it in far]
 
     def _veto_ok(self, x, y):
         """后置否决判据的反面：该点是否**合格**（用于迁移目标）。"""
@@ -2540,6 +2579,9 @@ class Arbiter(Node):
                 self.stats['rejected_size'] += 1
                 continue
             u_eff = u - self._stuck_penalty(x, y, now)
+            # 转角惩罚（软约束）：朝后方的候选只降分，不再被拒
+            if self.turn_pen_k > 0.0:
+                u_eff -= self.turn_pen_k * (self._turn_to(x, y) / math.pi)
             scored.append((u_eff, -math.hypot(x - self.pose[0], y - self.pose[1]), x, y))
         scored.sort(reverse=True)
         # V1：对前 max_cand 个候选先算区域特征 → 闸门硬拒 + occ/esc 罚分重排
@@ -2561,6 +2603,7 @@ class Arbiter(Node):
             top.append((u - pen, negd, x, y))
             feats[(round(x, 2), round(y, 2))] = f
         top.sort(reverse=True)
+        top = self.near_first_reorder(top)
         fallback = None
         for u, negd, x, y in top:
             gx, gy = self.pull_back(x, y)

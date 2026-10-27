@@ -160,6 +160,10 @@ def generate_launch_description():
                                 'cost_gate_hard': LaunchConfiguration('cost_gate_hard'),
                                 'cost_gate_disc_m': LaunchConfiguration('cost_gate_disc'),
                                 'cost_gate_free_ratio': LaunchConfiguration('cost_gate_free'),
+                                # 方向黏性软约束：转角只降分不否决 + 近处可执行优先
+                                'turn_penalty_k': LaunchConfiguration('turn_penalty_k'),
+                                'near_first': LaunchConfiguration('near_first'),
+                                'near_first_radius_m': LaunchConfiguration('near_first_r'),
                                 # 后验修复：不合格候选 → 就近随机采样改投最近的合格点
                                 'cost_repair': LaunchConfiguration('cost_repair'),
                                 'cost_repair_radius_m': LaunchConfiguration('cost_repair_radius'),
@@ -410,6 +414,12 @@ def generate_launch_description():
             description='圆盘半径 m：盘内不得有致命格'),
         DeclareLaunchArgument('cost_gate_free', default_value='0.80',
             description='圆盘内 /map 已知空闲比例下限'),
+        DeclareLaunchArgument('turn_penalty_k', default_value='60.0',
+            description='转角惩罚系数（分/π；0=不惩罚）'),
+        DeclareLaunchArgument('near_first', default_value='true',
+            description='近处可执行候选优先（<= near_first_r 米）'),
+        DeclareLaunchArgument('near_first_r', default_value='3.0',
+            description='近处优先半径 m'),
         DeclareLaunchArgument('cost_repair', default_value='true',
             description='后验不合格候选改为"就近修复"而不是否决'),
         DeclareLaunchArgument('cost_repair_radius', default_value='1.20',

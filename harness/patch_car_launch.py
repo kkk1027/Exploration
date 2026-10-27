@@ -38,6 +38,9 @@ SENT3_E = "            # ---- sim_patch(end3) ----\n"
 RRT_KEY = "'rrt_fallback_wait_sec':"
 SENT2_B = "            # ---- sim_patch(rrt_fallback_wait) ----\n"
 SENT2_E = "            # ---- sim_patch(end2) ----\n"
+TURN_KEY = "'min_explore_distance':"
+SENT6_B = "            # ---- sim_patch(turn_gate) ----\n"
+SENT6_E = "            # ---- sim_patch(end6) ----\n"
 FRONTIER_KEY = "'frontier_goal_topic':"
 SENT5_B = "            # ---- sim_patch(frontier_goal_topic) ----\n"
 SENT5_E = "            # ---- sim_patch(end5) ----\n"
@@ -82,6 +85,8 @@ def main():
     ap.add_argument('--front-stop', type=float, default=0.0,
                     help='车端 front_stop_distance（0=不注入；原厂 0.65）。'
                          '它决定"前向多近就判 blocked 并停住"，是静止卡死的主要触发线')
+    ap.add_argument('--turn-gate', choices=('', 'off'), default='',
+                    help='off = 关掉车端探索目标的 ±80° 转角门禁（方向黏性不再否决候选）')
     ap.add_argument('--frontier-topic', default='',
                     help='把 manager 的 frontier_goal_topic 改到该话题（空=不改）。'
                          '候选后验门要用：/assigned_frontier_goal 是 RRT 原始样本（无校验），'
@@ -91,7 +96,7 @@ def main():
     txt = open(path, encoding='utf-8').read()
     injected = SENT_B in txt
     injected2 = (SENT2_B in txt or SENT3_B in txt or SENT4_B in txt
-                 or SENT5_B in txt)
+                 or SENT5_B in txt or SENT6_B in txt)
     print(f'[patch_car_launch] 目标: {path}')
     print(f'  当前: 已注入(grace)={injected} 已注入(rrt_wait)={injected2}')
     if a.check or not (a.apply or a.restore):
@@ -144,6 +149,15 @@ def main():
                        + f"{ind}'front_stop_distance': {a.front_stop},\n"
                        + SENT3_E + new[le:])
                 print(f'  front_stop 生效行原样: {dup3.strip()}')
+        if a.turn_gate == 'off' and SENT6_B not in new:
+            if TURN_KEY not in new:
+                print('  ✗ 找不到 manager 参数块锚点（min_explore_distance）；跳过 turn_gate')
+            else:
+                new = new.replace(TURN_KEY,
+                                  SENT6_B
+                                  + "            'exploration_dispatch_max_turn_enabled': False,\n"
+                                  + SENT6_E + TURN_KEY, 1)
+                print('  已注入 exploration_dispatch_max_turn_enabled=False（方向黏性放开）')
         front_topic_orig = None
         if a.frontier_topic and SENT5_B not in new:
             if FRONTIER_KEY not in new:
@@ -209,6 +223,10 @@ def main():
         k = new.index(SENT3_E, i) + len(SENT3_E)
         new = new[:i] + (front_orig or '') + new[k:]
         front_orig = None
+    while SENT6_B in new:
+        i = new.index(SENT6_B)
+        k = new.index(SENT6_E, i) + len(SENT6_E)
+        new = new[:i] + new[k:]
     ft_orig = j.get('frontier_orig_line')
     while SENT5_B in new:
         i = new.index(SENT5_B)
