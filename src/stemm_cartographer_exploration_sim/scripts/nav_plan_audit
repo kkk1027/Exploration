@@ -121,8 +121,10 @@ class PlanAudit(Node):
             return None
         dist, ox, oy, res, w, h = self.field
         i = int((x - ox) / res)
-        # 同上：OccupancyGrid 的 data 第 0 行是**图上方**，origin 在左下 ⇒ 行号要翻转
-        j = h - 1 - int((y - oy) / res)
+        # 2026-10-27 修正：**OccupancyGrid 的 data 第 0 行就是最下面一行**（REP-118），
+        # origin 是左下角 ⇒ 行号**不需要**翻转。原来这里按 PGM 的"行 0 在图上方"翻转，
+        # 于是所有 /plan 都按上下镜像的行去查占据格 → 恒报 min_w≈0、假"穿窄处"。
+        j = int((y - oy) / res)
         if not (0 <= i < w and 0 <= j < h):
             return 0.0
         return 2.0 * float(dist[j, i])
