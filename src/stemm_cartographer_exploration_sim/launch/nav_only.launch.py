@@ -49,6 +49,9 @@ def generate_launch_description():
             get_package_share_directory('wheeltec_two_wheel_model'), 'launch', 'sim.launch.py')),
         launch_arguments={'world': LaunchConfiguration('world'),
                           'gui': LaunchConfiguration('gui'),
+                          'spawn_x': LaunchConfiguration('spawn_x'),
+                          'spawn_y': LaunchConfiguration('spawn_y'),
+                          'spawn_yaw': LaunchConfiguration('spawn_yaw'),
                           'use_sim_time': use_sim_time}.items())
 
     # 2) 静态地图（不跑 SLAM）+ map→odom_combined 单位变换 ⇒ map 帧 == world 帧
@@ -80,8 +83,11 @@ def generate_launch_description():
                              'tf_broadcast': True,
                              # 初始位姿 = 建图那一轮的出生点 (0,0,0)
                              'set_initial_pose': True,
-                             'initial_pose': {'x': 0.0, 'y': 0.0, 'z': 0.0,
-                                              'yaw': 0.0}}])
+                             # 初始位姿 = 出生点（同一组参数），保证"假定的位姿"与物理一致
+                             'initial_pose': {'x': LaunchConfiguration('spawn_x'),
+                                              'y': LaunchConfiguration('spawn_y'),
+                                              'z': 0.0,
+                                              'yaw': LaunchConfiguration('spawn_yaw')}}])
     lifecycle_amcl = Node(package='nav2_lifecycle_manager', executable='lifecycle_manager',
                           name='lifecycle_manager_amcl', output='screen',
                           parameters=[{'use_sim_time': use_sim_time,
@@ -133,5 +139,8 @@ def generate_launch_description():
         DeclareLaunchArgument('plan_audit_log', default_value=''),
         DeclareLaunchArgument('contact_log', default_value=''),
         DeclareLaunchArgument('nav_start_delay', default_value='8.0'),
+        DeclareLaunchArgument('spawn_x', default_value='0.0'),
+        DeclareLaunchArgument('spawn_y', default_value='0.0'),
+        DeclareLaunchArgument('spawn_yaw', default_value='0.0'),
         sim, map_server, lifecycle_maps, amcl, lifecycle_amcl, nav2_delayed, audit, contacts, rviz,
     ])
