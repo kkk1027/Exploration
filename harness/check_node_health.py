@@ -33,7 +33,9 @@ def scan(path):
     try:
         fh = open(path, encoding='utf-8', errors='replace')
     except FileNotFoundError:
-        return 0, [('(launch.log 不存在)', '')]
+        # 文件不存在 = 无法判定，**不能**当成"节点真崩"（2026-10-27 踩过：
+        # 批次里 $D 解析到不存在的旧目录 → 每轮都被判无效并白重跑一轮）
+        return 0, []
     with fh:
         for line in fh:
             line = line.rstrip('\n')
