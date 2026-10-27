@@ -32,6 +32,8 @@ from visualization_msgs.msg import Marker, MarkerArray
 
 class PlanAudit(Node):
     def __init__(self):
+        # 见 build_field 注释：未知格是否按障碍计（默认否）
+        self.unknown_block = False
         super().__init__('nav_plan_audit')
         p = self.declare_parameter
         p('pass_width', 1.05)
@@ -84,8 +86,14 @@ class PlanAudit(Node):
         res = m.info.resolution
         ox, oy = m.info.origin.position.x, m.info.origin.position.y
         data = np.array(m.data, dtype=np.int16).reshape(h, w)
-        # PGM/栅格：>=50 占据、<0 未知。未知按障碍处理（"没看清就不许钻"）
-        occ = (data >= 50) | (data < 0)
+        # PGM/栅格：>=50 占据、<0 未知。
+        # 2026-10-27：默认**未知不再按障碍算**（旧行为把"规划到未建图 frontier"误报成 0 净宽，
+        # 实测把 3.8~5.35 m 的普通路段报成"最窄 0.00 m"）。需要旧口径时开 unknown_block。
+        if self.unknown_block:
+            occ = (data >= 50) | (data < 0)
+        else:
+            occ = (data >= 50)
+        self.unk_mask = (data < 0)
         INF = 1 << 20
         d = np.full((h, w), INF, dtype=np.int32)
         q = deque()
