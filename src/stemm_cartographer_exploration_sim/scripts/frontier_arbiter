@@ -27,6 +27,7 @@ import json
 from collections import deque
 import math
 import os
+import random
 import time
 
 # P9-L1：「在等」而不是「过不去」的状态词（来自 50 轮历史 timeline 的实测分类）
@@ -576,6 +577,15 @@ class Arbiter(Node):
         self.cost_gate_hard = int(p('cost_gate_hard', 99).value)
         self.cost_gate_disc = float(p('cost_gate_disc_m', 0.35).value)
         self.cost_gate_free_ratio = float(p('cost_gate_free_ratio', 0.80).value)
+        # 候选后验"修复"（2026-10-27 用户方案）：后验不合格**不再一律否决**，
+        # 而是在原候选附近随机采样，改投最近的合格点位。理由：否决会掐断供给
+        # （实测单源化后 manager 连续 93 s 无目标），修复则保留仲裁通道的主导地位
+        # （合格点仍走 /validated_frontier_goal，TTL 优先），RRT 只是兜底。
+        self.repair_on = bool(p('cost_repair', True).value)
+        self.repair_radius = float(p('cost_repair_radius_m', 1.20).value)
+        self.repair_samples = int(p('cost_repair_samples', 24).value)
+        self.repair_keep_unknown = float(p('cost_repair_keep_unknown', 0.30).value)
+        self.repair_min_unknown = int(p('cost_repair_min_unknown', 20).value)
         # 物理接触区（撞过的地方）：强降权 + 长记忆，避免反复撞同一张桌子
         # 陷阱记忆：撞过的地方半径放大到 2.5 m（两张桌子底座之间这种"地图上开阔、
         # 物理上过不去"的陷阱，一次撞到就把整片圈起来），时长 300 s、罚 1500。
@@ -659,7 +669,7 @@ class Arbiter(Node):
                       'rejected_narrow': 0, 'narrow_fallback': 0, 'narrow_blocked_all': 0,
                       'reject_noexit': 0, 'noexit_passed': 0, 'noexit_checked': 0,
                       'gate_reject': 0, 'gate_penalized': 0,
-                      'reject_cost': 0, 'cost_checked': 0,
+                      'reject_cost': 0, 'cost_checked': 0, 'repair_cost': 0,
                       'escape_zones': 0}
 
         qmap = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
@@ -1581,6 +1591,7 @@ class Arbiter(Node):
                 'pinch_len_max': self.stats.get('pinch_len_max', 0.0),
                 'reject_cost': self.stats.get('reject_cost', 0),
                 'cost_checked': self.stats.get('cost_checked', 0),
+                'repair_cost': self.stats.get('repair_cost', 0),
             }
             if extra:
                 row.update(extra)
@@ -2016,7 +2027,7 @@ class Arbiter(Node):
             return 'unk'
         return 'free' if v < 50 else 'occ'
 
-    def cost_gate_reject(self, x, y, now):
+    def cost_gate_reject(self, x, y, now, count=True):
         """候选后验：用**当前**全局代价地图复核落点。返回 None=通过，否则返回原因串。
 
         三项判据（任一不过就拒）：
@@ -2031,7 +2042,8 @@ class Arbiter(Node):
         cm = self.costmap
         if cm is None:
             return None
-        self.stats['cost_checked'] = self.stats.get('cost_checked', 0) + 1
+        if count:
+            self.stats['cost_checked'] = self.stats.get('cost_checked', 0) + 1
         v0 = self.cost_at(x, y)
         if v0 is None:
             return 'out_of_costmap'
@@ -2062,6 +2074,37 @@ class Arbiter(Node):
         if free + occ > 0 and (free / float(free + occ)) < self.cost_gate_free_ratio:
             return 'occ_ratio=%.2f' % (occ / float(free + occ))
         return None
+
+    def cost_repair_point(self, x, y, u_orig, now):
+        """后验修复：在原候选附近随机采样，返回**最近的合格点位**；找不到返回 None。
+
+        判据（全部通过才算合格）：
+          * cost_gate_reject 通过（落点代价、盘内致命格、盘内已知占据占比）；
+          * 附近的未知格数 >= max(repair_min_unknown, keep_unknown × 原候选未知数)
+            —— 否则修复点只是把车送进已探索区，失去探索意义；
+          * 与原候选的最短距离（在 radius 内随机取点，取最近者）。
+        """
+        if not (self.repair_on and self.cost_gate):
+            return None
+        if self.costmap is None:
+            return None
+        best = None
+        need = max(self.repair_min_unknown, int(round(self.repair_keep_unknown * u_orig)))
+        for _ in range(max(1, self.repair_samples)):
+            ang = random.uniform(0.0, 2.0 * math.pi)
+            rad = self.repair_radius * math.sqrt(random.random())
+            nx = x + rad * math.cos(ang)
+            ny = y + rad * math.sin(ang)
+            if self.cost_gate_reject(nx, ny, now, count=False) is not None:
+                continue
+            if self.unknown_cells(nx, ny) < need:
+                continue
+            d = math.hypot(nx - x, ny - y)
+            if best is None or d < best[0]:
+                best = (d, nx, ny)
+        if best is None:
+            return None
+        return best[1], best[2]
 
     def pull_back(self, x, y):
         if self.pose is None or self.pullback <= 0:
@@ -2439,13 +2482,25 @@ class Arbiter(Node):
             gx, gy = self.pull_back(x, y)
             cost_why = self.cost_gate_reject(gx, gy, now)
             if cost_why:
-                self.stats['reject_cost'] = self.stats.get('reject_cost', 0) + 1
-                self._note_uniq('reject_cost', gx, gy)
-                self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
-                self.note_refusal(gx, gy)
-                self.get_logger().info(
-                    '候选后验否决（%s）目标 (%.2f,%.2f)' % (cost_why, gx, gy))
-                continue
+                # 先尝试"修复"：就近随机采样到最近的合格点（保留供给，不掐断）
+                rep = self.cost_repair_point(gx, gy, self.unknown_cells(gx, gy), now)
+                if rep is not None:
+                    self.stats['repair_cost'] = self.stats.get('repair_cost', 0) + 1
+                    self._note_uniq('repair_cost', rep[0], rep[1])
+                    self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
+                    self.get_logger().info(
+                        '候选后验修复（%s）(%.2f,%.2f) → (%.2f,%.2f) 距离 %.2f m'
+                        % (cost_why, gx, gy, rep[0], rep[1],
+                           math.hypot(rep[0] - gx, rep[1] - gy)))
+                    gx, gy = rep
+                else:
+                    self.stats['reject_cost'] = self.stats.get('reject_cost', 0) + 1
+                    self._note_uniq('reject_cost', gx, gy)
+                    self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
+                    self.note_refusal(gx, gy)
+                    self.get_logger().info(
+                        '候选后验否决（%s）目标 (%.2f,%.2f)' % (cost_why, gx, gy))
+                    continue
             ok, narrow, min_w, unk = self.path_and_width(gx, gy)
             if not ok:
                 self.blacklist.append((gx, gy, now + self.bl_sec))
@@ -2595,13 +2650,25 @@ class Arbiter(Node):
             gx, gy = self.pull_back(r['x'], r['y'])
             cost_why = self.cost_gate_reject(gx, gy, now)
             if cost_why:
-                self.stats['reject_cost'] = self.stats.get('reject_cost', 0) + 1
-                self._note_uniq('reject_cost', gx, gy)
-                self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
-                self.note_refusal(gx, gy)
-                self.get_logger().info(
-                    '候选后验否决（%s）目标 (%.2f,%.2f)' % (cost_why, gx, gy))
-                continue
+                # 先尝试"修复"：就近随机采样到最近的合格点（保留供给，不掐断）
+                rep = self.cost_repair_point(gx, gy, self.unknown_cells(gx, gy), now)
+                if rep is not None:
+                    self.stats['repair_cost'] = self.stats.get('repair_cost', 0) + 1
+                    self._note_uniq('repair_cost', rep[0], rep[1])
+                    self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
+                    self.get_logger().info(
+                        '候选后验修复（%s）(%.2f,%.2f) → (%.2f,%.2f) 距离 %.2f m'
+                        % (cost_why, gx, gy, rep[0], rep[1],
+                           math.hypot(rep[0] - gx, rep[1] - gy)))
+                    gx, gy = rep
+                else:
+                    self.stats['reject_cost'] = self.stats.get('reject_cost', 0) + 1
+                    self._note_uniq('reject_cost', gx, gy)
+                    self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
+                    self.note_refusal(gx, gy)
+                    self.get_logger().info(
+                        '候选后验否决（%s）目标 (%.2f,%.2f)' % (cost_why, gx, gy))
+                    continue
             ok, narrow, min_w, unk = self.path_and_width(gx, gy)
             if not ok:
                 self.blacklist.append((gx, gy, now + self.bl_sec))
@@ -2708,13 +2775,25 @@ class Arbiter(Node):
             gx, gy = self.pull_back(r['x'], r['y'])
             cost_why = self.cost_gate_reject(gx, gy, now)
             if cost_why:
-                self.stats['reject_cost'] = self.stats.get('reject_cost', 0) + 1
-                self._note_uniq('reject_cost', gx, gy)
-                self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
-                self.note_refusal(gx, gy)
-                self.get_logger().info(
-                    '候选后验否决（%s）目标 (%.2f,%.2f)' % (cost_why, gx, gy))
-                continue
+                # 先尝试"修复"：就近随机采样到最近的合格点（保留供给，不掐断）
+                rep = self.cost_repair_point(gx, gy, self.unknown_cells(gx, gy), now)
+                if rep is not None:
+                    self.stats['repair_cost'] = self.stats.get('repair_cost', 0) + 1
+                    self._note_uniq('repair_cost', rep[0], rep[1])
+                    self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
+                    self.get_logger().info(
+                        '候选后验修复（%s）(%.2f,%.2f) → (%.2f,%.2f) 距离 %.2f m'
+                        % (cost_why, gx, gy, rep[0], rep[1],
+                           math.hypot(rep[0] - gx, rep[1] - gy)))
+                    gx, gy = rep
+                else:
+                    self.stats['reject_cost'] = self.stats.get('reject_cost', 0) + 1
+                    self._note_uniq('reject_cost', gx, gy)
+                    self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
+                    self.note_refusal(gx, gy)
+                    self.get_logger().info(
+                        '候选后验否决（%s）目标 (%.2f,%.2f)' % (cost_why, gx, gy))
+                    continue
             ok, narrow, min_w, unk = self.path_and_width(gx, gy)
             if not ok:
                 self.blacklist.append((gx, gy, now + self.bl_sec))

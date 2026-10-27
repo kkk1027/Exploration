@@ -154,6 +154,12 @@ def generate_launch_description():
                                 'cost_gate_hard': LaunchConfiguration('cost_gate_hard'),
                                 'cost_gate_disc_m': LaunchConfiguration('cost_gate_disc'),
                                 'cost_gate_free_ratio': LaunchConfiguration('cost_gate_free'),
+                                # 后验修复：不合格候选 → 就近随机采样改投最近的合格点
+                                'cost_repair': LaunchConfiguration('cost_repair'),
+                                'cost_repair_radius_m': LaunchConfiguration('cost_repair_radius'),
+                                'cost_repair_samples': LaunchConfiguration('cost_repair_samples'),
+                                'cost_repair_keep_unknown': LaunchConfiguration('cost_repair_keep_unknown'),
+                                'cost_repair_min_unknown': LaunchConfiguration('cost_repair_min_unknown'),
                                 'gate_esc_dirs_min': LaunchConfiguration('gate_min_esc'),
                                 'gate_occ_soft': LaunchConfiguration('gate_occ_soft'),
                                 # 探索末段"停车友好"偏置需要知道本轮总时长
@@ -392,6 +398,16 @@ def generate_launch_description():
             description='圆盘半径 m：盘内不得有致命格'),
         DeclareLaunchArgument('cost_gate_free', default_value='0.80',
             description='圆盘内 /map 已知空闲比例下限'),
+        DeclareLaunchArgument('cost_repair', default_value='true',
+            description='后验不合格候选改为"就近修复"而不是否决'),
+        DeclareLaunchArgument('cost_repair_radius', default_value='1.20',
+            description='修复采样半径 m'),
+        DeclareLaunchArgument('cost_repair_samples', default_value='24',
+            description='每个候选的修复采样次数'),
+        DeclareLaunchArgument('cost_repair_keep_unknown', default_value='0.30',
+            description='修复点至少保留原候选未知格数的比例'),
+        DeclareLaunchArgument('cost_repair_min_unknown', default_value='20',
+            description='修复点附近未知格绝对下限'),
         # 2026-10-25 20 轮 vs 20 轮 A/B（docs/P7 第 24 节）：
         #   基线（无 veto）∶静止超时 28（1.40/轮）、归因率 24%
         #   有 veto（额度 6、冷却 10 s）∶静止超时 19（0.95/轮，−32%）、归因率 11.5%
