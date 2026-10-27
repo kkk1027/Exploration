@@ -38,6 +38,9 @@ SENT3_E = "            # ---- sim_patch(end3) ----\n"
 RRT_KEY = "'rrt_fallback_wait_sec':"
 SENT2_B = "            # ---- sim_patch(rrt_fallback_wait) ----\n"
 SENT2_E = "            # ---- sim_patch(end2) ----\n"
+FRONTIER_KEY = "'frontier_goal_topic':"
+SENT5_B = "            # ---- sim_patch(frontier_goal_topic) ----\n"
+SENT5_E = "            # ---- sim_patch(end5) ----\n"
 SENT_B = "            # ---- sim_patch(return_home_orientation_grace) ----\n"
 SENT_E = "            # ---- sim_patch(end) ----\n"
 CACHE = "/home/kbf/stemm_exploration_sim_ws/patches"
@@ -79,11 +82,16 @@ def main():
     ap.add_argument('--front-stop', type=float, default=0.0,
                     help='车端 front_stop_distance（0=不注入；原厂 0.65）。'
                          '它决定"前向多近就判 blocked 并停住"，是静止卡死的主要触发线')
+    ap.add_argument('--frontier-topic', default='',
+                    help='把 manager 的 frontier_goal_topic 改到该话题（空=不改）。'
+                         '候选后验门要用：/assigned_frontier_goal 是 RRT 原始样本（无校验），'
+                         '/validated_frontier_goal 才是仲裁器校验过的落点')
     a = ap.parse_args()
     path = target()
     txt = open(path, encoding='utf-8').read()
     injected = SENT_B in txt
-    injected2 = SENT2_B in txt or SENT3_B in txt or SENT4_B in txt
+    injected2 = (SENT2_B in txt or SENT3_B in txt or SENT4_B in txt
+                 or SENT5_B in txt)
     print(f'[patch_car_launch] 目标: {path}')
     print(f'  当前: 已注入(grace)={injected} 已注入(rrt_wait)={injected2}')
     if a.check or not (a.apply or a.restore):
@@ -136,6 +144,21 @@ def main():
                        + f"{ind}'front_stop_distance': {a.front_stop},\n"
                        + SENT3_E + new[le:])
                 print(f'  front_stop 生效行原样: {dup3.strip()}')
+        front_topic_orig = None
+        if a.frontier_topic and SENT5_B not in new:
+            if FRONTIER_KEY not in new:
+                print('  ✗ 车端 launch 里没有 frontier_goal_topic 键；跳过该项')
+            else:
+                i = new.rindex(FRONTIER_KEY)
+                ls = new.rfind('\n', 0, i) + 1
+                le = new.index('\n', i) + 1
+                front_topic_orig = new[ls:le]
+                ind = front_topic_orig[:len(front_topic_orig)
+                                        - len(front_topic_orig.lstrip())]
+                new = (new[:ls] + SENT5_B
+                       + f"{ind}'frontier_goal_topic': '{a.frontier_topic}',\n"
+                       + SENT5_E + new[le:])
+                print(f'  frontier_goal_topic 生效行原样: {front_topic_orig.strip()}')
         if new == txt:
             print('  已注入，跳过')
             return 0
@@ -155,6 +178,8 @@ def main():
             jold = {}
         j = {'anchor': ANCHOR, 'grace': a.grace, 'rrt_wait': a.rrt_wait,
              'front_stop': a.front_stop, 'front_orig_line': locals().get('dup3'),
+             'frontier_topic': a.frontier_topic,
+             'frontier_orig_line': locals().get('front_topic_orig'),
              'dup_orig_line': dup_orig if dup_orig is not None
                               else jold.get('dup_orig_line')}
         json.dump(j, open(journal_path(), 'w', encoding='utf-8'),
@@ -184,6 +209,12 @@ def main():
         k = new.index(SENT3_E, i) + len(SENT3_E)
         new = new[:i] + (front_orig or '') + new[k:]
         front_orig = None
+    ft_orig = j.get('frontier_orig_line')
+    while SENT5_B in new:
+        i = new.index(SENT5_B)
+        k = new.index(SENT5_E, i) + len(SENT5_E)
+        new = new[:i] + (ft_orig or '') + new[k:]
+        ft_orig = None
     while SENT2_B in new:
         i = new.index(SENT2_B)
         k = new.index(SENT2_E, i) + len(SENT2_E)

@@ -149,6 +149,11 @@ def generate_launch_description():
                                 'failfast_comp_radius_m': LaunchConfiguration('failfast_comp_radius'),
                                 # V1 闸门（落点级）：与 veto 搭配才覆盖全部派发通道
                                 'gate_enabled': LaunchConfiguration('gate'),
+                                # 候选后验门（2026-10-27）：用当前全局代价地图复核落点
+                                'cost_gate': LaunchConfiguration('cost_gate'),
+                                'cost_gate_hard': LaunchConfiguration('cost_gate_hard'),
+                                'cost_gate_disc_m': LaunchConfiguration('cost_gate_disc'),
+                                'cost_gate_free_ratio': LaunchConfiguration('cost_gate_free'),
                                 'gate_esc_dirs_min': LaunchConfiguration('gate_min_esc'),
                                 'gate_occ_soft': LaunchConfiguration('gate_occ_soft'),
                                 # 探索末段"停车友好"偏置需要知道本轮总时长
@@ -353,6 +358,16 @@ def generate_launch_description():
             description='闸门可逃逸方向下限'),
         DeclareLaunchArgument('gate_occ_soft', default_value='0.30',
             description='闸门复杂区软惩罚阈值（2 m 内障碍占比）'),
+        # 候选后验门（2026-10-27）：候选是在"当时的地图"上选的，等雷达/视觉扫到那一带，
+        # 同一位置可能已被膨胀/占据/视觉障碍覆盖。下发前用当前全局代价地图复核落点。
+        DeclareLaunchArgument('cost_gate', default_value='false',
+            description='候选后验门开关'),
+        DeclareLaunchArgument('cost_gate_hard', default_value='99',
+            description='落点格代价 >= 该值即拒（99=致命/内切）'),
+        DeclareLaunchArgument('cost_gate_disc', default_value='0.35',
+            description='圆盘半径 m：盘内不得有致命格'),
+        DeclareLaunchArgument('cost_gate_free', default_value='0.80',
+            description='圆盘内 /map 已知空闲比例下限'),
         # 2026-10-25 20 轮 vs 20 轮 A/B（docs/P7 第 24 节）：
         #   基线（无 veto）∶静止超时 28（1.40/轮）、归因率 24%
         #   有 veto（额度 6、冷却 10 s）∶静止超时 19（0.95/轮，−32%）、归因率 11.5%

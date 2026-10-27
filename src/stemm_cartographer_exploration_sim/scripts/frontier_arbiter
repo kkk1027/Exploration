@@ -567,6 +567,15 @@ class Arbiter(Node):
         self._esc_count = 0
         self.corridor_stride = max(1, int(p('corridor_stride_cells', 2).value))
         self.narrow_penalty_sec = float(p('narrow_blacklist_sec', 45.0).value)
+        # ==== 候选后验门（2026-10-27）====
+        # 现象：候选是在"当时的地图"上选的；雷达/深度相机扫到那一带后，同一位置可能
+        # 已被膨胀/占据/视觉障碍覆盖，却没有任何环节复核 → 派出去才发现过不去。
+        # 这里在下发前用**当前全局代价地图**再判一次；不通过就拒 + 进黑名单。
+        # 视觉障碍只存在于代价地图（/map 里没有），所以这一关必须看代价地图。
+        self.cost_gate = bool(p('cost_gate', False).value)
+        self.cost_gate_hard = int(p('cost_gate_hard', 99).value)
+        self.cost_gate_disc = float(p('cost_gate_disc_m', 0.35).value)
+        self.cost_gate_free_ratio = float(p('cost_gate_free_ratio', 0.80).value)
         # 物理接触区（撞过的地方）：强降权 + 长记忆，避免反复撞同一张桌子
         # 陷阱记忆：撞过的地方半径放大到 2.5 m（两张桌子底座之间这种"地图上开阔、
         # 物理上过不去"的陷阱，一次撞到就把整片圈起来），时长 300 s、罚 1500。
@@ -650,6 +659,7 @@ class Arbiter(Node):
                       'rejected_narrow': 0, 'narrow_fallback': 0, 'narrow_blocked_all': 0,
                       'reject_noexit': 0, 'noexit_passed': 0, 'noexit_checked': 0,
                       'gate_reject': 0, 'gate_penalized': 0,
+                      'reject_cost': 0, 'cost_checked': 0,
                       'escape_zones': 0}
 
         qmap = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
@@ -1569,6 +1579,8 @@ class Arbiter(Node):
                 'noexit_passed': self.stats.get('noexit_passed', 0),
                 'noexit_checked': self.stats.get('noexit_checked', 0),
                 'pinch_len_max': self.stats.get('pinch_len_max', 0.0),
+                'reject_cost': self.stats.get('reject_cost', 0),
+                'cost_checked': self.stats.get('cost_checked', 0),
             }
             if extra:
                 row.update(extra)
@@ -1973,6 +1985,84 @@ class Arbiter(Node):
             self.blacklist = self.blacklist[-40:]
         return any(math.hypot(x - b[0], y - b[1]) < self.bl_r for b in self.blacklist)
 
+    # ================= 候选后验门（2026-10-27）=================
+    def cost_at(self, x, y):
+        """当前全局代价地图在 (x,y) 的代价；越界/未就绪返回 None。"""
+        cm = self.costmap
+        if cm is None:
+            return None
+        info = cm.info
+        res = info.resolution
+        if res <= 0:
+            return None
+        i = int((x - info.origin.position.x) / res)
+        j = int((y - info.origin.position.y) / res)
+        if not (0 <= i < info.width and 0 <= j < info.height):
+            return None
+        return cm.data[j * info.width + i]
+
+    def _map_known_free_ratio(self, x, y):
+        """(x,y) 单格在 /map 上的状态：'free' / 'occ' / 'unk'。"""
+        m = self.map
+        if m is None:
+            return None
+        info = m.info
+        i = int((x - info.origin.position.x) / info.resolution)
+        j = int((y - info.origin.position.y) / info.resolution)
+        if not (0 <= i < info.width and 0 <= j < info.height):
+            return None
+        v = m.data[j * info.width + i]
+        if v < 0:
+            return 'unk'
+        return 'free' if v < 50 else 'occ'
+
+    def cost_gate_reject(self, x, y, now):
+        """候选后验：用**当前**全局代价地图复核落点。返回 None=通过，否则返回原因串。
+
+        三项判据（任一不过就拒）：
+          1) 落点格代价 < cost_gate_hard（默认 99，即致命/内切一律不可派发）；
+          2) cost_gate_disc 半径圆盘内没有致命格（车体+余量，默认 0.35 m）；
+          3) 圆盘内 /map 已知空闲比例 >= cost_gate_free_ratio（默认 0.8），
+             挡"孤岛自由格"——落点本身空闲、四周全是未知/占据。
+        代价地图未就绪时不阻塞（与 reachable() 同口径）；cost_gate 默认关。
+        """
+        if not self.cost_gate:
+            return None
+        cm = self.costmap
+        if cm is None:
+            return None
+        self.stats['cost_checked'] = self.stats.get('cost_checked', 0) + 1
+        v0 = self.cost_at(x, y)
+        if v0 is None:
+            return 'out_of_costmap'
+        if v0 >= self.cost_gate_hard:
+            return 'goal_cost=%d' % v0
+        res = cm.info.resolution
+        n = max(1, int(self.cost_gate_disc / res))
+        lethal = 0
+        free = occ = 0
+        for dj in range(-n, n + 1):
+            for di in range(-n, n + 1):
+                if di * di + dj * dj > n * n:
+                    continue
+                px, py = x + di * res, y + dj * res
+                v = self.cost_at(px, py)
+                if v is not None and v >= self.cost_gate_hard:
+                    lethal += 1
+                st = self._map_known_free_ratio(px, py)
+                if st == 'free':
+                    free += 1
+                elif st == 'occ':
+                    occ += 1
+        if lethal > 0:
+            return 'lethal_in_disc=%d' % lethal
+        # 注意：**未知格不算否决**。探索候选天生贴着未知边界，把未知计入分母会把
+        # 正常候选全毙掉（实测 666/744 次否决都来自这一条，属于判据写错）。
+        # 这里只要求"已知部分里空闲占比达标"，即盘内不得有已知占据。
+        if free + occ > 0 and (free / float(free + occ)) < self.cost_gate_free_ratio:
+            return 'occ_ratio=%.2f' % (occ / float(free + occ))
+        return None
+
     def pull_back(self, x, y):
         if self.pose is None or self.pullback <= 0:
             return self.snap_known_free(x, y)
@@ -2347,6 +2437,15 @@ class Arbiter(Node):
         fallback = None
         for u, negd, x, y in top:
             gx, gy = self.pull_back(x, y)
+            cost_why = self.cost_gate_reject(gx, gy, now)
+            if cost_why:
+                self.stats['reject_cost'] = self.stats.get('reject_cost', 0) + 1
+                self._note_uniq('reject_cost', gx, gy)
+                self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
+                self.note_refusal(gx, gy)
+                self.get_logger().info(
+                    '候选后验否决（%s）目标 (%.2f,%.2f)' % (cost_why, gx, gy))
+                continue
             ok, narrow, min_w, unk = self.path_and_width(gx, gy)
             if not ok:
                 self.blacklist.append((gx, gy, now + self.bl_sec))
@@ -2494,6 +2593,15 @@ class Arbiter(Node):
         gated.sort(key=lambda q: q.get('score', 0.0), reverse=True)
         for r in gated:
             gx, gy = self.pull_back(r['x'], r['y'])
+            cost_why = self.cost_gate_reject(gx, gy, now)
+            if cost_why:
+                self.stats['reject_cost'] = self.stats.get('reject_cost', 0) + 1
+                self._note_uniq('reject_cost', gx, gy)
+                self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
+                self.note_refusal(gx, gy)
+                self.get_logger().info(
+                    '候选后验否决（%s）目标 (%.2f,%.2f)' % (cost_why, gx, gy))
+                continue
             ok, narrow, min_w, unk = self.path_and_width(gx, gy)
             if not ok:
                 self.blacklist.append((gx, gy, now + self.bl_sec))
@@ -2598,6 +2706,15 @@ class Arbiter(Node):
         gated.sort(key=lambda q: q.get('score', 0.0), reverse=True)
         for r in gated:
             gx, gy = self.pull_back(r['x'], r['y'])
+            cost_why = self.cost_gate_reject(gx, gy, now)
+            if cost_why:
+                self.stats['reject_cost'] = self.stats.get('reject_cost', 0) + 1
+                self._note_uniq('reject_cost', gx, gy)
+                self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
+                self.note_refusal(gx, gy)
+                self.get_logger().info(
+                    '候选后验否决（%s）目标 (%.2f,%.2f)' % (cost_why, gx, gy))
+                continue
             ok, narrow, min_w, unk = self.path_and_width(gx, gy)
             if not ok:
                 self.blacklist.append((gx, gy, now + self.bl_sec))
