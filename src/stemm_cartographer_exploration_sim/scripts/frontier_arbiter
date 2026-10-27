@@ -530,6 +530,17 @@ class Arbiter(Node):
         self.noexit_turn_m = float(p('noexit_turn_m', 0.81).value)
         self.noexit_retreat_need_m = float(p('noexit_retreat_need_m', 1.00).value)
         self.noexit_turn_hold_m = float(p('noexit_turn_hold_m', 0.30).value)
+        # P9-S0（2026-10-27 用户批准"接触闭环三件套"）：
+        # ① 物理接触 → 取消当前目标（原来只把接触点记为候选降权，当前目标会一直往障碍里推，
+        #    实测 c3r4 贴着 Dumbbell 研磨 175 s）；
+        # ② 同一处重复接触 → 记忆时间递增（反复撞比撞一次更该避开）；
+        # ③ 接触触发的受限倒车在监督侧（escape_supervisor::contact_panic）。
+        self.contact_fail_enabled = self._as_bool(p('contact_fail_enabled', False).value)
+        self.contact_fail_max = int(p('contact_fail_max', 6).value)
+        self.contact_fail_cooldown_sec = float(p('contact_fail_cooldown_sec', 3.0).value)
+        self.contact_hits = {}
+        self._cf_count = 0
+        self._cf_last = 0.0
         self._last_path_reject = None
         # 半径取 0.6 m："这一脚到那儿能不能转过身"，而不是"附近某处有片空地"。
         # 取 1.2 m 时实测 3 轮里一次都没触发（房间尺度上总能找到空地），等于没生效。
@@ -725,14 +736,42 @@ class Arbiter(Node):
             % (m.pose.position.x, m.pose.position.y))
 
     def on_contact_zone(self, m):
-        self.contact_zones.append((m.pose.position.x, m.pose.position.y,
-                                   time.monotonic() + self.contact_zone_sec))
+        x, y = float(m.pose.position.x), float(m.pose.position.y)
+        key = (round(x, 1), round(y, 1))
+        n = int(self.contact_hits.get(key, 0)) + 1
+        self.contact_hits[key] = n
+        ttl = self.contact_zone_sec * min(6, n)     # 同一处反复撞 → 记忆更久
+        self.contact_zones.append((x, y, time.monotonic() + ttl))
         if len(self.contact_zones) > 20:
             self.contact_zones = self.contact_zones[-20:]
         self.stats['contact_zones'] = self.stats.get('contact_zones', 0) + 1
         self.get_logger().warn(
-            '物理接触区记录：(%.2f,%.2f)；统计 %s'
-            % (m.pose.position.x, m.pose.position.y, self.stats))
+            '物理接触区记录：(%.2f,%.2f) 第 %d 次（记忆 %.0fs）；统计 %s'
+            % (x, y, n, ttl, self.stats))
+        self._maybe_fail_on_contact(x, y)
+
+    def _maybe_fail_on_contact(self, x, y):
+        """接触即失败（默认关）：物理接触时取消正在执行的目标，别让它继续往里推。
+
+        纪律边界：返航期不动（返航失败只记录不解决）；有冷却与每轮上限。
+        """
+        if not self.contact_fail_enabled:
+            return
+        pay = self._nav_payload or {}
+        blob = (str(pay.get('mode', '')) + ' ' + str(pay.get('navigation_state', ''))).lower()
+        if 'return' in blob or 'home' in blob:
+            return
+        now = time.monotonic()
+        if now - self._cf_last < self.contact_fail_cooldown_sec:
+            return
+        if self._cf_count >= self.contact_fail_max:
+            return
+        if self._do_veto_cancel():
+            self._cf_count += 1
+            self._cf_last = now
+            self.stats['contact_fail_cancel'] = self.stats.get('contact_fail_cancel', 0) + 1
+            self.get_logger().warn(
+                '物理接触 → 取消当前目标（第 %d 次）：(%.2f,%.2f）' % (self._cf_count, x, y))
 
     def on_costmap(self, m):
         self.costmap = m
@@ -1421,6 +1460,7 @@ class Arbiter(Node):
                 'rejected_narrow': self.stats.get('rejected_narrow', 0),
                 'rejected_oneway': self.stats.get('rejected_oneway', 0),
                 # P9-A 观测：A 打开后必须能看到"救回多少供给 / 否决多少不可退出"
+                'contact_fail_cancel': self.stats.get('contact_fail_cancel', 0),
                 'reject_noexit': self.stats.get('reject_noexit', 0),
                 'noexit_passed': self.stats.get('noexit_passed', 0),
                 'noexit_checked': self.stats.get('noexit_checked', 0),

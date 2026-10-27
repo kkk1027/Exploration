@@ -67,6 +67,8 @@ if probe and os.path.exists(probe):
     c = collections.Counter()
     chassis = 0
     wheel = 0
+    cont_ep = 0
+    cont_secs = 0.0
     rev = 0
     rev_m = 0.0
     rev_hard = 0
@@ -93,6 +95,8 @@ if probe and os.path.exists(probe):
         elif t == 'summary':
             chassis = int(r.get('chassis_contacts') or 0)
             wheel = int(r.get('wheel_contacts') or 0)
+            cont_ep = int(r.get('contact_episodes') or 0)
+            cont_secs = float(r.get('contact_secs') or 0.0)
         for k in ('min_d', 'min_d_now', 'min_d_ever'):
             v = r.get(k)
             if isinstance(v, (int, float)) and v >= 0 and (mind is None or v < mind):
@@ -101,6 +105,7 @@ if probe and os.path.exists(probe):
                  'reverse_windows': rev, 'reverse_m': round(rev_m, 2),
                  'reverse_hard_windows': rev_hard, 'chassis_contacts': chassis,
                  'wheel_contacts': wheel, 'physical_contacts': chassis + wheel,
+                 'contact_episodes': cont_ep, 'contact_secs': round(cont_secs, 1),
                  'min_clearance_ever': round(mind, 3) if mind is not None else None}
     # 判据用"物理接触"（Gazebo 接触传感器，已过滤地面）+ ">=5 cm 的**非受控**后退窗口"
     # （返航阶段由 escape_supervisor 执行的受控小步倒车 assist=True，不算违规）；

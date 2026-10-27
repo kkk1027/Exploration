@@ -101,8 +101,13 @@ class CollisionProbe(Node):
         self.body_bb = None
         self.body_world_bb = None
 
+        self._contact_last = 0.0
         self.stats = {'contacts': 0, 'grazes': 0, 'alerts': 0, 'bumpers': 0,
                       'ground_contacts': 0, 'chassis_contacts': 0, 'wheel_contacts': 0,
+                      # 2026-10-27 用户批准的 KPI 改造：帧数会被"多连杆交替"打爆（实测一轮
+                      # 14351 帧其实只有 1 段、175 s 的研磨），所以主指标改为
+                      #   接触段数（间隔 >1.5 s 才算新的一段）+ 接触总秒数。
+                      'contact_episodes': 0, 'contact_secs': 0.0,
                       'reverse_msgs': 0, 'reverse_windows': 0, 'reverse_secs': 0.0,
                       'reverse_dist': 0.0, 'forward_secs': 0.0,
                       'stalls': 0}
@@ -217,6 +222,14 @@ class CollisionProbe(Node):
         FLOOR_HINTS = ('ground_plane', 'floor', 'carpet', 'rug')
         pairs = [st.collision1_name + '|' + st.collision2_name for st in m.states]
         real = [p for p in pairs if not any(k in p.lower() for k in FLOOR_HINTS)]
+        # 接触段/时长：只要"当前确实有物理接触"就计时，**不受名字去重影响**
+        if real:
+            dt = now - self._contact_last if self._contact_last else 0.0
+            if self._contact_last <= 0.0 or dt > 1.5:
+                self.stats['contact_episodes'] += 1
+            else:
+                self.stats['contact_secs'] += min(dt, 1.5)
+            self._contact_last = now
         if not real:
             self.stats['ground_contacts'] = self.stats.get('ground_contacts', 0) + 1
             return
@@ -392,6 +405,7 @@ class CollisionProbe(Node):
             self.stats['forward_secs'] += 0.2
 
         s = dict(self.stats)
+        s['contact_secs'] = round(float(self.stats.get('contact_secs') or 0.0), 1)
         s.update({'min_d_ever': round(self.min_d_ever, 3) if self.min_d_ever is not None else None,
                   'circ_ever': round(self.circ_ever, 3) if self.circ_ever is not None else None,
                   'min_d_now': round(self.min_d, 3) if self.min_d is not None else None})
@@ -399,6 +413,7 @@ class CollisionProbe(Node):
 
     def summary(self):
         s = dict(self.stats)
+        s['contact_secs'] = round(float(self.stats.get('contact_secs') or 0.0), 1)
         s.update({'min_d_ever': round(self.min_d_ever, 3) if self.min_d_ever is not None else None,
                   'circ_ever': round(self.circ_ever, 3) if self.circ_ever is not None else None,
                   'pos': [round(v, 2) for v in (self.pose or (0, 0, 0))[:2]],

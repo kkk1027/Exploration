@@ -21,6 +21,8 @@ RE_VERDICT = re.compile(r'verdict: \*\*(\w+)\*\*　失败项: (\[[^\]]*\]|无)')
 RE_COLL = re.compile(r'物理接触: (\d+)　倒车: ([\d.]+) m（探索段 ([\d.]+) / 返航受控 ([\d.]+)）')
 RE_STUCK = re.compile(r'卡死事件（[^）]*）: \*\*(\d+)\*\*　其中"想动却动不了\(cmd非0\)": \*\*(\d+)\*\*　最长 ([\d.]+) s')
 RE_DISP = re.compile(r'派发来源: (.+)')
+RE_CONT = re.compile(r'接触段/时长: (\d+) 段 / ([\d.]+) s')
+RE_STALLSET = re.compile(r'停滞总秒数: \*\*([\d.]+) s\*\*　≥30 s: \*\*(\d+)\*\* 条')
 RE_MISC = re.compile(r'（本轮"前沿全灭→脱困目标"触发 (\d+) 次；时间线采样 (\d+) 拍')
 
 
@@ -52,6 +54,14 @@ def one(d):
             r['stuck'] = int(m.group(1))
             r['stuck_cmd'] = int(m.group(2))
             r['stuck_max_s'] = float(m.group(3))
+        m = RE_CONT.search(t)
+        if m:
+            r['cont_ep'] = int(m.group(1))
+            r['cont_s'] = float(m.group(2))
+        m = RE_STALLSET.search(t)
+        if m:
+            r['stall_s'] = float(m.group(1))
+            r['stall30'] = int(m.group(2))
         m = RE_DISP.search(t)
         if m:
             r['dispatch'] = m.group(1).strip()

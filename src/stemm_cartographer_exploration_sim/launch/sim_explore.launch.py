@@ -118,6 +118,9 @@ def generate_launch_description():
                                 'noexit_turn_m': LaunchConfiguration('noexit_turn_m'),
                                 'noexit_retreat_need_m': LaunchConfiguration('noexit_retreat_need_m'),
                                 'noexit_turn_hold_m': LaunchConfiguration('noexit_turn_hold_m'),
+                                'contact_fail_enabled': LaunchConfiguration('contact_fail'),
+                                'contact_fail_max': LaunchConfiguration('contact_fail_max'),
+                                'contact_fail_cooldown_sec': LaunchConfiguration('contact_fail_cooldown'),
                                 # V2-③ 后置 veto：默认关，实验时 veto:=true
                                 'veto_enabled': LaunchConfiguration('veto'),
                                 'veto_min_esc_dirs': LaunchConfiguration('veto_min_esc'),
@@ -227,6 +230,8 @@ def generate_launch_description():
                                    'contact_reverse_enabled': LaunchConfiguration('supervisor_contact_reverse'),
                                    'contact_reverse_window_sec': LaunchConfiguration('supervisor_contact_reverse_window'),
                                    'contact_reverse_max': LaunchConfiguration('supervisor_contact_reverse_max'),
+                                   'contact_reverse_cooldown_sec': LaunchConfiguration('supervisor_contact_reverse_cool'),
+                                   'contact_reverse_front_m': LaunchConfiguration('supervisor_contact_reverse_front'),
                                    'log_path': LaunchConfiguration('supervisor_log')}])
 
 
@@ -309,6 +314,12 @@ def generate_launch_description():
             description='A：pinch 内存在此自由直径即可掉头（车对角线）'),
         DeclareLaunchArgument('noexit_retreat_need_m', default_value='1.00',
             description='A：回退窗口内 w>=pinch 的连续长度要求'),
+        DeclareLaunchArgument('contact_fail', default_value='false',
+            description='P9-S0：物理接触时取消当前目标（默认关）'),
+        DeclareLaunchArgument('contact_fail_max', default_value='6',
+            description='P9-S0：每轮最多因接触取消几次目标'),
+        DeclareLaunchArgument('contact_fail_cooldown', default_value='3.0',
+            description='P9-S0：接触取消的冷却（s）'),
         DeclareLaunchArgument('noexit_turn_hold_m', default_value='0.30',
             description='A：掉头空间要连续多长（避免一格毛刺被当成凹室）'),
         DeclareLaunchArgument('corridor_width', default_value='1.05',
@@ -398,6 +409,10 @@ def generate_launch_description():
             description='P9-S0：物理接触后（/collision_contact_zone）允许一次受限倒车（雷达复核后方）'),
         DeclareLaunchArgument('supervisor_contact_reverse_window', default_value='5.0',
             description='P9-S0：接触后多少秒内仍允许触发（s）'),
+        DeclareLaunchArgument('supervisor_contact_reverse_cool', default_value='3.0',
+            description='P9-S0：接触倒车冷却（s）'),
+        DeclareLaunchArgument('supervisor_contact_reverse_front', default_value='0.90',
+            description='P9-S0：接触倒车要求前向 ±20° 测距 <= 此值（前方已开阔就不倒）'),
         DeclareLaunchArgument('supervisor_contact_reverse_max', default_value='3',
             description='P9-S0：每局接触触发的倒车次数上限'),
         DeclareLaunchArgument('supervisor_recovery_timeout', default_value='40.0',

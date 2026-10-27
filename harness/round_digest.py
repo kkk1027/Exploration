@@ -357,6 +357,12 @@ def main():
     lines.append(f'- 卡死事件（探索区间内无位移≥3 s）: **{len(stuck)}**　'
                  f'其中"想动却动不了(cmd非0)": **{n_wedged}**　'
                  f'最长 {max([s["dur"] for s in stuck], default=0):.0f} s')
+    # 2026-10-27 KPI 改造：接触段数/时长 + 停滞总秒数（帧数与事件数会被长研磨/短停顿放大）
+    lines.append(f'- 接触段/时长: {coll.get("contact_episodes")} 段 / '
+                 f'{coll.get("contact_secs")} s')
+    _st = sum(s["dur"] for s in stuck)
+    _st30 = sum(1 for s in stuck if s["dur"] >= 30)
+    lines.append(f'- 停滞总秒数: **{_st:.0f} s**　≥30 s: **{_st30}** 条')
     lines.append(f'- 派发来源: ' + '　'.join(
         f'{k}={v}({100*v//total_src}%)' for k, v in src.most_common()) if src else '- 派发: 无记录')
     lines.append('')

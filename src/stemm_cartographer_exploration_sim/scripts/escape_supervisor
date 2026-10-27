@@ -171,8 +171,15 @@ class EscapeSupervisor(Node):
         self.contact_reverse_window_sec = abs(float(
             p('contact_reverse_window_sec', 5.0).value))
         self.contact_reverse_max = int(p('contact_reverse_max', 3).value)
+        # 2026-10-27 实测（b3r4）：contact_seen=5 但一次都没倒车 —— 因为"车端静默 >=0.5 s"
+        # 这道门在研磨时永远不成立（车端一路给油门）。接触触发的倒车就是要覆盖车端指令，
+        # 安全性改由"后方净空 + 单步 <=0.15 m + 每局 <=3 次 + 冷却 3 s"来保证。
         self.contact_reverse_quiet_sec = abs(float(
-            p('contact_reverse_quiet_sec', 0.5).value))
+            p('contact_reverse_quiet_sec', 0.0).value))
+        self.contact_reverse_front_m = abs(float(
+            p('contact_reverse_front_m', 0.90).value))
+        self.contact_reverse_cooldown_sec = abs(float(
+            p('contact_reverse_cooldown_sec', 3.0).value))
         self._contact_at = None
         self._rv_contact_count = 0
         self._rv_explore_count = 0
@@ -641,7 +648,8 @@ class EscapeSupervisor(Node):
                 and not self.in_return_phase()
                 and (now - self._contact_at) <= self.contact_reverse_window_sec
                 and self._rv_contact_count < self.contact_reverse_max
-                and (now - self.last_foreign_cmd) >= self.contact_reverse_quiet_sec):
+                and (now - self.contact_reverse_quiet_sec) <= now
+                and (now - self._rv_last_end) >= self.contact_reverse_cooldown_sec):
             # 接触后车端已松手（静默 ≥0.5 s）→ 允许一次受限倒车把车退离障碍。
             # 不要求 blocked 状态：实测贴着低矮物体研磨时状态机根本不报 blocked。
             contact_panic = True
@@ -669,10 +677,18 @@ class EscapeSupervisor(Node):
             self._rv_streak_left = self.return_reverse_streak
         if now - self.points_stamp > self.scan_stale_sec:
             return False
-        if now - self.last_foreign_cmd < 1.0:
-            return False
-        if now - self.last_motion < (1.0 if explore else 2.0):
-            return False
+        if contact_panic:
+            # 接触路径：允许覆盖车端指令（这正是它的意义），只要求"确实没在正常行驶"
+            if now - self.last_motion < 0.3:
+                return False
+            rfront = self.range_cone(0.0, half_deg=20.0, stride=2)
+            if rfront > self.contact_reverse_front_m:
+                return False                     # 前方已开阔：倒车没意义
+        else:
+            if now - self.last_foreign_cmd < 1.0:
+                return False
+            if now - self.last_motion < (1.0 if explore else 2.0):
+                return False
         clear, npts = self.rear_clearance()
         need_pts = self.return_reverse_min_points
         need_clear = self.explore_reverse_rear_clear_m if explore else self.return_reverse_rear_clear
