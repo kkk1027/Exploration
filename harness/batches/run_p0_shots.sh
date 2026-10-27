@@ -28,7 +28,7 @@ for i in $(seq "$START" "$(( START + N - 1 ))") ; do
   # 轮次在后台起，方便同时挂探针与截图
   # ROUND_MARGIN：探索结束后等"返航/收尾"的余量（真实秒）。用户口径：返航失败只记录不解决，
   # 所以余量给小一点，避免每轮都吃满 300 s 把单轮拖到 14 分钟。两批必须一致。
-  RVIZ=true GUI=false VISION=1 POSE_OVERRIDE="0.0 0.0 0.0" ROUND_MARGIN="${ROUND_MARGIN:-90}" RECOVERY_BT="${RECOVERY_BT:-none}" \
+  RVIZ=true GUI=false VISION="${VISION:-1}" POSE_OVERRIDE="0.0 0.0 0.0" ROUND_MARGIN="${ROUND_MARGIN:-90}" RECOVERY_BT="${RECOVERY_BT:-none}" \
     timeout -k 10 $(( 180 + ${ROUND_MARGIN:-90} + 300 )) bash harness/round.sh "$TAG" 180 \
     >/tmp/${TAG}.log 2>&1 9>&- &
   RPID=$!
@@ -92,7 +92,7 @@ for i in $(seq "$START" "$(( START + N - 1 ))") ; do
       tail -20 "$D/launch.log" 2>/dev/null; } > "/tmp/invalid_rounds/${TAG}_$(date +%H%M%S).txt" 2>&1
     rm -rf "$D"
     pkill -x gzserver 2>/dev/null; rm -f /dev/shm/fastrtps_* 2>/dev/null; sleep 5
-    RVIZ=true GUI=false VISION=1 POSE_OVERRIDE="0.0 0.0 0.0" ROUND_MARGIN="${ROUND_MARGIN:-90}" RECOVERY_BT="${RECOVERY_BT:-none}" \
+    RVIZ=true GUI=false VISION="${VISION:-1}" POSE_OVERRIDE="0.0 0.0 0.0" ROUND_MARGIN="${ROUND_MARGIN:-90}" RECOVERY_BT="${RECOVERY_BT:-none}" \
       timeout -k 10 $(( 180 + ${ROUND_MARGIN:-90} + 300 )) bash harness/round.sh "$TAG" 180 \
       >/tmp/${TAG}.retry.log 2>&1 9>&- &
     wait $!
