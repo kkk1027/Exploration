@@ -1534,11 +1534,18 @@ class Arbiter(Node):
                 sim_t = self.get_clock().now().nanoseconds / 1e9
             except Exception:                            # noqa: BLE001
                 pass
+            _pay = self._nav_payload or {}
+            _mp = _pay.get('pose') or {}
             row = {
                 't': round(now_wall, 3), 'sim': None if sim_t is None else round(sim_t, 3),
                 'x': None if self.pose is None else round(self.pose[0], 3),
                 'y': None if self.pose is None else round(self.pose[1], 3),
                 'yaw': None if getattr(self, 'yaw', None) is None else round(self.yaw, 3),
+                # 2026-10-27：x/y 是 **odom 帧**（来自 /odom_combined），而目标/计划/map 都是 map 帧。
+                # 出生点不在原点时两者差一个固定偏移，事后按 x/y 筛点位会筛空（踩过一次）。
+                # 这里直接从车端 nav_state 的 pose（map 帧）再记一份，归因一律用 mx/my。
+                'mx': (round(float(_mp['x']), 3) if _mp.get('x') is not None else None),
+                'my': (round(float(_mp['y']), 3) if _mp.get('y') is not None else None),
                 'cmd': [None if self.cmd is None else round(self.cmd[0], 3),
                         None if self.cmd is None else round(self.cmd[1], 3)],
                 'busy': bool(getattr(self, 'mgr_busy', False)),
