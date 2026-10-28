@@ -505,6 +505,9 @@ fi
 # 本轮验收（七项 + P0 两项）
 if [ -f "$OUT/launch.log" ]; then
   timeout 180 python3 harness/evaluate.py "$OUT/launch.log" "$TAG" "$OUT/probe.jsonl" --p0 \
+  # 候选打分专用指标（独立于 PASS 验收）：供给/收获/打分质量/守门
+  timeout 120 python3 harness/candidate_metrics.py "$OUT" --json "$OUT/cand_metrics.json" \
+    > "$OUT/cand_metrics.md" 2>&1 || true
     > "$OUT/evaluate.json" 2>&1 || true
   python3 - "$OUT/evaluate.json" <<'PYEOF'
 import json,sys

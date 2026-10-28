@@ -1325,6 +1325,40 @@ class Arbiter(Node):
                 return (wx, wy, c)
         return None
 
+    def _area_stats(self, x, y, radius):
+        """(radius) 圆内：未知格数、已知空闲占"已知格"的比例（用于候选打分口径）。"""
+        m = self.map
+        if m is None:
+            return None, None
+        info = m.info
+        res = info.resolution
+        if res <= 0:
+            return None, None
+        n = max(1, int(radius / res))
+        ci = int((x - info.origin.position.x) / res)
+        cj = int((y - info.origin.position.y) / res)
+        unk = free = occ = 0
+        for dj in range(-n, n + 1):
+            j = cj + dj
+            if not (0 <= j < info.height):
+                continue
+            base = j * info.width
+            for di in range(-n, n + 1):
+                if di * di + dj * dj > n * n:
+                    continue
+                i = ci + di
+                if not (0 <= i < info.width):
+                    continue
+                v = m.data[base + i]
+                if v < 0 or v == 205:
+                    unk += 1
+                elif v == 0:
+                    occ += 1
+                else:
+                    free += 1
+        known = free + occ
+        return unk, (round(free / float(known), 3) if known else None)
+
     def _turn_to(self, x, y):
         """车头朝向量与"车→候选"方向的夹角（0..π）。位姿不可用时返回 0。"""
         if self.pose is None or len(self.pose) < 3:
@@ -1740,10 +1774,21 @@ class Arbiter(Node):
         except Exception as exc:                       # noqa: BLE001
             cx = {'error': f'{type(exc).__name__}: {exc}'}
             self.get_logger().warn(f'候选探针失败（忽略）：{cx["error"]}')
+        # 2026-10-28：补"打分质量"字段（用户要求给候选打分单独一套验收指标）
+        try:
+            _u2, _k2 = self._area_stats(gx, gy, 2.0)
+        except Exception:                       # noqa: BLE001
+            _u2 = _k2 = None
         row = {'t': round(time.time(), 3), 'goal': [round(gx, 3), round(gy, 3)],
                'robot': [round(self.pose[0], 3), round(self.pose[1], 3)] if self.pose else None,
                'min_w': None if min_w is None else round(float(min_w), 3),
                'unknown': None if unk is None else unk,
+               # 2 m 半径内的未知格数 / 已知空闲占比：派发时的"区域新度"
+               'unk_2m': _u2, 'free_frac_2m': _k2,
+               'turn_deg': round(math.degrees(self._turn_to(gx, gy)), 1),
+               'dispatch_idx': self.stats.get('published', 0) + 1,
+               'dist_to_robot': (round(math.hypot(gx - self.pose[0], gy - self.pose[1]), 2)
+                                 if self.pose else None),
                'ahead': (r or {}).get('ahead'), 'near_ratio': (r or {}).get('near_ratio'),
                'block': (r or {}).get('block'), 'penalty': (r or {}).get('penalty'),
                'score': (r or {}).get('score')}
