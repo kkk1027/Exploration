@@ -724,7 +724,9 @@ class Arbiter(Node):
         self.create_subscription(OccupancyGrid, self.vision_grid_topic,
                                  self.on_vision_grid, qmap)
         self.create_timer(1.0, self.tick)
-        self.get_logger().info('frontier_arbiter 就绪：可达性预筛/黑名单/最小前沿/回拉')
+        self.get_logger().info(
+            'frontier_arbiter 就绪：可达性预筛/黑名单/最小前沿/回拉｜scoring=%s '
+            'candidate_probe=%s' % (getattr(self, 'scoring', '?'), repr(self.probe_log)))
 
     # ---- 回调 ----
     def on_map(self, m):
