@@ -25,6 +25,7 @@ import numpy as np
 import rclpy
 import tf2_ros
 from nav_msgs.msg import OccupancyGrid
+from rcl_interfaces.msg import ParameterDescriptor
 from rclpy.node import Node
 from rclpy.qos import (DurabilityPolicy, QoSProfile, ReliabilityPolicy)
 from rclpy.time import Time
@@ -65,7 +66,14 @@ def cloud_msg(pts, frame_id, stamp):
 class VisionObstacleGrid(Node):
     def __init__(self):
         super().__init__('vision_obstacle_grid')
-        d = self.declare_parameter
+        # ★ 2026-10-28：数值型 launch 参数会以 INTEGER 传入（如 live_ttl_sec:=8），
+        # 而 declare(double) 遇到 int 会抛 InvalidParameterTypeException 当场崩
+        # （本项目已踩过 bool 版同样的坑）。这里对数值开关一律 dynamic_typing，
+        # 再用 float() 归一化。
+        _DYN = ParameterDescriptor(dynamic_typing=True)
+
+        def d(name, default, descriptor=None):
+            return self.declare_parameter(name, default, descriptor or _DYN)
         d('cloud_topic', '/camera/depth/points')
         d('global_frame', 'map')
         d('live_topic', '/vision/live_cloud')
@@ -108,6 +116,14 @@ class VisionObstacleGrid(Node):
         #   一旦写进去就再也擦不掉。旋转（|ω|>阈值）时只发 live 云给局部层，
         #   停稳后再累积，从源头消掉旋转鬼影。0 = 关闭（保持旧行为）。
         d('omega_gate', 0.0)
+        # ★ 2026-10-28 改动3a（默认关）：短 TTL 云 /vision/live_ttl_cloud。
+        #   局部代价地图的 VoxelLayer 只会清"当前观测包围盒内、被 raytrace 打到"的格，
+        #   于是转动时看到的格一旦离开视野就永久残留（实测 raw_lethal 2250→5453 单调不减）。
+        #   这里维护一份"短记忆"（默认 TTL 秒），只保留最近 TTL 内观测到的格，
+        #   再转回机身帧发布 —— 不再被观测的格会自动退场，绕开上面的语义。
+        d('live_ttl_sec', 0.0)          # 0=关闭（旧行为，只发 /vision/live_cloud）
+        d('ttl_topic', '/vision/live_ttl_cloud')
+        d('ttl_min_pts', 1)             # 单帧内至少几个点才算该格（比累积层的 min_points 松）
         d('odom_topic', '/odom_combined')
         # P9-⑧（2026-10-27 用户批准）：**累积层**（-> /vision/obstacle_cloud -> 全局代价地图）
         # 的独立衰减窗口。原来累积层与实时层共用 decay_sec（实验口径 20 s），结果
@@ -146,6 +162,9 @@ class VisionObstacleGrid(Node):
         self.dilate = max(0, int(g('dilate_cells').value))
         self.decay = float(g('decay_sec').value)
         self.omega_gate = max(0.0, float(g('omega_gate').value))
+        self.live_ttl = max(0.0, float(g('live_ttl_sec').value))
+        self.ttl_min_pts = max(1, int(g('ttl_min_pts').value))
+        self.ttl_cells = {}      # 格 -> 最后一次观测（monotonic）
         self.omega = None            # 由 odom_topic 的 twist.angular.z 提供
         self._gated_frames = 0
         _ad = float(g('accum_decay_sec').value)
@@ -189,11 +208,18 @@ class VisionObstacleGrid(Node):
         self.pub_low_accum = self.create_publisher(
             PointCloud2, g('low_accum_topic').value, qos_vis)
         self.pub_grid = self.create_publisher(OccupancyGrid, g('grid_topic').value, qos_map)
+        self.pub_ttl = (self.create_publisher(PointCloud2, g('ttl_topic').value, qos_vis)
+                        if self.live_ttl > 0.0 else None)
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         self.create_timer(1.0 / max(0.2, float(g('live_hz').value)), self.publish_live)
+        if self.pub_ttl is not None:
+            self.create_timer(1.0 / max(0.2, float(g('live_hz').value)), self.publish_ttl)
+            self.get_logger().info(
+                f'短 TTL 云已启用：TTL={self.live_ttl:.1f} s → {g("ttl_topic").value}'
+                f'（不再被观测的格会自动退场）')
         self.create_timer(1.0 / max(0.2, float(g('accum_hz').value)), self.publish_accum)
         self.create_timer(5.0, self.report)
         self.get_logger().info(
@@ -385,6 +411,15 @@ class VisionObstacleGrid(Node):
         key = (ix + OFF) * base + (iy + OFF)
         uniq, counts = np.unique(key, return_counts=True)
         good = uniq[counts >= self.min_pts]
+        # ★ 改动3a：短记忆（该格只要本帧有 >= ttl_min_pts 个点就记，不做 2 帧确认）
+        if self.pub_ttl is not None:
+            import time as _time_ttl
+            base_t = 2 * OFF
+            good_t = uniq[counts >= self.ttl_min_pts]
+            now_tt = _time_ttl.monotonic()
+            for c in zip((good_t // base_t - OFF).tolist(),
+                         (good_t % base_t - OFF).tolist()):
+                self.ttl_cells[c] = now_tt
         if good.size:
             gx = good // base - OFF
             gy = good % base - OFF
@@ -400,6 +435,41 @@ class VisionObstacleGrid(Node):
         self.stats['filtered'] = int(uniq.size - good.size)
 
     # ---------------- 输出 ----------------
+    def publish_ttl(self):
+        """短 TTL 云：把最近 ttl 秒内观测到的格转回机身帧发布（供局部代价地图用）。"""
+        if self.pub_ttl is None:
+            return
+        import time as _t
+        if not self.ttl_cells:
+            return
+        now = _t.monotonic()
+        stale = [c for c, ts in self.ttl_cells.items() if now - ts > self.live_ttl]
+        for c in stale:
+            self.ttl_cells.pop(c, None)
+        if not self.ttl_cells:
+            return
+        cells = np.fromiter((v for c in self.ttl_cells for v in c), dtype=np.int64,
+                            count=2 * len(self.ttl_cells)).reshape(-1, 2)
+        p_map = np.empty((cells.shape[0], 3), dtype=np.float64)
+        p_map[:, 0] = (cells[:, 0] + 0.5) * self.res
+        p_map[:, 1] = (cells[:, 1] + 0.5) * self.res
+        p_map[:, 2] = self.obstacle_z
+        # 必须发在**机身帧**：nav2 用云的 frame 原点当射线原点，发在 map 帧会把射线
+        # 从地图原点打出去、擦掉真实障碍。用最新 TF（不用点云 stamp，避免外推失败）。
+        try:
+            tr = self.tf_buffer.lookup_transform(self.live_frame, self.global_frame, Time())
+        except Exception:                                     # noqa: BLE001
+            return
+        t = tr.transform.translation
+        R = quat_to_matrix(tr.transform.rotation)
+        # lookup_transform(target=base, source=map) 给出 p_target = R @ p_map + t
+        # ★ 2026-10-28 修：原来写成 (p_map - t) @ R（等于转置），云被转错方位 →
+        #   局部代价地图满屏 lethal（实测 raw_lethal 2249→13131）。必须用 R @ p + t。
+        p_body = p_map @ R.T + np.array([t.x, t.y, t.z])
+        stamp = self.get_clock().now().to_msg()
+        self.pub_ttl.publish(cloud_msg(p_body, self.live_frame, stamp))
+        self.stats['pub_ttl'] = self.stats.get('pub_ttl', 0) + 1
+
     def publish_live(self):
         if self.last_live.shape[0] == 0:
             return

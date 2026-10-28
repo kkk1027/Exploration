@@ -7,6 +7,8 @@ set -u
 cd /home/kbf/stemm_exploration_sim_ws || exit 9
 TAG="${1:-lr}"
 TURNS="${2:-3}"
+# launch 里数值参数必须是浮点字面量，否则 int 型覆盖会让节点崩（本轮踩过）
+TTL_SEC="${TTL_SEC:-0.0}"; TTL_SEC_F=$(python3 -c "print(f\"{float('${TTL_SEC}'):.2f}\")" 2>/dev/null || echo 0.0)
 OUT="logs/localres_$(date +%Y%m%d-%H%M%S)_${TAG}"
 mkdir -p "$OUT"
 
@@ -38,6 +40,9 @@ setsid ros2 launch stemm_cartographer_exploration_sim nav_only.launch.py \
   spawn_x:=0.0 spawn_y:=0.0 spawn_yaw:=0.0 \
   vision:=${VISION:-true} vision_mode:=accum vision_tf_stamp:=true \
   vision_omega_gate:=${VISION_GATE:-0.0} \
+  vision_live_ttl_sec:=${TTL_SEC_F} \
+  vision_local_src:=${LOCAL_SRC:-live} \
+  vision_local_raytrace:=${LOCAL_RAYTRACE:-3.5} \
   vision_accum_decay_sec:=${VISION_DECAY:-120.0} \
   vision_low_accum_decay_sec:=${VISION_LOW_DECAY:-0.0} \
   gui:=false rviz:=false > "$OUT/launch.log" 2>&1 &
@@ -52,6 +57,7 @@ for _ in $(seq 1 40); do
   sleep 2
 done
 sleep 6
+echo "[local] 视觉口径：live_ttl=${TTL_SEC:-0.0}s local_src=${LOCAL_SRC:-live} local_raytrace=${LOCAL_RAYTRACE:-3.5} m"
 echo "[local] 局部代价地图关键参数："
 for p in use_sim_time update_frequency rolling_window width height; do
   echo "  /local_costmap/local_costmap $p = $(timeout 8 ros2 param get /local_costmap/local_costmap $p 2>&1 | tail -1)"

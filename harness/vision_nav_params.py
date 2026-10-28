@@ -166,13 +166,30 @@ BLOCK_G_LIVEMARK = f'''{SENT % "begin(global)"}
 
 
 MODE = 'live'
+# ★ 2026-10-28：局部视觉层可参数化（用户批准的 3a/3b）
+#   LOCAL_SRC='live' → 订阅 /vision/live_cloud（旧行为）
+#   LOCAL_SRC='ttl'  → 订阅 /vision/live_ttl_cloud（短 TTL 云：不再被观测的格会自动退场，
+#                       绕开 nav2「只清当前观测包围盒」的语义）
+LOCAL_SRC = 'live'
+LOCAL_RAYTRACE = 3.5      # raytrace_max_range
+LOCAL_OBS_RANGE = 3.0     # obstacle_max_range（nav2 要求 <= raytrace）
+
+def _local_block():
+    """按 LOCAL_SRC / LOCAL_RAYTRACE / LOCAL_OBS_RANGE 渲染局部视觉层块。"""
+    b = BLOCK_L
+    if LOCAL_SRC == 'ttl':
+        b = b.replace('topic: /vision/live_cloud', 'topic: /vision/live_ttl_cloud')
+    # 注意：nav2 的 double 参数不接受整数字面量（写成 3 会 ERROR 型不匹配），必须带小数
+    b = b.replace('obstacle_max_range: 3.0', f'obstacle_max_range: {LOCAL_OBS_RANGE:.2f}')
+    b = b.replace('raytrace_max_range: 3.5', f'raytrace_max_range: {LOCAL_RAYTRACE:.2f}')
+    return b
 
 
 def sections():
     g = {'live': BLOCK_G, 'accum': BLOCK_G_ACCUM,
          'lowaccum': BLOCK_G_LOWACCUM,
          'livemark': BLOCK_G_LIVEMARK}.get(MODE, BLOCK_G)
-    return [('local_costmap', TAG_L, BLOCK_L), ('global_costmap', TAG_G, g)]
+    return [('local_costmap', TAG_L, _local_block()), ('global_costmap', TAG_G, g)]
 
 
 SECTIONS = [('local_costmap', TAG_L, BLOCK_L), ('global_costmap', TAG_G, BLOCK_G)]
@@ -348,9 +365,22 @@ def main():
                          'accum=全带累积云+不清除（P9-⑧，覆盖退化）；'
                          'lowaccum=仅低矮带累积（P9-⑧b）；'
                          'livemark=实时云+不清除（P9-⑨，隔离 raytrace 擦除）')
+    ap.add_argument('--local-src', choices=('live', 'ttl'), default='live',
+                    help='local_costmap 视觉层源：live=实时云（旧行为）；'
+                         'ttl=短 TTL 云 /vision/live_ttl_cloud（不再被观测的格会自动退场）')
+    ap.add_argument('--local-raytrace', type=float, default=3.5,
+                    help='局部视觉层 raytrace_max_range（m）；局部窗口 6x6 m ⇒ 提到 5.0 可提高重观测概率')
+    ap.add_argument('--local-obstacle-range', type=float, default=3.0,
+                    help='局部视觉层 obstacle_max_range（m），必须 <= raytrace')
     a = ap.parse_args()
-    global MODE
+    global MODE, LOCAL_SRC, LOCAL_RAYTRACE, LOCAL_OBS_RANGE
     MODE = a.global_mode
+    LOCAL_SRC = a.local_src
+    LOCAL_RAYTRACE = a.local_raytrace
+    LOCAL_OBS_RANGE = a.local_obstacle_range
+    if LOCAL_OBS_RANGE > LOCAL_RAYTRACE:
+        print(f'  ✗ obstacle_max_range({LOCAL_OBS_RANGE}) > raytrace_max_range({LOCAL_RAYTRACE})')
+        return 2
     path = target_path()
     text = open(path, encoding='utf-8').read()
     lines = text.split('\n')
