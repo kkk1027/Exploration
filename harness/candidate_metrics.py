@@ -142,7 +142,7 @@ def main():
             v = [p.get(key) for p in probes if isinstance(p.get(key), (int, float))]
             return st.median(v) if v else None
         out['C1_novelty_2m'] = med('unk_2m')
-        out['C2_free_frac_2m'] = med('free_frac_2m')
+        out['C2_known_frac_2m'] = med('free_frac_2m')   # 字段名沿用，语义已改为"已探测占比"
         ff = [p['free_frac_2m'] for p in probes
               if isinstance(p.get('free_frac_2m'), (int, float))]
         out['C3_repeat_ratio'] = (round(sum(1 for x in ff if x >= 0.90) / float(len(ff)), 3)
@@ -227,8 +227,8 @@ def main():
         ('S5 修复比例', out.get('S5_repair_ratio')),
         ('S6 供给冗余 seen/pub', out.get('S6_cands_per_dispatch')),
         ('C1 派发时 2m 内未知格(中位)', out.get('C1_novelty_2m')),
-        ('C2 派发时 2m 内已知空闲占比(中位)', out.get('C2_free_frac_2m')),
-        ('C3 往老地方跑的比例(>=0.90)', out.get('C3_repeat_ratio')),
+        ('C2 派发时 2m 内已探测占比(中位)', out.get('C2_known_frac_2m')),
+        ('C3 往老地方跑的比例(已探测>=0.90)', out.get('C3_repeat_ratio')),
         ('C4 派发距离 中位/最大 m', '%s / %s' % (
             round(out['C4_dispatch_dist_med'], 2) if out.get('C4_dispatch_dist_med') else '-',
             round(out['C4_dispatch_dist_max'], 2) if out.get('C4_dispatch_dist_max') else '-')),

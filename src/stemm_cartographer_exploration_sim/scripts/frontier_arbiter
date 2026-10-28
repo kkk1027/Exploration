@@ -609,10 +609,10 @@ class Arbiter(Node):
                 return float(p(name, default).value)
             except Exception:                    # noqa: BLE001
                 return float(default)
-        self.novelty_w = _f('novelty_w', 0.30)
+        self.novelty_w = _f('novelty_w', 0.0)
         self.novelty_r = _f('novelty_radius_m', 2.0)
         self.repeat_ff = _f('repeat_free_frac', 0.90)
-        self.repeat_pen = _f('repeat_penalty', 250.0)
+        self.repeat_pen = _f('repeat_penalty', 0.0)
         self.near_first_band = _f('near_first_band', 0.10)
         # 候选后验"修复"（2026-10-27 用户方案）：后验不合格**不再一律否决**，
         # 而是在原候选附近随机采样，改投最近的合格点位。理由：否决会掐断供给
@@ -1373,7 +1373,10 @@ class Arbiter(Node):
                 else:
                     free += 1
         known = free + occ
-        return unk, (round(free / float(known), 3) if known else None)
+        # 返回（未知格数, 已知格占比）。注意不要返回"已知里的空闲占比"——
+        # 一片全新的区域里 free/(free+occ) 也会是 1.0，会把它误判成"已探明"。
+        frac = round(known / float(known + unk), 3) if (known + unk) else None
+        return unk, frac
 
     def _turn_to(self, x, y):
         """车头朝向量与"车→候选"方向的夹角（0..π）。位姿不可用时返回 0。"""
