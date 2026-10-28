@@ -111,6 +111,14 @@ def patch_text(txt, a):
             out.append(f'{ind}cost_scaling_factor: {a.infl_scaling}    # sim_patch(global)\n')
             done.append('infl_scaling')
             continue
+        if st.startswith('downsample_costmap:') and a.smac_downsample and a.smac_downsample > 1:
+            out.append(f'{ind}downsample_costmap: true    # sim_patch：降采样压搜索规模\n')
+            done.append('downsample_costmap')
+            continue
+        if st.startswith('downsampling_factor:') and a.smac_downsample and a.smac_downsample > 1:
+            out.append(f'{ind}downsampling_factor: {int(a.smac_downsample)}    # sim_patch\n')
+            done.append('downsampling_factor')
+            continue
         if st.startswith('allow_unknown:') and a.allow_unknown is not None:
             out.append(f'{ind}allow_unknown: {a.allow_unknown}    # sim_patch：不把没建图的区域当可行\n')
             done.append('allow_unknown')
@@ -139,6 +147,8 @@ def main():
     ap.add_argument('--check', action='store_true')
     ap.add_argument('--vx-max', type=float, default=None)
     ap.add_argument('--vx-min', type=float, default=None)
+    ap.add_argument('--smac-downsample', type=int, default=None,
+                    help='SmacPlannerHybrid 降采样倍数（2~4）；>1 时同时打开 downsample_costmap')
     ap.add_argument('--infl-radius', type=float, default=None)
     ap.add_argument('--infl-scaling', type=float, default=None)
     ap.add_argument('--pad', type=float, default=None)
@@ -161,7 +171,8 @@ def main():
     print(f'  已注入={SENT in cur}  pristine 存在={os.path.exists(PRISTINE)}')
     if a.check or not (a.apply or a.restore):
         for key in ('vx_max', 'vx_min', 'footprint_padding', 'allow_unknown',
-                    'motion_model_for_search', 'reverse_penalty'):
+                    'motion_model_for_search', 'reverse_penalty',
+                    'downsample_costmap', 'downsampling_factor'):
             rows = [l.strip() for l in cur.splitlines() if l.strip().startswith(key + ':')]
             print(f'   {key:24s} {rows[:3]}')
         return 0
