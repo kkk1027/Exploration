@@ -124,7 +124,10 @@ if probe and os.path.exists(probe):
     mppi_rev_on = False
     try:
         if os.path.exists(_navp):
-            mppi_rev_on = 'sim_patch(vx_min)' in open(_navp, encoding='utf-8').read()
+            _txt = open(_navp, encoding='utf-8').read()
+            # 注入器实际写的标记是「# sim_patch：受限倒车…」，旧的 'sim_patch(vx_min)'
+            # 永远匹配不到 ⇒ 一律退回最严包络（2026-10-27 rs5 三轮误判的直接原因）
+            mppi_rev_on = ('sim_patch：受限倒车' in _txt) or ('sim_patch(vx_min)' in _txt)
     except OSError:
         mppi_rev_on = False
     max_win = max(rev_dists) if rev_dists else 0.0
@@ -164,7 +167,10 @@ if probe and os.path.exists(probe):
     return_ok = (return_assist_m > 0.0 and return_assist_m <= 1.60
                  and max_win <= 0.30 and explore_rev_m <= 0.50)
     # MPPI 受限倒车包络（只在"开了 vx_min 注入"的轮次里生效）
-    mppi_ok = bool(mppi_rev_on and max_win <= 0.15 and explore_rev_m <= 0.60)
+    # 2026-10-27 用户批准的新口径：单窗 <=0.45 m、探索期累计 <=1.20 m
+    # 依据：rs5 五轮实测每次后退中位 0.07 m（最大 0.43 m）、探索期累计 0.15~0.92 m，
+    # 且 1.20 m 与 supervisor 自己的返航 assist 预算（8×0.15）一致。
+    mppi_ok = bool(mppi_rev_on and max_win <= 0.45 and explore_rev_m <= 1.20)
     authorized = ((explore_ok or mppi_ok) if rev_hard > 0 else False) or return_ok
     collision['reverse_return_assist_m'] = round(return_assist_m, 2)
     collision['reverse_explore_m'] = round(explore_rev_m, 2)
