@@ -176,6 +176,10 @@ def generate_launch_description():
                                 'cost_repair_samples': LaunchConfiguration('cost_repair_samples'),
                                 'cost_repair_keep_unknown': LaunchConfiguration('cost_repair_keep_unknown'),
                                 'cost_repair_min_unknown': LaunchConfiguration('cost_repair_min_unknown'),
+                                # 修复点综合质量：nav2 可通行先验 + 一般候选判据
+                                'cost_repair_verify': LaunchConfiguration('cost_repair_verify'),
+                                'cost_repair_verify_tries': LaunchConfiguration('cost_repair_tries'),
+                                'cost_repair_tick_cap': LaunchConfiguration('cost_repair_tick_cap'),
                                 'gate_esc_dirs_min': LaunchConfiguration('gate_min_esc'),
                                 'gate_occ_soft': LaunchConfiguration('gate_occ_soft'),
                                 # 探索末段"停车友好"偏置需要知道本轮总时长
@@ -446,6 +450,12 @@ def generate_launch_description():
             description='修复点至少保留原候选未知格数的比例'),
         DeclareLaunchArgument('cost_repair_min_unknown', default_value='20',
             description='修复点附近未知格绝对下限'),
+        DeclareLaunchArgument('cost_repair_verify', default_value='true',
+            description='修复点是否再验"可通行 + 候选判据"'),
+        DeclareLaunchArgument('cost_repair_tries', default_value='3',
+            description='修复点最多验几个（按距离近到远）'),
+        DeclareLaunchArgument('cost_repair_tick_cap', default_value='6',
+            description='每拍最多做几次修复验证（控时延）'),
         # 2026-10-25 20 轮 vs 20 轮 A/B（docs/P7 第 24 节）：
         #   基线（无 veto）∶静止超时 28（1.40/轮）、归因率 24%
         #   有 veto（额度 6、冷却 10 s）∶静止超时 19（0.95/轮，−32%）、归因率 11.5%
