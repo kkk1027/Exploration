@@ -186,6 +186,20 @@ class GhostProbe(Node):
             while time.time() < end:
                 rclpy.spin_once(self, timeout_sec=0.1)
             sample(f'hold{i:02d}')
+
+        # 4) ★ 改动2 的必要动作：再转回去，让"旋转期间写进来的格"不再被观测，
+        #    短衰减窗口(15~20 s)才有机会生效。旧协议只转一次，衰减永远不被触发。
+        if self.a.return_turn:
+            sample('pre-back')
+            self.drive(-self.a.rate, self.a.rotate_sec)
+            self.pub.publish(Twist())
+            sample('post-back')
+            m = max(1, int(self.a.back_hold_sec / self.a.period))
+            for i in range(m):
+                end = time.time() + self.a.period
+                while time.time() < end:
+                    rclpy.spin_once(self, timeout_sec=0.1)
+                sample(f'back{i:02d}')
         f.close()
         print(f'[ghost] 输出 {self.a.out}', flush=True)
         return 0
@@ -214,6 +228,9 @@ def main():
     ap.add_argument('--period', type=float, default=10.0)
     ap.add_argument('--base-n', type=int, default=3)
     ap.add_argument('--wait', type=float, default=120.0)
+    ap.add_argument('--return-turn', action='store_true',
+                    help='转完再转回去，让短衰减窗口有机会生效')
+    ap.add_argument('--back-hold-sec', type=float, default=40.0)
     ap.add_argument('--iso-m', type=float, default=0.30)
     ap.add_argument('--cmd-topic', default='/cmd_vel',
                     help='/cmd_vel 会被 velocity_smoother 的零速抢，建议 /cmd_vel_nav')

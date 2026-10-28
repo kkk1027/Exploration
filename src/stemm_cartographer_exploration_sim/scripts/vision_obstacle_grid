@@ -103,6 +103,12 @@ class VisionObstacleGrid(Node):
         # P0-己：幽灵障碍——累积格若长期没被再次观测就淡出（0=永不衰减，维持旧行为）。
         # 视觉看到的是物体表面，家具被挪走后旧格会永久堵路；默认 120 s 慢衰减。
         d('decay_sec', 120.0)
+        # ★ 2026-10-28 改动1（默认关）：旋转期间不写累积层。
+        #   鬼影的成因之一是"同一表面在旋转中被贴到多个位置"，而累积层 clearing=False，
+        #   一旦写进去就再也擦不掉。旋转（|ω|>阈值）时只发 live 云给局部层，
+        #   停稳后再累积，从源头消掉旋转鬼影。0 = 关闭（保持旧行为）。
+        d('omega_gate', 0.0)
+        d('odom_topic', '/odom_combined')
         # P9-⑧（2026-10-27 用户批准）：**累积层**（-> /vision/obstacle_cloud -> 全局代价地图）
         # 的独立衰减窗口。原来累积层与实时层共用 decay_sec（实验口径 20 s），结果
         # "视觉看到过的低矮物体"20 s 后就被遗忘，全局规划器随后直接横穿它
@@ -139,6 +145,9 @@ class VisionObstacleGrid(Node):
         self.live_frame = str(g('live_frame').value or 'base_footprint')
         self.dilate = max(0, int(g('dilate_cells').value))
         self.decay = float(g('decay_sec').value)
+        self.omega_gate = max(0.0, float(g('omega_gate').value))
+        self.omega = None            # 由 odom_topic 的 twist.angular.z 提供
+        self._gated_frames = 0
         _ad = float(g('accum_decay_sec').value)
         self.accum_decay = _ad if _ad >= 0.0 else self.decay
         self.low_accum_decay = float(g('low_accum_decay_sec').value)
@@ -158,6 +167,16 @@ class VisionObstacleGrid(Node):
         qos_cloud_in = QoSProfile(depth=2, reliability=ReliabilityPolicy.BEST_EFFORT,
                                   durability=DurabilityPolicy.VOLATILE)
         self.create_subscription(PointCloud2, self.cloud_topic, self.on_cloud, qos_cloud_in)
+        if self.omega_gate > 0.0:
+            try:
+                from nav_msgs.msg import Odometry
+                self.create_subscription(Odometry, str(g('odom_topic').value),
+                                         self.on_odom, 20)
+                self.get_logger().info(
+                    f'累积层角速度门控开启：|ω|>{self.omega_gate:.2f} rad/s 时只发 live 云、不写累积')
+            except Exception as e:                            # noqa: BLE001
+                self.get_logger().warn(f'角速度门控订阅失败（将不门控）：{e}')
+                self.omega_gate = 0.0
 
         # 发布侧一律 RELIABLE：可靠发布者兼容 best-effort 订阅者，反之会静默收不到
         qos_vis = QoSProfile(depth=2, reliability=ReliabilityPolicy.RELIABLE,
@@ -184,6 +203,9 @@ class VisionObstacleGrid(Node):
             f'range=[{self.range_min},{self.range_max}] self_r={self.self_r})')
 
     # ---------------- 输入 ----------------
+    def on_odom(self, msg):
+        self.omega = msg.twist.twist.angular.z
+
     def on_cloud(self, msg):
         self.stats['frames'] += 1
         names = {f.name: f.offset for f in msg.fields}
@@ -325,8 +347,18 @@ class VisionObstacleGrid(Node):
         else:
             self.last_low = np.zeros((0, 3), dtype=np.float64)
 
+        # ★ 改动1：旋转期间不写累积（live 云照发）。omega 拿不到时按"不门控"处理（fail-safe）。
+        gated = (self.omega_gate > 0.0 and self.omega is not None
+                 and abs(self.omega) > self.omega_gate)
+        if gated:
+            self._gated_frames += 1
+            if self._gated_frames % 20 == 1:
+                self.get_logger().info(
+                    f'累积层门控生效：|ω|={abs(self.omega):.2f} rad/s > '
+                    f'{self.omega_gate:.2f}，本帧只发 live 云（累计门控 {self._gated_frames} 帧）')
+
         # 低矮带累积（P9-⑧b）：只记 z∈[low_z_min, low_z_max] 的格
-        if self.last_low.shape[0]:
+        if self.last_low.shape[0] and not gated:
             lx = np.floor(self.last_low[:, 0] / self.res).astype(np.int64)
             ly = np.floor(self.last_low[:, 1] / self.res).astype(np.int64)
             OFF2 = 1 << 20
@@ -342,6 +374,8 @@ class VisionObstacleGrid(Node):
                     self.low_cells.add(c)
 
         keep2 = keep & (dist >= self.range_min)
+        if gated:
+            return
         if not keep2.any():
             return
         ix = np.floor(Pw[keep2, 0] / self.res).astype(np.int64)
@@ -386,6 +420,9 @@ class VisionObstacleGrid(Node):
             if stale:
                 for c in stale:
                     self.cells.discard(c)
+                    # ★ 改动2：衰减掉的格必须**重新**攒够 min_frames 次观测才能再进来，
+                    #   否则 hits 会把"很久以前看过两次"的记忆一直沿用。
+                    self.hits.pop(c, None)
                 self.get_logger().info('衰减移除 %d 个长期未再观测的障碍格（%.0fs 窗口）'
                                        % (len(stale), self.accum_decay))
         stamp = self.get_clock().now().to_msg()
@@ -421,6 +458,7 @@ class VisionObstacleGrid(Node):
             if stale:
                 for c in stale:
                     self.low_cells.discard(c)
+                    self.low_seen.pop(c, None)
                     self.low_seen.pop(c, None)
                 self.get_logger().info('低矮带累积移除 %d 格（%.0fs 窗口）'
                                        % (len(stale), self.low_accum_decay))

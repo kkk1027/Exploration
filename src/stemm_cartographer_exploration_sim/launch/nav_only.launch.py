@@ -166,6 +166,7 @@ def generate_launch_description():
                                'self_filter_radius': LaunchConfiguration('vision_self_radius'),
                                'tf_use_stamp': LaunchConfiguration('vision_tf_stamp'),
                                'tf_debug': LaunchConfiguration('vision_tf_debug'),
+                               'omega_gate': LaunchConfiguration('vision_omega_gate'),
                                'z_max': 1.80,
                                'low_z_max': 0.35,
                                'dump_path': LaunchConfiguration('vision_dump'),
@@ -244,6 +245,9 @@ def generate_launch_description():
                               description='true=按点云时间戳取 TF（修旋转鬼影）；false=旧行为'),
         DeclareLaunchArgument('vision_tf_debug', default_value='false',
                               description='true=TF 取不到时打印本节点 buffer 已知帧表（取证用）'),
+        DeclareLaunchArgument('vision_omega_gate', default_value='0.0',
+                              description='改动1：|ω| 超过该值(rad/s)时只发 live 云、不写累积层；'
+                                          '0=关闭（旧行为）'),
         DeclareLaunchArgument('vision_decay_sec', default_value='0.0'),
         DeclareLaunchArgument('vision_accum_decay_sec', default_value='120.0',
                               description='累积云衰减秒数(-1=永不衰减；120=与 round.sh 的 accum 档一致)'),

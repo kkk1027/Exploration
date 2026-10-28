@@ -50,6 +50,8 @@ setsid ros2 launch stemm_cartographer_exploration_sim nav_only.launch.py \
   map_yaml:=/home/kbf/stemm_sim_ws/maps/explore_latest.yaml \
   spawn_x:=0.0 spawn_y:=0.0 spawn_yaw:=0.0 \
   vision:=true vision_mode:=accum vision_tf_stamp:=$TSV \
+  vision_omega_gate:=${OMEGA_GATE:-0.0} vision_accum_decay_sec:=${ACCUM_DECAY:-120.0} \
+  vision_low_accum_decay_sec:=${LOW_DECAY:-0.0} \
   gui:=false rviz:=false > "$OUT/launch.log" 2>&1 &
 LPID=$!
 
@@ -64,9 +66,10 @@ for _ in $(seq 1 60); do
 done
 sleep 8
 
-echo "[ghost] 开始探测（tf_stamp=$TSV, hold=${HOLD}s）"
-timeout 400 python3 harness/ghost_probe.py \
-  --rotate-deg 360 --rate 1.2 --hold-sec "$HOLD" --period 10 \
+echo "[ghost] 开始探测（tf_stamp=$TSV, hold=${HOLD}s, omega_gate=${OMEGA_GATE:-0.0}, accum_decay=${ACCUM_DECAY:-120.0}, low_decay=${LOW_DECAY:-0.0}）"
+timeout 600 python3 harness/ghost_probe.py \
+  --rotate-deg 360 --rate 1.2 --hold-sec "$HOLD" --period 10 --return-turn \
+  --back-hold-sec "${BACK_HOLD:-40}" \
   --iso-m 0.30 --wait 90 --cmd-topic "${CMD_TOPIC:-/cmd_vel_nav}" --out "$OUT/ghost.jsonl" 2>&1 | tee "$OUT/probe.log"
 
 sed 's/\x1b\[[0-9;]*m//g' "$OUT/launch.log" | grep -a '累积使能' | tail -3 | tee "$OUT/vision_stats.txt"

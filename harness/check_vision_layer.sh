@@ -22,8 +22,8 @@ R=$(residue); [ -n "$R" ] && { say "清理残留: $R"; for p in $R; do kill -TER
   for p in $R; do kill -9 "$p" 2>/dev/null; done; sleep 1; }
 say "启动前残留=[$(residue)]"
 
-say "1) 注入视觉图层"
-python3 harness/vision_nav_params.py --apply 2>&1 | tee -a "$OUT/harness.log"
+say "1) 注入视觉图层（global-mode=${GLOBAL_MODE:-accum}；live 档是 P9-⑧ 已知会丢障碍的档）"
+python3 harness/vision_nav_params.py --apply --global-mode "${GLOBAL_MODE:-accum}" 2>&1 | tee -a "$OUT/harness.log"
 [ "${PIPESTATUS[0]}" = "0" ] || { say "注入失败"; exit 11; }
 trap 'python3 /home/kbf/stemm_exploration_sim_ws/harness/vision_nav_params.py --restore >/dev/null 2>&1' EXIT INT TERM
 
