@@ -180,6 +180,7 @@ def generate_launch_description():
                                 'cost_repair_verify': LaunchConfiguration('cost_repair_verify'),
                                 'cost_repair_verify_tries': LaunchConfiguration('cost_repair_tries'),
                                 'cost_repair_tick_cap': LaunchConfiguration('cost_repair_tick_cap'),
+                                'cost_repair_fallback': LaunchConfiguration('cost_repair_fallback'),
                                 'gate_esc_dirs_min': LaunchConfiguration('gate_min_esc'),
                                 'gate_occ_soft': LaunchConfiguration('gate_occ_soft'),
                                 # 探索末段"停车友好"偏置需要知道本轮总时长
@@ -454,6 +455,8 @@ def generate_launch_description():
             description='修复点是否再验"可通行 + 候选判据"'),
         DeclareLaunchArgument('cost_repair_tries', default_value='3',
             description='修复点最多验几个（按距离近到远）'),
+        DeclareLaunchArgument('cost_repair_fallback', default_value='true',
+            description='校验全失败时改投"仅过代价门"的最近点（不否决，保住供给）'),
         DeclareLaunchArgument('cost_repair_tick_cap', default_value='6',
             description='每拍最多做几次修复验证（控时延）'),
         # 2026-10-25 20 轮 vs 20 轮 A/B（docs/P7 第 24 节）：

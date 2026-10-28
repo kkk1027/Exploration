@@ -28,6 +28,7 @@ from nav_msgs.msg import OccupancyGrid
 from rclpy.node import Node
 from rclpy.qos import (DurabilityPolicy, QoSProfile, ReliabilityPolicy)
 from rclpy.time import Time
+from rclpy.duration import Duration
 from sensor_msgs.msg import PointCloud2, PointField
 
 
@@ -206,11 +207,25 @@ class VisionObstacleGrid(Node):
         if not ok.any():
             return
 
+        # ★ 2026-10-28：必须用**点云自己的时间戳**做 TF，而不是"最新 TF"。
+        # 原来取 Time()（最新）→ 车在旋转时，用当前姿态去变换 0.2~0.4 s 前的点云，
+        # 每帧错位 ω·Δt（实测转速可达 1.5 rad/s、相机 5 Hz ⇒ 每帧偏 0.3 rad≈17°），
+        # 多帧叠起来就是"旋转中一圈多重鬼影"；而累积层 clearing=False + 衰减 120 s，
+        # 这些鬼影会长时间留在栅格图上不消失。
+        stamp = Time.from_msg(msg.header.stamp) if msg.header.stamp.sec or \
+            msg.header.stamp.nanosec else Time()
         try:
-            tr = self.tf_buffer.lookup_transform(self.global_frame, msg.header.frame_id, Time())
-            tr_live = (self.tf_buffer.lookup_transform(self.live_frame, msg.header.frame_id, Time())
-                       if self.live_frame else None)
+            tr = self.tf_buffer.lookup_transform(self.global_frame, msg.header.frame_id,
+                                                 stamp, timeout=Duration(seconds=0.10))
+            self.stats['tf_stamp_ok'] = self.stats.get('tf_stamp_ok', 0) + 1
         except Exception:
+            # 时间戳 TF 取不到（首次上电/时间跳变）→ 退回最新 TF，并计数以便观察
+            try:
+                tr = self.tf_buffer.lookup_transform(self.global_frame, msg.header.frame_id, Time())
+                self.stats['tf_stamp_fallback'] = self.stats.get('tf_stamp_fallback', 0) + 1
+            except Exception:
+                tr = None
+        if tr is None:
             self.stats['tf_fail'] += 1
             if not self._warned_tf:
                 self._warned_tf = True
@@ -218,6 +233,17 @@ class VisionObstacleGrid(Node):
                     f'TF {self.global_frame}<-{msg.header.frame_id} 暂不可用（等待 SLAM 起图），先丢弃点云')
             return
         self._warned_tf = False
+        try:
+            tr_live = (self.tf_buffer.lookup_transform(self.live_frame, msg.header.frame_id,
+                                                       stamp, timeout=Duration(seconds=0.05))
+                       if self.live_frame else None)
+        except Exception:
+            try:
+                tr_live = (self.tf_buffer.lookup_transform(self.live_frame, msg.header.frame_id,
+                                                           Time())
+                           if self.live_frame else None)
+            except Exception:
+                tr_live = None
         t = tr.transform.translation
         R = quat_to_matrix(tr.transform.rotation)
         P = np.stack([x[ok], y[ok], z[ok]], axis=1)

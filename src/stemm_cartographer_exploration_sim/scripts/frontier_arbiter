@@ -616,6 +616,10 @@ class Arbiter(Node):
         self.repair_verify = self._as_bool(p('cost_repair_verify', True).value)
         self.repair_verify_tries = int(p('cost_repair_verify_tries', 3).value)
         self.repair_tick_cap = int(p('cost_repair_tick_cap', 6).value)
+        # 校验失败的兜底：若所有采样点都过不了"可通行 + 候选判据"，仍然改投
+        # **仅过代价门**的最近点（而不是回落到否决）。依据：rp6 实测严格校验后
+        # 每轮 68~164 个候选被否决掉 ⇒ 供给被掐、等候选 16→22 s、停滞 9→15 s。
+        self.repair_fallback = self._as_bool(p('cost_repair_fallback', True).value)
         self.novelty_w = _f('novelty_w', 0.0)
         self.novelty_r = _f('novelty_radius_m', 2.0)
         self.repeat_ff = _f('repeat_free_frac', 0.90)
@@ -2329,6 +2333,9 @@ class Arbiter(Node):
                 continue
             self.stats['repair_verified'] = self.stats.get('repair_verified', 0) + 1
             return nx, ny
+        if self.repair_fallback:
+            self.stats['repair_fallback'] = self.stats.get('repair_fallback', 0) + 1
+            return cand[0][1], cand[0][2]
         return None
 
     def pull_back(self, x, y):
