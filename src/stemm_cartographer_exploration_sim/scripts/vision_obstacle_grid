@@ -74,6 +74,7 @@ class VisionObstacleGrid(Node):
         d('low_topic', '/vision/low_cloud')
         d('resolution', 0.05)
         d('tf_use_stamp', True)      # True=按点云时间戳取 TF（修鬼影）；False=旧行为（最新 TF）
+        d('tf_debug', False)         # ★ 2026-10-28 取证用：打印本节点 tf buffer 已知帧表
         d('z_min', 0.05)
         d('z_max', 1.80)
         d('low_z_min', 0.05)
@@ -121,6 +122,7 @@ class VisionObstacleGrid(Node):
         self.global_frame = g('global_frame').value
         self.res = float(g('resolution').value)
         self.tf_use_stamp = bool(g('tf_use_stamp').value)
+        self.tf_debug = bool(g('tf_debug').value)   # ★ 2026-10-28 取证开关
         self.z_min = float(g('z_min').value)
         self.z_max = float(g('z_max').value)
         self.low_z = (float(g('low_z_min').value), float(g('low_z_max').value))
@@ -215,27 +217,50 @@ class VisionObstacleGrid(Node):
         # 多帧叠起来就是"旋转中一圈多重鬼影"；而累积层 clearing=False + 衰减 120 s，
         # 这些鬼影会长时间留在栅格图上不消失。
         use_stamp = bool(self.tf_use_stamp and (msg.header.stamp.sec or msg.header.stamp.nanosec))
-        stamp = Time.from_msg(msg.header.stamp) if use_stamp else self.get_clock().now()
+        # ★ 2026-10-28 修：fallback 与"旧行为"分支必须取 Time()（= 最新可用公共时间），
+        #   不能取 now()。原因（本轮实测，见 logs/diag_axis_*）：
+        #     map->odom_combined 由 AMCL 发布，而 AMCL 只在"位移≥update_min_d(0.25 m)
+        #     或转角≥update_min_a(0.2 rad)"时才广播 ⇒ **车一静止，TF 链最新时间就冻住**。
+        #     点云仍在以 5 Hz 前进（stamp 6.824 s），而 TF 链最新只到 6.790 s，
+        #     于是任何"以 now 或点云 stamp 为界"的 lookup 都会抛
+        #     ExtrapolationException: requested time ... in the future。
+        #     now() 与 Time() 只差在这：Time() 直接拿整条链的最新公共时间，不做外推。
+        #   后果（修前实测）：nav_only 里 帧 N / TF 失败 N = 100%，/vision/live_cloud 无数据、
+        #   代价地图看不到视觉障碍 —— 正是"视觉层好像没接入"的现象。
+        stamp = Time.from_msg(msg.header.stamp) if use_stamp else Time()
         try:
             if use_stamp:
                 tr = self.tf_buffer.lookup_transform(self.global_frame, msg.header.frame_id,
                                                      stamp, timeout=Duration(seconds=0.10))
             else:
-                # 旧行为：用"此刻"的位姿（等价于原来取最新 TF 的效果）
+                # 旧行为：取整条链最新的公共时间（与 amend 之前的 Time() 语义一致）
                 tr = self.tf_buffer.lookup_transform(self.global_frame, msg.header.frame_id,
-                                                     stamp, timeout=Duration(seconds=0.10))
+                                                     stamp)
             self.stats['tf_stamp_ok'] = self.stats.get('tf_stamp_ok', 0) + 1
         except Exception as _e1:                 # noqa: BLE001
             self._last_tf_err = f'{type(_e1).__name__}: {_e1}'
-            # 时间戳 TF 取不到（首次上电/时间跳变）→ 退回最新 TF，并计数以便观察
+            # 时间戳 TF 取不到（TF 链被上游卡住/时间跳变）→ 退回"最新可用"，并计数
             try:
                 tr = self.tf_buffer.lookup_transform(self.global_frame, msg.header.frame_id,
-                                                     self.get_clock().now())
+                                                     Time())
                 self.stats['tf_stamp_fallback'] = self.stats.get('tf_stamp_fallback', 0) + 1
             except Exception:
                 tr = None
         if tr is None:
             self.stats['tf_fail'] += 1
+            # ★ 2026-10-28 取证：TF 明明在 /tf 上（tf2_echo 能取到 map->odom_combined），
+            # 但本节点 lookup 说 "map does not exist" ⇒ 必须看本节点 buffer 到底有哪些帧。
+            if getattr(self, 'tf_debug', False):
+                now_s = self.get_clock().now().nanoseconds * 1e-9
+                if now_s - getattr(self, '_tf_dbg_t', -1e9) > 10.0:
+                    self._tf_dbg_t = now_s
+                    try:
+                        frames = self.tf_buffer.all_frames_as_string()
+                    except Exception as _fe:              # noqa: BLE001
+                        frames = f'<all_frames_as_string failed: {_fe}>'
+                    self.get_logger().warn(
+                        f'[tf_debug] lookup {self.global_frame}<-{msg.header.frame_id} 失败，'
+                        f'buffer 已知帧:\n{frames[:800]}')
             if not self._warned_tf:
                 self._warned_tf = True
                 self.get_logger().warn(

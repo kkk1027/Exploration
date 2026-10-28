@@ -64,6 +64,10 @@ class UrdfPublisher(Node):
                        reliability=ReliabilityPolicy.RELIABLE)
         self.pub = self.create_publisher(String, self.topic, q)
         self.sent = 0
+        # ★ 先立刻发一次，不要只依赖定时器：本节点用系统时钟（launch 里显式
+        # use_sim_time=False）；若用仿真时钟，定时器要等 /clock，实测一次都没触发，
+        # spawn_entity 就永远等不到 robot_description。
+        self.tick()
         self.create_timer(self.period, self.tick)
         self.get_logger().info(
             f'urdf_publisher: 就绪 {os.path.basename(self.model)} -> {self.topic} '

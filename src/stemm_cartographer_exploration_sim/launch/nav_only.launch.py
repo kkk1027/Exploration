@@ -56,7 +56,7 @@ def generate_launch_description():
     #    这里并行再发一份同源 URDF（内容与 RSP 一致），保证 spawn 一定能拿到。
     urdf_pub = Node(package='stemm_cartographer_exploration_sim',
                     executable='urdf_publisher', name='urdf_publisher', output='screen',
-                    parameters=[{'use_sim_time': use_sim_time,
+                    parameters=[{'use_sim_time': False,   # 系统时钟，不能等 /clock
                                  'model_file': LaunchConfiguration('robot_model'),
                                  'topic': '/robot_description',
                                  'period': 1.0, 'count': 30}])
@@ -101,6 +101,13 @@ def generate_launch_description():
                              'tf_broadcast': True,
                              # 初始位姿 = 建图那一轮的出生点 (0,0,0)
                              'set_initial_pose': True,
+                             # ★ 2026-10-28：AMCL 默认只在"位移≥0.25 m / 转角≥0.2 rad"时才
+                             # 广播 map->odom_combined ⇒ 车静止时 TF 链冻住，而视觉点云还在
+                             # 5 Hz 前进，视觉层 100% TF 失败（实测 帧 N/失败 N）。
+                             # 台架上把阈值压到 0 ⇒ 每帧激光都广播，与探索栈里
+                             # cartographer 持续广播的行为对齐，nav_only 的视觉结论才可信。
+                             'update_min_d': LaunchConfiguration('amcl_update_min_d'),
+                             'update_min_a': LaunchConfiguration('amcl_update_min_a'),
                              # 初始位姿 = 出生点（同一组参数），保证"假定的位姿"与物理一致
                              'initial_pose': {'x': LaunchConfiguration('spawn_x'),
                                               'y': LaunchConfiguration('spawn_y'),
@@ -158,6 +165,7 @@ def generate_launch_description():
                                'global_frame': 'map',
                                'self_filter_radius': LaunchConfiguration('vision_self_radius'),
                                'tf_use_stamp': LaunchConfiguration('vision_tf_stamp'),
+                               'tf_debug': LaunchConfiguration('vision_tf_debug'),
                                'z_max': 1.80,
                                'low_z_max': 0.35,
                                'dump_path': LaunchConfiguration('vision_dump'),
@@ -212,6 +220,11 @@ def generate_launch_description():
         DeclareLaunchArgument('spawn_x', default_value='0.0'),
         DeclareLaunchArgument('spawn_y', default_value='0.0'),
         DeclareLaunchArgument('spawn_yaw', default_value='0.0'),
+        DeclareLaunchArgument('amcl_update_min_d', default_value='0.0',
+                              description='AMCL 位移阈值(m)：0=每帧激光都广播 map->odom，'
+                                          '静止时 TF 不冻结（视觉层需要）'),
+        DeclareLaunchArgument('amcl_update_min_a', default_value='0.0',
+                              description='AMCL 转角阈值(rad)：0=同上'),
         DeclareLaunchArgument('robot_model',
                               default_value=os.path.join(
                                   get_package_share_directory('wheeltec_two_wheel_model'),
@@ -229,6 +242,8 @@ def generate_launch_description():
         DeclareLaunchArgument('vision_self_radius', default_value='0.38'),
         DeclareLaunchArgument('vision_tf_stamp', default_value='true',
                               description='true=按点云时间戳取 TF（修旋转鬼影）；false=旧行为'),
+        DeclareLaunchArgument('vision_tf_debug', default_value='false',
+                              description='true=TF 取不到时打印本节点 buffer 已知帧表（取证用）'),
         DeclareLaunchArgument('vision_decay_sec', default_value='0.0'),
         DeclareLaunchArgument('vision_accum_decay_sec', default_value='120.0',
                               description='累积云衰减秒数(-1=永不衰减；120=与 round.sh 的 accum 档一致)'),
