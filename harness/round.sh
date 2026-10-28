@@ -215,6 +215,9 @@ trap 'python3 /home/kbf/stemm_exploration_sim_ws/harness/vision_nav_params.py --
       say "统一口径：footprint=${UNIFY_FP:-0.97m宽} padding=${PAD_UNIFY:-0.0} vx_min=-$(as_float "${VX_MIN:-0.08}") allow_unknown=false"
     fi
     [ -n "${VX_MIN:-}" ] && NAV_ARGS+=(--vx-min "$VX_MIN")
+    # 只改**全局**膨胀半径（局部保持原厂 0.45）：车自身格被判"起点致命"是因为
+    # 全局 inflation 0.40 ≥ 车体到障碍的距离；降到 0.30 后车贴墙时不再整格抬升。
+    [ -n "${INFL_R:-}" ] && NAV_ARGS+=(--infl-radius "$(as_float "$INFL_R")")
     if [ "${COST_INFL:-0}" = "1" ]; then
       NAV_ARGS+=(--infl-radius "${GLOBE_R:-1.00}" --infl-scaling "${GLOBE_S:-1.2}" --pad "${PAD:-0.10}")
     fi
