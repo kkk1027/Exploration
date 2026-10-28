@@ -91,9 +91,9 @@ class GhostProbe(Node):
         res = grid.info.resolution
         ox, oy = grid.info.origin.position.x, grid.info.origin.position.y
         x = ox + (col + 0.5) * res
-        y = oy + (row + 0.5) * res
-        # PGM 行 0 在图上、origin 在左下 ⇒ y 需要翻转（本项目已踩过的镜像坑）
-        return np.stack([x, oy + (h - row - 0.5) * res], axis=1)
+        # ★ nav_msgs/OccupancyGrid 行 0 = **最小 y**（不是 PGM 的"行 0 在上"）。
+        #   这里曾按 PGM 习惯翻转（h-row），等于拿镜像地图当参照 —— 2026-10-28 踩过。
+        return np.stack([x, oy + (row + 0.5) * res], axis=1)
 
     def static_points(self):
         g = self.smap

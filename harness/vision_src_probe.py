@@ -113,7 +113,7 @@ class SrcProbe(Node):
         my = s * x + c * y
         r = np.hypot(mx, my)
         col = ((mx - m['ox']) / m['res']).astype(int)
-        row = ((m['h'] - 1) - ((my - m['oy']) / m['res'])).astype(int)  # PGM 行翻转
+        row = ((my - m['oy']) / m['res']).astype(int)   # OccupancyGrid: 行 0 = 最小 y
         inside = (col >= 0) & (col < m['w']) & (row >= 0) & (row < m['h'])
         near = np.zeros(len(mx), dtype=bool)
         near[inside] = m['near'][row[inside], col[inside]]

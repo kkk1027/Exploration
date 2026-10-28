@@ -63,8 +63,10 @@ class Align(Node):
         res = g.info.resolution
         ox, oy = g.info.origin.position.x, g.info.origin.position.y
         x = ox + (cols + 0.5) * res
-        # nav2 规范：行 0 在图上方 ⇒ y 随行号减小
-        y = oy + (g.info.height - rows - 0.5) * res
+        # ★ nav_msgs/OccupancyGrid 规范：data 行 0 = **最小 y**（底边），
+        #   nav2 map_server / RViz 都按这个约定显示。这里曾误用 PGM 的"行 0 在上"，
+        #   导致把镜像地图当成正常地图（2026-10-28 因此误判过一次）。
+        y = oy + (rows + 0.5) * res
         return np.stack([x, y], axis=1)
 
     def hit_rate(self, pts_xy, occ, tol):

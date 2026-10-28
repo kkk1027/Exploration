@@ -627,15 +627,24 @@ class SessionDriver(Node):
             return False
         w, h, res = msg.info.width, msg.info.height, msg.info.resolution
         img = bytearray(w * h)
+        # ★★ 2026-10-28 修镜像根因：
+        #   nav_msgs/OccupancyGrid.data 是**行 0 = 最小 y（底边）**的 row-major，
+        #   而 PGM（nav2 map_io / map_saver 约定）**行 0 = 最大 y（顶边）**。
+        #   原来 `for i, v in enumerate(msg.data): img[i] = ...` 把 data 原样写进
+        #   PGM 像素缓冲，少了一次行翻转 ⇒ 每次存出来的地图都是 **y 镜像**；
+        #   nav_only 用这张图跑时，雷达点云与地图整片错位（实测按 nav2 约定读只有
+        #   15.3% 贴合，翻转后 99.6%）——这就是历史上反复出现的"地图和点云镜像"。
         for i, v in enumerate(msg.data):
+            y, x = divmod(i, w)
             if v < 0:
-                img[i] = 205
+                c = 205
             elif v >= 65:
-                img[i] = 0
+                c = 0
             elif v <= 25:
-                img[i] = 254
+                c = 254
             else:
-                img[i] = 205
+                c = 205
+            img[(h - 1 - y) * w + x] = c
         out = os.path.expanduser(self.map_out)
         os.makedirs(os.path.dirname(out) or '.', exist_ok=True)
         with open(out + '.pgm', 'wb') as fh:

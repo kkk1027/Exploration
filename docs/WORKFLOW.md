@@ -4,6 +4,10 @@
 1. **一次只跑一轮**（`flock /tmp/stemm_round.lock`）；批次也是串行。
 2. **改动可回退**：开关默认关，或 `--restore` 逐字节还原；改完立刻 `git commit`。
 3. **S0 零接触优先**：出现物理接触即回退该改动，即使别的指标变好。
+4. **看到"点云/地图不贴合或像镜像"先跑判定，别猜**：
+   `python3 harness/scan_map_align.py --frames 15 --tf-warm 5`
+   （as-is <30% 且 y-flip >90% ⇒ 地图行序错，见 `docs/P10_地图行序镜像_根因与归档.md`；
+   长跑挂 `python3 harness/align_guard.py --period 10 &`）
 
 ## 1. 目录约定
 | 位置 | 内容 |

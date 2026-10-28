@@ -227,11 +227,19 @@ def generate_launch_description():
         DeclareLaunchArgument('spawn_x', default_value='0.0'),
         DeclareLaunchArgument('spawn_y', default_value='0.0'),
         DeclareLaunchArgument('spawn_yaw', default_value='0.0'),
-        DeclareLaunchArgument('amcl_update_min_d', default_value='0.0',
-                              description='AMCL 位移阈值(m)：0=每帧激光都广播 map->odom，'
-                                          '静止时 TF 不冻结（视觉层需要）'),
-        DeclareLaunchArgument('amcl_update_min_a', default_value='0.0',
-                              description='AMCL 转角阈值(rad)：0=同上'),
+        # ★★ 2026-10-28 回退：默认必须回到原厂 0.25 / 0.2。
+        #   本轮实测：把阈值压到 0（每帧激光都更新滤波器）后，车**静止不动**时
+        #   AMCL 也会持续重采样；运动模型此régime没有信息，粒子云就在似然场里随机游走，
+        #   最终稳定到**错误**位姿：map->base=(0.523,-0.731,yaw 3.4°)，而里程计只有
+        #   (0.004,0.000,0.36°) ⇒ 雷达点云被 map->odom 一起挪走 0.9 m，
+        #   RViz 上看起来就是"雷达点云和地图镜像/错位"（实测对齐率 99.6%→16.3%，
+        #   且任何镜像轴都解释不了：y-flip 14.4%、最佳 x 镜像 18.4%）。
+        #   视觉层不需要这个改动：TF 冻结时已有 Time() 回退（实测 med 0.03~0.12 m）。
+        DeclareLaunchArgument('amcl_update_min_d', default_value='0.25',
+                              description='AMCL 位移阈值(m)：原厂默认 0.25。'
+                                          '⚠ 置 0 会让静止时的滤波器随机游走并锁到错误位姿（实测）'),
+        DeclareLaunchArgument('amcl_update_min_a', default_value='0.2',
+                              description='AMCL 转角阈值(rad)：原厂默认 0.2。⚠ 同上'),
         DeclareLaunchArgument('robot_model',
                               default_value=os.path.join(
                                   get_package_share_directory('wheeltec_two_wheel_model'),
