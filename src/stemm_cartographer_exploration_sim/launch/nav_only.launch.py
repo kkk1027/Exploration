@@ -200,8 +200,11 @@ def generate_launch_description():
             d = yaml.safe_load(open(params_file, encoding='utf-8'))
         except Exception as e:                                  # noqa: BLE001
             raise RuntimeError(f'[nav_only] 参数文件解析失败：{e}') from e
-        for node_name, tag in (('local_costmap', 'vision_voxel_layer'),
-                               ('global_costmap', 'vision_obstacle_layer')):
+        # local-src=none 时局部**故意**没有视觉图层，别把它当成注入失败
+        want = [('global_costmap', 'vision_obstacle_layer')]
+        if local_src != 'none':
+            want.insert(0, ('local_costmap', 'vision_voxel_layer'))
+        for node_name, tag in want:
             got = d[node_name][node_name]['ros__parameters'].get('plugins') or []
             if tag not in got:
                 raise RuntimeError(f'[nav_only] {node_name}.plugins 缺 {tag}：{got}')

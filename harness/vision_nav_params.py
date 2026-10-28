@@ -175,7 +175,9 @@ LOCAL_RAYTRACE = 3.5      # raytrace_max_range
 LOCAL_OBS_RANGE = 3.0     # obstacle_max_range（nav2 要求 <= raytrace）
 
 def _local_block():
-    """按 LOCAL_SRC / LOCAL_RAYTRACE / LOCAL_OBS_RANGE 渲染局部视觉层块。"""
+    """按 LOCAL_SRC / LOCAL_RAYTRACE / LOCAL_OBS_RANGE 渲染局部视觉层块（none = 不注入）。"""
+    if LOCAL_SRC == 'none':
+        return ''
     b = BLOCK_L
     if LOCAL_SRC == 'ttl':
         b = b.replace('topic: /vision/live_cloud', 'topic: /vision/live_ttl_cloud')
@@ -249,9 +251,13 @@ def inject_tag(line, tag):
 
 
 def remove_tag(line, tag):
-    out = re.sub(r',\s*"%s"' % tag, '', line)
-    out = re.sub(r'"%s"\s*,\s*' % tag, '', out)
-    return out
+    """从 plugins 行里删掉某个插件名（保留其它项与格式）。"""
+    m = re.search(r'plugins:\s*\[(.*?)\]', line)
+    if not m:
+        return line
+    keep = [x.strip() for x in m.group(1).split(',')
+            if x.strip().strip('"\'') != tag]
+    return line[:m.start()] + 'plugins: [' + ', '.join(keep) + ']' + line[m.end():]
 
 
 def do_apply(lines):
@@ -259,6 +265,20 @@ def do_apply(lines):
     for name, tag, block in sections():
         lo, hi = section_range(lines, name)
         i = find_plugins_line(lines, lo, hi)
+        if block == '':                       # local-src=none：局部**不注入**（并从 plugins 移除）
+            if tag in plugin_list_of(lines[i]):
+                lines[i] = remove_tag(lines[i], tag)
+                changed = True
+            key = 'begin(local)'
+            if SENT % key in '\n'.join(lines):
+                b, e = SENT % key, SENT % 'end(local)'
+                try:
+                    bi = lines.index(b); ei = lines.index(e, bi)
+                    del lines[bi:ei + 1]
+                    changed = True
+                except ValueError:
+                    pass
+            continue
         if tag not in plugin_list_of(lines[i]):
             lines[i] = inject_tag(lines[i], tag)
             changed = True
@@ -314,7 +334,9 @@ def validate(text, expect_tags=True):
         return False, f'YAML 解析失败: {e}'
     if not expect_tags:
         return True, 'ok'
-    for name, tag, _ in sections():
+    for name, tag, block in sections():
+        if block == '':            # local-src=none：局部本来就不该有该插件
+            continue
         sec = d.get(name) or {}
         inner = sec.get(name) or {}
         names = (inner.get('ros__parameters') or {}).get('plugins') or []
@@ -365,9 +387,10 @@ def main():
                          'accum=全带累积云+不清除（P9-⑧，覆盖退化）；'
                          'lowaccum=仅低矮带累积（P9-⑧b）；'
                          'livemark=实时云+不清除（P9-⑨，隔离 raytrace 擦除）')
-    ap.add_argument('--local-src', choices=('live', 'ttl'), default='live',
+    ap.add_argument('--local-src', choices=('live', 'ttl', 'none'), default='live',
                     help='local_costmap 视觉层源：live=实时云（旧行为）；'
-                         'ttl=短 TTL 云 /vision/live_ttl_cloud（不再被观测的格会自动退场）')
+                         'ttl=短 TTL 云 /vision/live_ttl_cloud；'
+                         'none=**不注入**（局部只留雷达+静态，视觉仍由 global 层负责）')
     ap.add_argument('--local-raytrace', type=float, default=3.5,
                     help='局部视觉层 raytrace_max_range（m）；局部窗口 6x6 m ⇒ 提到 5.0 可提高重观测概率')
     ap.add_argument('--local-obstacle-range', type=float, default=3.0,
