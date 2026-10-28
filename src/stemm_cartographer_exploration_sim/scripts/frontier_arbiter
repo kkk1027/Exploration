@@ -598,6 +598,14 @@ class Arbiter(Node):
         self.turn_pen_k = float(p('turn_penalty_k', 60.0).value)
         self.near_first = self._as_bool(p('near_first', True).value)
         self.near_first_r = float(p('near_first_radius_m', 3.0).value)
+        # ==== 区域新度打分（2026-10-28 用户要求：优先级看"哪片区域没探过"）====
+        # 旧口径只数目标周围 0.6 m 的未知格；改为叠加"2 m 半径未知格"作为主权重，
+        # 并对"已探明区"（2 m 内已知空闲占比 >= repeat_ff）重罚，避免车被反复送回老地方。
+        self.novelty_w = float(p('novelty_w', 0.30).value)
+        self.novelty_r = float(p('novelty_radius_m', 2.0).value)
+        self.repeat_ff = float(p('repeat_free_frac', 0.90).value)
+        self.repeat_pen = float(p('repeat_penalty', 250.0).value)
+        self.near_first_band = float(p('near_first_band', 0.10).value)
         # 候选后验"修复"（2026-10-27 用户方案）：后验不合格**不再一律否决**，
         # 而是在原候选附近随机采样，改投最近的合格点位。理由：否决会掐断供给
         # （实测单源化后 manager 连续 93 s 无目标），修复则保留仲裁通道的主导地位
@@ -1371,7 +1379,7 @@ class Arbiter(Node):
                            math.cos(want - self.pose[2])))
         return min(d, math.pi)
 
-    def near_first_reorder(self, top):
+    def near_first_reorder(self, top, band=None):
         """近处可执行优先（2026-10-27 用户要求 2）。
 
         top 里若有"距车 <= near_first_r"的候选，则把它们提到最前面（按距离升序），
@@ -1379,11 +1387,15 @@ class Arbiter(Node):
         """
         if not self.near_first or self.pose is None or not top:
             return top
+        b = self.near_first_band if band is None else band
+        best = top[0][0] if isinstance(top[0][0], (int, float)) else None
+        floor = (best * (1.0 - b)) if (best is not None and best > 0) else None
         near, far = [], []
         for item in top:
             x, y = item[2], item[3]
             d = math.hypot(x - self.pose[0], y - self.pose[1])
-            (near if d <= self.near_first_r else far).append((d, item))
+            ok_band = (floor is None) or (item[0] >= floor)
+            (near if (d <= self.near_first_r and ok_band) else far).append((d, item))
         if not near:
             return top
         near.sort(key=lambda t: t[0])
@@ -2629,6 +2641,14 @@ class Arbiter(Node):
             # 转角惩罚（软约束）：朝后方的候选只降分，不再被拒
             if self.turn_pen_k > 0.0:
                 u_eff -= self.turn_pen_k * (self._turn_to(x, y) / math.pi)
+            # 区域新度：2 m 半径未知格加分；已探明区（已知空闲占比高）重罚
+            if self.novelty_w > 0.0 or self.repeat_pen > 0.0:
+                _unk2, _ff2 = self._area_stats(x, y, self.novelty_r)
+                if _unk2 is not None and self.novelty_w > 0.0:
+                    u_eff += self.novelty_w * _unk2
+                if _ff2 is not None and self.repeat_pen > 0.0 and _ff2 >= self.repeat_ff:
+                    u_eff -= self.repeat_pen
+                    self.stats['repeat_pen'] = self.stats.get('repeat_pen', 0) + 1
             scored.append((u_eff, -math.hypot(x - self.pose[0], y - self.pose[1]), x, y))
         scored.sort(reverse=True)
         # V1：对前 max_cand 个候选先算区域特征 → 闸门硬拒 + occ/esc 罚分重排
