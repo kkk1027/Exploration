@@ -601,11 +601,19 @@ class Arbiter(Node):
         # ==== 区域新度打分（2026-10-28 用户要求：优先级看"哪片区域没探过"）====
         # 旧口径只数目标周围 0.6 m 的未知格；改为叠加"2 m 半径未知格"作为主权重，
         # 并对"已探明区"（2 m 内已知空闲占比 >= repeat_ff）重罚，避免车被反复送回老地方。
-        self.novelty_w = float(p('novelty_w', 0.30).value)
-        self.novelty_r = float(p('novelty_radius_m', 2.0).value)
-        self.repeat_ff = float(p('repeat_free_frac', 0.90).value)
-        self.repeat_pen = float(p('repeat_penalty', 250.0).value)
-        self.near_first_band = float(p('near_first_band', 0.10).value)
+        # 注意：launch 传参会被 YAML 推断类型，整数（250）与 float 声明不匹配会抛
+        # InvalidParameterTypeException 把整个仲裁器打崩（2026-10-28 实测一次）。
+        # 这里统一用容错读取：先取 value，再用 float(str(...)) 兜一层。
+        def _f(name, default):
+            try:
+                return float(p(name, default).value)
+            except Exception:                    # noqa: BLE001
+                return float(default)
+        self.novelty_w = _f('novelty_w', 0.30)
+        self.novelty_r = _f('novelty_radius_m', 2.0)
+        self.repeat_ff = _f('repeat_free_frac', 0.90)
+        self.repeat_pen = _f('repeat_penalty', 250.0)
+        self.near_first_band = _f('near_first_band', 0.10)
         # 候选后验"修复"（2026-10-27 用户方案）：后验不合格**不再一律否决**，
         # 而是在原候选附近随机采样，改投最近的合格点位。理由：否决会掐断供给
         # （实测单源化后 manager 连续 93 s 无目标），修复则保留仲裁通道的主导地位
