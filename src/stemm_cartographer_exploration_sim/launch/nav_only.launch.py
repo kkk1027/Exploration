@@ -50,6 +50,17 @@ def generate_launch_description():
     use_sim_time = LaunchConfiguration('use_sim_time')
     map_yaml = LaunchConfiguration('map_yaml')
 
+    # 0) ★ 出生竞态兜底：spawn_entity 用 TRANSIENT_LOCAL 订阅 /robot_description，
+    #    而 nav_only 里只有仿真侧一个 RSP，偶发拿不到 latched 消息 → 永久卡在
+    #    "Waiting for entity xml on /robot_description"（实测连续 3 次）。
+    #    这里并行再发一份同源 URDF（内容与 RSP 一致），保证 spawn 一定能拿到。
+    urdf_pub = Node(package='stemm_cartographer_exploration_sim',
+                    executable='urdf_publisher', name='urdf_publisher', output='screen',
+                    parameters=[{'use_sim_time': use_sim_time,
+                                 'model_file': LaunchConfiguration('robot_model'),
+                                 'topic': '/robot_description',
+                                 'period': 1.0, 'count': 30}])
+
     # 1) 机器人活着（Gazebo 物理 + TF + /odom_combined），默认生成在世界原点
     sim = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(os.path.join(
@@ -146,6 +157,7 @@ def generate_launch_description():
                                'cloud_topic': '/camera/depth/points',
                                'global_frame': 'map',
                                'self_filter_radius': LaunchConfiguration('vision_self_radius'),
+                               'tf_use_stamp': LaunchConfiguration('vision_tf_stamp'),
                                'z_max': 1.80,
                                'low_z_max': 0.35,
                                'dump_path': LaunchConfiguration('vision_dump'),
@@ -200,6 +212,11 @@ def generate_launch_description():
         DeclareLaunchArgument('spawn_x', default_value='0.0'),
         DeclareLaunchArgument('spawn_y', default_value='0.0'),
         DeclareLaunchArgument('spawn_yaw', default_value='0.0'),
+        DeclareLaunchArgument('robot_model',
+                              default_value=os.path.join(
+                                  get_package_share_directory('wheeltec_two_wheel_model'),
+                                  'urdf', 'two_wheel_diff_sim.urdf.xacro'),
+                              description='nav_only 兜底发布 /robot_description 用的模型'),
         # 视觉层（与 sim_explore.launch.py 的默认值逐项对齐，便于两份测试台互相对照）
         DeclareLaunchArgument('vision', default_value='true',
                               description='false = 纯雷达基线（代价地图不含视觉层）'),
@@ -210,11 +227,14 @@ def generate_launch_description():
         DeclareLaunchArgument('vision_dump', default_value='/tmp/navonly_vision',
                               description='视觉栅格落盘前缀（留空会让 launch 报 malformed arg，踩过）'),
         DeclareLaunchArgument('vision_self_radius', default_value='0.38'),
+        DeclareLaunchArgument('vision_tf_stamp', default_value='true',
+                              description='true=按点云时间戳取 TF（修旋转鬼影）；false=旧行为'),
         DeclareLaunchArgument('vision_decay_sec', default_value='0.0'),
         DeclareLaunchArgument('vision_accum_decay_sec', default_value='120.0',
                               description='累积云衰减秒数(-1=永不衰减；120=与 round.sh 的 accum 档一致)'),
         DeclareLaunchArgument('vision_low_accum_decay_sec', default_value='0.0'),
-        sim, map_server, lifecycle_maps, amcl, lifecycle_amcl, nav2_delayed, audit, contacts, rviz,
+        urdf_pub, sim, map_server, lifecycle_maps, amcl, lifecycle_amcl, nav2_delayed, audit,
+        contacts, rviz,
         OpaqueFunction(function=_vision_setup),
         RegisterEventHandler(OnShutdown(on_shutdown=[
             ExecuteProcess(cmd=[sys.executable, VISION_PATCH, '--restore'], output='screen')])),

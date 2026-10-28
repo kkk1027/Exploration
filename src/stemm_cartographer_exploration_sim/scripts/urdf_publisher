@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""urdf_publisher —— 兜底把 URDF 发布到 /robot_description（TRANSIENT_LOCAL，周期重发）。
+
+为什么需要它
+------------
+`spawn_entity.py` 用 **TRANSIENT_LOCAL** 订阅 `/robot_description`，而
+`robot_state_publisher` 只在该 topic 上发布一次。nav_only 这条测试台里只有仿真侧
+一个 RSP：偶发（实测连续 3 次）spawn_entity 永远收不到那条 latched 消息 →
+`Waiting for entity xml on /robot_description` 卡死 → 机器人不生成 → 没有相机数据。
+（正式轮次不受影响：车端栈自己还有一个 RSP 在发同一个 topic。）
+
+本节点在 nav_only 里与 RSP 并行运行：启动时用 xacro 生成一次 URDF，然后以
+TRANSIENT_LOCAL 周期重发（默认每 1 s，共 30 次），保证 spawn_entity 一定能拿到。
+内容与 RSP 完全一致（同一份 xacro），重复发布无害。
+
+参数
+  model_file   要展开的 xacro/urdf 路径
+  topic        发布话题（默认 /robot_description）
+  period       重发周期 s（默认 1.0）
+  count        重发次数（默认 30；<=0 表示一直发）
+"""
+import os
+import subprocess
+import sys
+
+import rclpy
+from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from std_msgs.msg import String
+
+
+class UrdfPublisher(Node):
+    def __init__(self):
+        super().__init__('urdf_publisher')
+        d = self.declare_parameter
+        d('model_file', '')
+        d('topic', '/robot_description')
+        d('period', 1.0)
+        d('count', 30)
+        g = self.get_parameter
+        self.model = str(g('model_file').value)
+        self.topic = str(g('topic').value)
+        self.period = float(g('period').value)
+        self.count = int(g('count').value)
+
+        self.text = ''
+        if not self.model or not os.path.exists(self.model):
+            self.get_logger().error(f'urdf_publisher: 模型不存在 {self.model!r}，退出')
+            return
+        try:
+            r = subprocess.run(['xacro', self.model], capture_output=True, text=True,
+                               timeout=60)
+            if r.returncode == 0 and r.stdout.strip():
+                self.text = r.stdout
+            else:
+                self.get_logger().error(
+                    f'urdf_publisher: xacro 失败 rc={r.returncode}: {r.stderr[:300]}')
+                return
+        except Exception as e:                      # noqa: BLE001
+            self.get_logger().error(f'urdf_publisher: xacro 异常 {e}')
+            return
+
+        q = QoSProfile(depth=1, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                       reliability=ReliabilityPolicy.RELIABLE)
+        self.pub = self.create_publisher(String, self.topic, q)
+        self.sent = 0
+        self.create_timer(self.period, self.tick)
+        self.get_logger().info(
+            f'urdf_publisher: 就绪 {os.path.basename(self.model)} -> {self.topic} '
+            f'({len(self.text)} B, 每 {self.period}s 重发)')
+
+    def tick(self):
+        if not self.text:
+            return
+        if self.count > 0 and self.sent >= self.count:
+            return
+        msg = String()
+        msg.data = self.text
+        self.pub.publish(msg)
+        self.sent += 1
+        if self.sent == 1:
+            self.get_logger().info('urdf_publisher: 已发布 robot_description（latched）')
+
+
+def main():
+    rclpy.init()
+    n = UrdfPublisher()
+    try:
+        rclpy.spin(n)
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    except Exception:                               # noqa: BLE001
+        pass
+    finally:
+        n.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
