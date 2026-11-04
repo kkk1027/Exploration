@@ -489,7 +489,7 @@ class Arbiter(Node):
         #   controller_server.cpp:439 用 path.poses.back() 做目标校验）。
         #   默认 False（行为与现状完全一致），灰度验证后由用户切 True。
         self.veto_inplace = self._as_bool(p('veto_inplace', False).value)
-        self.inplace_radius = float(p('inplace_radius_m', 2.0).value)
+        self.inplace_radius = float(p('inplace_radius_m', 3.5).value)
         self.inplace_tries = int(p('inplace_tries', 48).value)
         # ★ inplace 专用判据：migrate 的 veto_migrate_min_move(1.0 m) 是为了"把目标挪开"，
         #   而原地纠偏要的是"最近的合格点"，两者必须解耦；宽度阈值也单列（默认 0.70 m，
@@ -1507,45 +1507,37 @@ class Arbiter(Node):
             return False
         if self.costmap is not None and self.cost_gate_reject(x, y, None, count=False):
             return False
-        field = self.clearance_field()
-        if field is None:
-            return True
-        try:
-            f = self.region_complexity(field, x, y)
-        except Exception:                                   # noqa: BLE001
-            return False
-        if not f:
-            return False
-        if f['esc_dirs'] < self.veto_min_esc:
-            return False
-        if f['occ_frac_r2'] >= self.veto_occ_max:
-            return False
+        # ★ 2026-11-04 实测修正：后置判据触发的前提就是"目标邻域拥挤"
+        #   （occ_frac_r2 ≥ 0.30 或 esc_dirs < 3），若再要求 G* 通过**同一套**
+        #   区域复杂度，几乎找不到点（实测 5 轮只纠偏 4 次）。G* 的定位是"就近的
+        #   合法临时落点"，判据只需：代价门（已在上面）+ 可达 + 净宽（外层校验）。
+        #   仍保留一条硬底线：G* 自身不能落在致命/内切格上（cost_gate_reject 已覆盖）。
         return True
 
     def _nearest_valid_point(self, gx, gy, radius):
-        """确定性搜索「离原目标最近的合格自由点 G*」：按半径由小到大、圆周采样。
+        """确定性搜索「离原目标最近的合格自由点 G*」——由内向外按半径推进。
 
-        合格 = _veto_ok（区域复杂度 + 代价门 + 离车最小位移）
-              + path_and_width 可达（BFS）+ 沿途最小净宽 >= corridor_width。
-        path_and_width 较贵，所以先用便宜的 _veto_ok 预筛，并限制总尝试次数。
+        ★ 2026-11-04 实测修正：初版按 res(0.05 m) 逐圈采样、且 `tried` 只数"过了
+        _inplace_ok 的候选"，放宽判据后**内圈候选就把 inplace_tries 预算用光**，
+        结果反而一个点都找不到（ab3 组 5 轮仅 1 次纠偏）。现改为：
+          * 半径步长 0.25 m（而不是 res），角向按弧长 ~0.35 m 采样；
+          * 预算 inplace_tries 只数**真正做了 path_and_width 的候选**；
+          * 仍由内向外，第一个合格点即返回（语义=最近）。
         """
         if self.costmap is None:
             return None
-        try:
-            res = float(self.costmap.info.resolution) or 0.05
-        except Exception:                                   # noqa: BLE001
-            res = 0.05
-        tried = 0
-        r = res
-        while r <= radius + 1e-9:
-            n = max(8, int(2.0 * math.pi * r / max(res, 0.05)))
+        tries = 0
+        r = max(0.20, float(self.inplace_min_goal))
+        r_max = max(r, float(radius))
+        while r <= r_max + 1e-9:
+            n = max(8, int(2.0 * math.pi * r / 0.35))
             for k in range(n):
                 ang = 2.0 * math.pi * k / n
                 nx, ny = gx + r * math.cos(ang), gy + r * math.sin(ang)
                 if not self._inplace_ok(nx, ny, gx, gy):
                     continue
-                tried += 1
-                if tried > max(1, self.inplace_tries):
+                tries += 1
+                if tries > max(1, self.inplace_tries):
                     return None
                 try:
                     reach, _narrow_at, min_w, _unk = self.path_and_width(nx, ny)
@@ -1553,10 +1545,11 @@ class Arbiter(Node):
                     continue
                 if not reach:
                     continue
-                if min_w is not None and min_w < self.inplace_min_width:
+                if (self.inplace_min_width > 0.0 and min_w is not None
+                        and min_w < self.inplace_min_width):
                     continue
                 return nx, ny
-            r += res
+            r += 0.25
         return None
 
     def _publish_goal_update(self, x, y, reason, gx, gy, now):
