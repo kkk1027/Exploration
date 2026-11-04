@@ -54,10 +54,11 @@ class Audit(Node):
                         durability=DurabilityPolicy.TRANSIENT_LOCAL)
         qv = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                         durability=DurabilityPolicy.VOLATILE)
+        pre = '/global_costmap' if a.costmap == 'global' else '/local_costmap'
         if Nav2Costmap is not None:
-            self.create_subscription(Nav2Costmap, '/local_costmap/costmap_raw',
+            self.create_subscription(Nav2Costmap, pre + '/costmap_raw',
                                      lambda m: setattr(self, 'raw', m), qm)
-        self.create_subscription(OccupancyGrid, '/local_costmap/costmap',
+        self.create_subscription(OccupancyGrid, pre + '/costmap',
                                  lambda m: setattr(self, 'cm', m), qm)
         self.create_subscription(OccupancyGrid, '/map', lambda m: setattr(self, 'map', m), qm)
         self.create_subscription(OccupancyGrid, '/vision/obstacle_grid',
@@ -166,8 +167,12 @@ class Audit(Node):
                                ('all_lethal', np.ones(len(L), dtype=bool))):
                 sel = L[mask]
                 pts[name] = [[round(float(x), 3), round(float(y), 3)] for x, y in sel]
-            with open(self.a.dump_cells, 'w', encoding='utf-8') as f:
-                json.dump(dict(pos=self.pos, yaw=self.yaw, cells=pts), f, ensure_ascii=False)
+            tgt = self.a.dump_cells
+            if self.a.dump_prefix:
+                tgt = f'{self.a.dump_prefix}_{tag}.json'
+            with open(tgt, 'w', encoding='utf-8') as f:
+                json.dump(dict(pos=self.pos, yaw=self.yaw, n=int(len(L)), cells=pts),
+                          f, ensure_ascii=False)
         row = dict(tag=tag, t=round(time.time(), 1), n=int(len(L)), inscribed=n_insc,
                    lidar=int(m_lid.sum()), stat=int(m_map.sum()), vgrid=int(m_vg.sum()),
                    vis_only=int(vis_only.sum()), unsupported=int(unsup.sum()),
@@ -216,6 +221,10 @@ def main():
     ap.add_argument('--cone-deg', type=float, default=35.0)
     ap.add_argument('--cone-m', type=float, default=4.5)
     ap.add_argument('--out', default='logs/lethal_audit.jsonl')
+    ap.add_argument('--costmap', choices=('local', 'global'), default='local',
+                    help='审计哪个代价地图（global 用它的 costmap_raw）')
+    ap.add_argument('--dump-prefix', default='',
+                    help='每次采样各写一个 {prefix}_{tag}.json（叠加旋转时用）')
     ap.add_argument('--dump-cells', default='',
                     help='把 vision_only / unsupported / all_lethal 的格子坐标落盘（JSON），'
                          '供 harness/classify_costmap.py 用世界真值判定真假')
