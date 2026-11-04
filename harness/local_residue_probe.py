@@ -86,7 +86,7 @@ class LocalResidue(Node):
         res = float(self.raw.metadata.resolution)
         ox = float(self.raw.metadata.origin.position.x)
         oy = float(self.raw.metadata.origin.position.y)
-        idx = np.flatnonzero(d >= 99)
+        idx = np.flatnonzero(d == 254)   # 只统计障碍本体
         if idx.size == 0:
             return 0, 0
         row = idx // w
@@ -102,11 +102,18 @@ class LocalResidue(Node):
         return int(inc.sum()), int((~inc).sum())
 
     def counts(self):
-        raw_lethal = None
+        """★ 2026-11-04 修正口径：nav2 costmap_raw 里
+             255 = NO_INFORMATION（未知）、254 = LETHAL（障碍本体）、253 = INSCRIBED（内切环）。
+           原来用 `d >= 99` 统计会把 **255 未知格**也算成 lethal，属严重口径错误
+           （实测同一时刻 254=449、253=1480、而 >=99 记到 3986）。
+           现在分开计数：lethal(254) 才是"障碍本体"。"""
+        raw_lethal = raw_inscribed = raw_unknown = None
         if self.raw is not None:
             import numpy as np
             d = np.frombuffer(bytes(self.raw.data), dtype=np.uint8)
-            raw_lethal = int((d >= 99).sum())       # 253/254/255 都在 >=99
+            raw_lethal = int((d == 254).sum())
+            raw_inscribed = int((d == 253).sum())
+            raw_unknown = int((d == 255).sum())       # 253/254/255 都在 >=99
         inf_area = all_occ = None
         if self.occ is not None:
             import numpy as np
@@ -117,19 +124,21 @@ class LocalResidue(Node):
         if self.vgrid is not None:
             import numpy as np
             vg = int((np.asarray(self.vgrid.data, dtype=np.int8) > 0).sum())
-        return raw_lethal, inf_area, all_occ, vg
+        return raw_lethal, inf_area, all_occ, vg, raw_inscribed, raw_unknown
 
     def sample(self, tag, rows, t0):
-        rl, ia, ao, vg = self.counts()
+        rl, ia, ao, vg, ri, ru = self.counts()
         cone_in, cone_out = self.cone_split()
         row = dict(tag=tag, t=round(time.time() - t0, 1), cone_in=cone_in, cone_out=cone_out,
+                   inscribed=ri, unknown=ru,
                    yaw=(round(self.yaw, 3) if self.yaw is not None else None),
                    raw_lethal=rl, inf_area=ia, all_occ=ao, vgrid=vg,
                    ratio=(round(ia / rl, 2) if (ia is not None and rl) else None))
         rows.append(row)
         print(f"[local] {tag:>12} t={row['t']:6.1f}s yaw={row['yaw']} "
               f"raw_lethal={rl} inf_area={ia} all_occ={ao} "
-              f"ratio={row['ratio']} vgrid={vg} 锥内={cone_in} 锥外={cone_out}", flush=True)
+              f"lethal254={rl} 内切253={ri} 未知255={ru} ratio={row['ratio']} vgrid={vg} "
+              f"锥内={cone_in} 锥外={cone_out}", flush=True)
         return row
 
     def rotate_by(self, dpsi, t0, rows, tag):

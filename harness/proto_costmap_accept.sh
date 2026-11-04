@@ -62,11 +62,21 @@ for _ in $(seq 1 120); do
   case "$st" in active*) break ;; esac
   sleep 2
 done
-for _ in $(seq 1 60); do
-  timeout 6 ros2 topic hz /local_costmap/costmap 2>/dev/null | grep -q 'average rate' && break
+# ★ 硬闸门：必须等 local_costmap 真正 active 且话题在发，否则整轮作废
+#   （2026-11-04 踩过：bringup 超过 120 s，探针拿不到 costmap 却照样跑完并输出 NaN）
+LC_OK=0
+for _ in $(seq 1 150); do
+  st=$(timeout 8 ros2 lifecycle get /local_costmap/local_costmap 2>/dev/null | head -1)
+  if [ "${st#active}" != "$st" ] && timeout 6 ros2 topic hz /local_costmap/costmap 2>/dev/null | grep -q 'average rate'; then
+    LC_OK=1; break
+  fi
   sleep 2
 done
-sleep 8
+if [ "$LC_OK" != "1" ]; then
+  echo "[proto] ✗ local_costmap 未就绪（state='${st:-?}'）—— 本轮作废，不产出数字"
+  exit 5
+fi
+sleep 6
 
 echo "[proto] ① 静止：视觉点 vs 雷达/静态图"
 timeout 150 python3 harness/vision_vs_truth_probe.py --samples 5 --tol 0.15 \
@@ -79,6 +89,10 @@ timeout 900 python3 harness/local_residue_probe.py --turns 3 --settle 10 --hold 
 echo "[proto] ③ 静止再测一次视觉点"
 timeout 150 python3 harness/vision_vs_truth_probe.py --samples 3 --tol 0.15 \
   --cloud-topic /vision/live_cloud --out "$OUT/vvt_after.json" 2>&1 | tee "$OUT/vvt_after.log"
+
+echo "[proto] ④ lethal 归因审计（是否真错）"
+timeout 200 python3 harness/costmap_lethal_audit.py --samples 3 --period 5 \
+  --out "$OUT/lethal_audit.jsonl" --dump-cells "$OUT/cells.json" 2>&1 | tee "$OUT/lethal_audit.log" || true
 
 echo "[proto] 汇总"
 python3 - "$OUT" <<'PY' | tee "$OUT/summary.txt"
