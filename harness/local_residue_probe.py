@@ -47,6 +47,7 @@ class LocalResidue(Node):
         self.occ = None          # /local_costmap/costmap      (OccupancyGrid，已膨胀)
         self.vgrid = None        # /vision/obstacle_grid       (交叉参考)
         self.yaw = None
+        self.pos = None
         self.create_subscription(Odometry, '/odom_combined', self.on_odom, 20)
         self.pub = self.create_publisher(Twist, a.cmd_topic, 10)
 
@@ -54,6 +55,7 @@ class LocalResidue(Node):
         q = m.pose.pose.orientation
         self.yaw = math.atan2(2 * (q.w * q.z + q.x * q.y),
                               1 - 2 * (q.y * q.y + q.z * q.z))
+        self.pos = (m.pose.pose.position.x, m.pose.pose.position.y)
 
     def setup_subs(self):
         q = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
@@ -72,6 +74,32 @@ class LocalResidue(Node):
 
     def on_grid_v(self, m):
         self.vgrid = m
+
+    def cone_split(self):
+        """把 raw（master）里 >=99 的格按"机器人前方视野锥内/外"分开计数。
+        用户真正痛的是"车前方/周围被虚假 lethal 压窄"，而不是整窗总数。"""
+        import numpy as np
+        if self.raw is None or self.pos is None or self.yaw is None:
+            return None, None
+        d = np.frombuffer(bytes(self.raw.data), dtype=np.uint8)
+        w, h = int(self.raw.metadata.size_x), int(self.raw.metadata.size_y)
+        res = float(self.raw.metadata.resolution)
+        ox = float(self.raw.metadata.origin.position.x)
+        oy = float(self.raw.metadata.origin.position.y)
+        idx = np.flatnonzero(d >= 99)
+        if idx.size == 0:
+            return 0, 0
+        row = idx // w
+        col = idx % w
+        x = ox + (col + 0.5) * res
+        y = oy + (row + 0.5) * res
+        dx = x - self.pos[0]
+        dy = y - self.pos[1]
+        r = np.hypot(dx, dy)
+        br = np.arctan2(dy, dx) - self.yaw
+        br = (br + np.pi) % (2 * np.pi) - np.pi
+        inc = (np.abs(br) <= math.radians(self.a.cone_deg)) & (r <= self.a.cone_m) & (r >= 0.35)
+        return int(inc.sum()), int((~inc).sum())
 
     def counts(self):
         raw_lethal = None
@@ -93,14 +121,15 @@ class LocalResidue(Node):
 
     def sample(self, tag, rows, t0):
         rl, ia, ao, vg = self.counts()
-        row = dict(tag=tag, t=round(time.time() - t0, 1),
+        cone_in, cone_out = self.cone_split()
+        row = dict(tag=tag, t=round(time.time() - t0, 1), cone_in=cone_in, cone_out=cone_out,
                    yaw=(round(self.yaw, 3) if self.yaw is not None else None),
                    raw_lethal=rl, inf_area=ia, all_occ=ao, vgrid=vg,
                    ratio=(round(ia / rl, 2) if (ia is not None and rl) else None))
         rows.append(row)
         print(f"[local] {tag:>12} t={row['t']:6.1f}s yaw={row['yaw']} "
               f"raw_lethal={rl} inf_area={ia} all_occ={ao} "
-              f"ratio={row['ratio']} vgrid={vg}", flush=True)
+              f"ratio={row['ratio']} vgrid={vg} 锥内={cone_in} 锥外={cone_out}", flush=True)
         return row
 
     def rotate_by(self, dpsi, t0, rows, tag):
@@ -183,6 +212,10 @@ def main():
     ap.add_argument('--base-n', type=int, default=3)
     ap.add_argument('--wait', type=float, default=120.0)
     ap.add_argument('--cmd-topic', default='/cmd_vel_nav')
+    ap.add_argument('--cone-deg', type=float, default=35.0,
+                    help='前方视野锥半角(度)，用于把 lethal 分解成锥内/锥外')
+    ap.add_argument('--cone-m', type=float, default=4.5,
+                    help='视野锥最大距离(m)')
     ap.add_argument('--out', default='logs/local_residue.jsonl')
     a = ap.parse_args()
     rclpy.init()

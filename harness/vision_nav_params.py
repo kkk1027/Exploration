@@ -27,6 +27,31 @@ import sys
 import yaml
 
 TAG_L, TAG_G = 'vision_voxel_layer', 'vision_obstacle_layer'
+# ★ 2026-10-28 方案A：局部视觉层追加一条"只清不标"的自由射线源（默认关，--free-rays 打开）
+FREE_RAYS = False
+FREE_BLOCK = '''
+          vision_free:
+            topic: /vision/free_rays
+            data_type: "PointCloud2"
+            marking: False
+            clearing: True
+            min_obstacle_height: -0.50
+            max_obstacle_height: 2.00
+            obstacle_max_range: 0.0
+            raytrace_max_range: 5.00
+            raytrace_min_range: 0.00'''
+
+
+def local_block():
+    """局部视觉层块；FREE_RAYS 时在 observation_sources 里追加 vision_free 并补其配置。"""
+    if not FREE_RAYS:
+        return BLOCK_L
+    # nav2 的 observation_sources 用**空格**分隔；写逗号会让它把 "vision_cloud," 当源名
+    # （实测报 Invalid topic name 并让 local_costmap configure 失败）
+    b = BLOCK_L.replace('observation_sources: vision_cloud',
+                        'observation_sources: vision_cloud vision_free')
+    end = SENT % 'end(local)'
+    return b.replace(end, FREE_BLOCK.strip('\n') + '\n' + end)
 SENT = '# ---- vision_fusion_patch:%s ----'
 
 BLOCK_L = f'''{SENT % "begin(local)"}
@@ -172,7 +197,7 @@ def sections():
     g = {'live': BLOCK_G, 'accum': BLOCK_G_ACCUM,
          'lowaccum': BLOCK_G_LOWACCUM,
          'livemark': BLOCK_G_LIVEMARK}.get(MODE, BLOCK_G)
-    return [('local_costmap', TAG_L, BLOCK_L), ('global_costmap', TAG_G, g)]
+    return [('local_costmap', TAG_L, local_block()), ('global_costmap', TAG_G, g)]
 
 
 SECTIONS = [('local_costmap', TAG_L, BLOCK_L), ('global_costmap', TAG_G, BLOCK_G)]
@@ -348,9 +373,13 @@ def main():
                          'accum=全带累积云+不清除（P9-⑧，覆盖退化）；'
                          'lowaccum=仅低矮带累积（P9-⑧b）；'
                          'livemark=实时云+不清除（P9-⑨，隔离 raytrace 擦除）')
+    ap.add_argument('--free-rays', action='store_true',
+                    help='方案A：局部视觉层追加一条 marking=False/clearing=True 的自由射线源'
+                         '（订阅 /vision/free_rays，raytrace 5 m）')
     a = ap.parse_args()
-    global MODE
+    global MODE, FREE_RAYS
     MODE = a.global_mode
+    FREE_RAYS = a.free_rays
     path = target_path()
     text = open(path, encoding='utf-8').read()
     lines = text.split('\n')

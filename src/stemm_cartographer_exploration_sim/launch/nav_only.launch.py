@@ -167,6 +167,9 @@ def generate_launch_description():
                                'tf_use_stamp': LaunchConfiguration('vision_tf_stamp'),
                                'tf_debug': LaunchConfiguration('vision_tf_debug'),
                                'omega_gate': LaunchConfiguration('vision_omega_gate'),
+                               'stamp_from_cloud': LaunchConfiguration('vision_stamp_from_cloud'),
+                               'open_kernel': LaunchConfiguration('vision_open_kernel'),
+                               'free_rays': LaunchConfiguration('vision_free_rays'),
                                'z_max': 1.80,
                                'low_z_max': 0.35,
                                'dump_path': LaunchConfiguration('vision_dump'),
@@ -185,7 +188,11 @@ def generate_launch_description():
             print('[nav_only] ⚠ vision:=false —— 视觉层**未**接入代价地图，'
                   '本轮只有雷达静态基线，低矮障碍必然被当成可通行。', flush=True)
             return []
-        r = subprocess.run([sys.executable, VISION_PATCH, '--apply', '--global-mode', mode],
+        free_rays = LaunchConfiguration('vision_free_rays').perform(context).lower() in ('1', 'true', 'yes')
+        _args = [sys.executable, VISION_PATCH, '--apply', '--global-mode', mode]
+        if free_rays:
+            _args.append('--free-rays')
+        r = subprocess.run(_args,
                            capture_output=True, text=True)
         print(r.stdout.strip(), flush=True)
         if r.returncode != 0:
@@ -253,6 +260,15 @@ def generate_launch_description():
                               description='true=按点云时间戳取 TF（修旋转鬼影）；false=旧行为'),
         DeclareLaunchArgument('vision_tf_debug', default_value='false',
                               description='true=TF 取不到时打印本节点 buffer 已知帧表（取证用）'),
+        DeclareLaunchArgument('vision_stamp_from_cloud', default_value='true',
+                              description='C1：云的时间戳取点云采集时刻（true，修位姿滞后）；'
+                                          'false=旧的发布时刻'),
+        DeclareLaunchArgument('vision_free_rays', default_value='0',
+                              description='方案A：1=发布 /vision/free_rays 并在局部视觉层加一条'
+                                          ' marking=False/clearing=True 的清除源'),
+        DeclareLaunchArgument('vision_open_kernel', default_value='0',
+                              description='C2：累积云发布前 3x3 开运算（0=关，1=开）；'
+                                          '只影响累积云，不动 live 云'),
         DeclareLaunchArgument('vision_omega_gate', default_value='0.0',
                               description='改动1：|ω| 超过该值(rad/s)时只发 live 云、不写累积层；'
                                           '0=关闭（旧行为）'),

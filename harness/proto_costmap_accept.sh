@@ -48,12 +48,12 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "[proto] 起栈（原始口径）→ $OUT/launch.log"
+echo "[proto] 起栈（EXTRA_ARGS=${EXTRA_ARGS:-<无>}）→ $OUT/launch.log"
 setsid ros2 launch stemm_cartographer_exploration_sim nav_only.launch.py \
   map_yaml:=/home/kbf/stemm_sim_ws/maps/explore_latest.yaml \
   spawn_x:=0.0 spawn_y:=0.0 spawn_yaw:=0.0 \
   vision:=true vision_mode:=accum vision_tf_stamp:=true \
-  gui:=false rviz:=false \
+  gui:=false rviz:=false ${EXTRA_ARGS:-} \
   contact_log:="$OUT/contacts.jsonl" > "$OUT/launch.log" 2>&1 &
 LPID=$!
 
@@ -102,7 +102,17 @@ s = dict(
     settle_raw_lethal=h,
     settle_return_pct=(round((h - b) / b * 100, 1) if (b and h) else None),
     ratio_median=(round(st.median(ratios), 3) if ratios else None),
+    vgrid_peak=(max([r.get('vgrid') or 0 for r in rows]) or None),
 )
+cone_base = [r['cone_in'] for r in rows if r['tag'].startswith('base') and r.get('cone_in') is not None]
+cone_hold = [r['cone_in'] for r in rows if r['tag'].startswith('hold') and r.get('cone_in') is not None]
+cb = st.median(cone_base) if cone_base else None
+ch = st.median(cone_hold) if cone_hold else None
+s['cone_in_base'] = cb
+s['cone_in_settle'] = ch
+s['cone_in_return_pct'] = (round((ch - cb) / cb * 100, 1) if (cb and ch) else None)
+# 局部层的视觉专属贡献（与"无视觉"对照比）：vgrid 是全局累积栅格，供 C2 对照
+
 for key in ('vvt_before', 'vvt_after'):
     v = load(key + '.json')
     fr = [x['frac_near_lidar'] for x in v if isinstance(x.get('frac_near_lidar'), float)]
@@ -129,6 +139,9 @@ show('delta_peak', '判据≤+800')
 show('settle_raw_lethal', '停稳后中位')
 show('settle_return_pct', '判据回落到基线±10%')
 show('ratio_median', '判据 0.6±0.1（膨胀/障碍）')
+show('cone_in_base', '前方视野锥内 lethal（静止基线）')
+show('cone_in_settle', '前方视野锥内 lethal（停稳后）')
+show('cone_in_return_pct', '★锥内回落（用户真正的痛点指标）')
 show('vvt_before_near_lidar', '判据≥0.80（视觉点贴雷达）')
 show('vvt_after_near_lidar', '同上（旋转后）')
 show('vvt_before_near_map', '视觉点贴静态图')

@@ -121,6 +121,25 @@ class VisionObstacleGrid(Node):
         #   于是转动时看到的格一旦离开视野就永久残留（实测 raw_lethal 2250→5453 单调不减）。
         #   这里维护一份"短记忆"（默认 TTL 秒），只保留最近 TTL 内观测到的格，
         #   再转回机身帧发布 —— 不再被观测的格会自动退场，绕开上面的语义。
+        # ★ 2026-10-28 C1：云的时间戳是否"取点云采集时刻"。
+        #   旧行为用 self.get_clock().now()（发布时刻），而点云是 0~0.2 s 前采集的；
+        #   nav2 按 stamp 取 TF ⇒ 等于"用发布时刻的位姿去贴 0.2 s 前的点"。
+        #   转动 1.2 rad/s 时角误差可达 0.24 rad、3 m 处错位 0.7 m（厚包络/长舌头的成因）。
+        # ★ 2026-10-28 方案A：自由射线云 /vision/free_rays（默认关）。
+        #   按相机 FOV 每 step 度一条射线，长度取该角度**最近回波**（无则 free_ray_max），
+        #   由局部代价地图的一条 marking=False/clearing=True 源做 raytrace 清障。
+        #   这样"以前转过、现在又被看到"的方向会被真正清掉，而不是永久残留。
+        d('free_rays', 0)                  # 1=启用
+        d('free_ray_topic', '/vision/free_rays')
+        d('free_ray_fov_deg', 60.0)        # 相机水平视场（保守值，宁窄不宽）
+        d('free_ray_step_deg', 1.0)
+        d('free_ray_max', 5.0)             # 射线最长（= 视觉有效距离）
+        d('free_ray_margin', 0.10)         # 末端留 10 cm，绝不穿过实体
+        d('free_ray_hz', 5.0)
+        d('stamp_from_cloud', True)
+        # ★ 2026-10-28 C2：累积层发布前做形态学开运算的核（0=关；1=3×3 十字核）。
+        #   只作用于**累积**云/栅格，live 云不受影响（局部实时感知不被削）。
+        d('open_kernel', 0)
         d('live_ttl_sec', 0.0)          # 0=关闭（旧行为，只发 /vision/live_cloud）
         d('ttl_topic', '/vision/live_ttl_cloud')
         d('ttl_min_pts', 1)             # 单帧内至少几个点才算该格（比累积层的 min_points 松）
@@ -162,6 +181,14 @@ class VisionObstacleGrid(Node):
         self.dilate = max(0, int(g('dilate_cells').value))
         self.decay = float(g('decay_sec').value)
         self.omega_gate = max(0.0, float(g('omega_gate').value))
+        self.free_rays = int(g('free_rays').value) == 1
+        self.free_fov = float(g('free_ray_fov_deg').value)
+        self.free_step = max(0.2, float(g('free_ray_step_deg').value))
+        self.free_max = float(g('free_ray_max').value)
+        self.free_margin = float(g('free_ray_margin').value)
+        self.stamp_from_cloud = bool(g('stamp_from_cloud').value)
+        self.open_kernel = max(0, int(g('open_kernel').value))
+        self._cloud_stamp = None      # 最近一帧点云的采集时刻
         self.live_ttl = max(0.0, float(g('live_ttl_sec').value))
         self.ttl_min_pts = max(1, int(g('ttl_min_pts').value))
         self.ttl_cells = {}      # 格 -> 最后一次观测（monotonic）
@@ -210,11 +237,19 @@ class VisionObstacleGrid(Node):
         self.pub_grid = self.create_publisher(OccupancyGrid, g('grid_topic').value, qos_map)
         self.pub_ttl = (self.create_publisher(PointCloud2, g('ttl_topic').value, qos_vis)
                         if self.live_ttl > 0.0 else None)
+        self.pub_free = (self.create_publisher(PointCloud2, g('free_ray_topic').value, qos_vis)
+                         if self.free_rays else None)
 
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
 
         self.create_timer(1.0 / max(0.2, float(g('live_hz').value)), self.publish_live)
+        if self.pub_free is not None:
+            self.create_timer(1.0 / max(0.2, float(g('free_ray_hz').value)), self.publish_free_rays)
+            self.get_logger().info(
+                f'自由射线云已启用：FOV={self.free_fov:.0f}° step={self.free_step:.1f}° '
+                f'max={self.free_max:.1f}m -> {g("free_ray_topic").value}'
+                f'（供局部代价地图 clearing 源做 raytrace 清障）')
         if self.pub_ttl is not None:
             self.create_timer(1.0 / max(0.2, float(g('live_hz').value)), self.publish_ttl)
             self.get_logger().info(
@@ -229,11 +264,40 @@ class VisionObstacleGrid(Node):
             f'range=[{self.range_min},{self.range_max}] self_r={self.self_r})')
 
     # ---------------- 输入 ----------------
+    def _pub_stamp(self):
+        """发布云用的时间戳：优先用点云采集时刻（C1），拿不到才回退 now()。"""
+        if self.stamp_from_cloud and self._cloud_stamp is not None:
+            st = self._cloud_stamp
+            if st.sec or st.nanosec:
+                return st
+            self.stats['stamp_fallback'] = self.stats.get('stamp_fallback', 0) + 1
+        return self.get_clock().now().to_msg()
+
+    @staticmethod
+    def _opening(cells_arr):
+        """对格集合做 3×3 十字核开运算：去掉孤立 1 格与 1 格宽的细长结构。"""
+        if cells_arr.size == 0:
+            return cells_arr
+        minx, miny = int(cells_arr[:, 0].min()), int(cells_arr[:, 1].min())
+        maxx, maxy = int(cells_arr[:, 0].max()), int(cells_arr[:, 1].max())
+        w, h = maxx - minx + 1, maxy - miny + 1
+        img = np.zeros((h + 2, w + 2), dtype=bool)        # 补 1 格边，避免边界被腐蚀
+        img[cells_arr[:, 1] - miny + 1, cells_arr[:, 0] - minx + 1] = True
+        er = img.copy()
+        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            er &= np.roll(np.roll(img, dy, 0), dx, 1)
+        di = er.copy()
+        for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+            di |= np.roll(np.roll(er, dy, 0), dx, 1)
+        ys, xs = np.nonzero(di)
+        return np.stack([xs - 1 + minx, ys - 1 + miny], axis=1).astype(np.int64)
+
     def on_odom(self, msg):
         self.omega = msg.twist.twist.angular.z
 
     def on_cloud(self, msg):
         self.stats['frames'] += 1
+        self._cloud_stamp = msg.header.stamp      # C1：记住采集时刻
         names = {f.name: f.offset for f in msg.fields}
         if not all(k in names for k in ('x', 'y', 'z')):
             self.stats['bad'] += 1
@@ -356,6 +420,7 @@ class VisionObstacleGrid(Node):
         self.stats['last_kept'] = int(keep.sum())
         self.last_live = Pw[keep]
         self.last_live_body = (Pl[keep] if (tr_live is not None) else Pw[keep])
+        self._live_body_ok = tr_live is not None      # 只有真机身帧才算射线
 
         # 体素抽稀：同一 5 cm 体素只保留一个点，喂 local_costmap 体素层时省 TF/CPU
         if self.last_live.shape[0]:
@@ -466,14 +531,45 @@ class VisionObstacleGrid(Node):
         # ★ 2026-10-28 修：原来写成 (p_map - t) @ R（等于转置），云被转错方位 →
         #   局部代价地图满屏 lethal（实测 raw_lethal 2249→13131）。必须用 R @ p + t。
         p_body = p_map @ R.T + np.array([t.x, t.y, t.z])
-        stamp = self.get_clock().now().to_msg()
+        stamp = self._pub_stamp()
         self.pub_ttl.publish(cloud_msg(p_body, self.live_frame, stamp))
         self.stats['pub_ttl'] = self.stats.get('pub_ttl', 0) + 1
+
+    def publish_free_rays(self):
+        """按相机 FOV 发"自由射线端点"云（机身帧），长度 = 该角度最近回波 − margin。
+        多个 z 层各发一遍：VoxelLayer 的 raytrace 会按体素列清，单层会漏掉高层标记。"""
+        if not getattr(self, '_live_body_ok', False) or self.last_live_body.shape[0] == 0:
+            return
+        b = self.last_live_body
+        r = np.hypot(b[:, 0], b[:, 1])
+        a = np.arctan2(b[:, 1], b[:, 0])
+        half = np.radians(self.free_fov) / 2.0
+        step = np.radians(self.free_step)
+        angs = np.arange(-half, half + 1e-9, step)
+        if angs.size == 0:
+            return
+        ranges = np.full(angs.size, self.free_max)
+        ok = (r >= self.range_min) & (r <= self.free_max)
+        if ok.any():
+            idx = np.round((a[ok] + half) / step).astype(int)
+            good = (idx >= 0) & (idx < angs.size)
+            if good.any():
+                np.minimum.at(ranges, idx[good], r[ok][good])
+        ranges = np.maximum(self.range_min, ranges - self.free_margin)
+        zs = (0.10, 0.25, 0.45, 0.65, 0.79)
+        pts = np.zeros((angs.size * len(zs), 3), dtype=np.float32)
+        k = 0
+        for z in zs:
+            for i in range(angs.size):
+                pts[k] = (ranges[i] * np.cos(angs[i]), ranges[i] * np.sin(angs[i]), z)
+                k += 1
+        self.pub_free.publish(cloud_msg(pts, self.live_frame, self._pub_stamp()))
+        self.stats['pub_free'] = self.stats.get('pub_free', 0) + 1
 
     def publish_live(self):
         if self.last_live.shape[0] == 0:
             return
-        stamp = self.get_clock().now().to_msg()
+        stamp = self._pub_stamp()
         src = self.last_vox if self.last_vox.shape[0] else self.last_live
         self.pub_live.publish(cloud_msg(src, self.live_frame or self.global_frame, stamp))
         if self.last_low.shape[0]:
@@ -498,6 +594,10 @@ class VisionObstacleGrid(Node):
         stamp = self.get_clock().now().to_msg()
         arr = np.fromiter((v for c in self.cells for v in c), dtype=np.int64,
                           count=2 * len(self.cells)).reshape(-1, 2)
+        if self.open_kernel > 0 and arr.size:
+            before = arr.shape[0]
+            arr = self._opening(arr)
+            self.stats['opened_removed'] = self.stats.get('opened_removed', 0) + (before - arr.shape[0])
         if self.dilate > 0 and arr.size:
             # 4/8 邻域膨胀：让"视觉看到的表面"向外长 dilate 格，吃掉擦边接触
             offs = []
