@@ -478,7 +478,7 @@ def generate_launch_description():
         DeclareLaunchArgument('veto_inplace', default_value='false',
                               description='P12：后置判据命中时原地改目标（nav2 GoalUpdater 的 '
                                           '/goal_update），**不取消**当前 NavigateToPose 动作'),
-        DeclareLaunchArgument('inplace_radius_m', default_value='2.0'),
+        DeclareLaunchArgument('inplace_radius_m', default_value='3.5'),
         DeclareLaunchArgument('inplace_tries', default_value='48'),
         DeclareLaunchArgument('inplace_min_width_m', default_value='0.70'),
         DeclareLaunchArgument('inplace_min_robot_m', default_value='0.50'),
