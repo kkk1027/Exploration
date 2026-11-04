@@ -167,8 +167,6 @@ def generate_launch_description():
                                'tf_use_stamp': LaunchConfiguration('vision_tf_stamp'),
                                'tf_debug': LaunchConfiguration('vision_tf_debug'),
                                'omega_gate': LaunchConfiguration('vision_omega_gate'),
-                               'live_ttl_sec': LaunchConfiguration('vision_live_ttl_sec'),
-                               'ttl_topic': '/vision/live_ttl_cloud',
                                'z_max': 1.80,
                                'low_z_max': 0.35,
                                'dump_path': LaunchConfiguration('vision_dump'),
@@ -187,10 +185,7 @@ def generate_launch_description():
             print('[nav_only] ⚠ vision:=false —— 视觉层**未**接入代价地图，'
                   '本轮只有雷达静态基线，低矮障碍必然被当成可通行。', flush=True)
             return []
-        local_src = LaunchConfiguration('vision_local_src').perform(context)
-        local_rt = LaunchConfiguration('vision_local_raytrace').perform(context)
-        r = subprocess.run([sys.executable, VISION_PATCH, '--apply', '--global-mode', mode,
-                            '--local-src', local_src, '--local-raytrace', local_rt],
+        r = subprocess.run([sys.executable, VISION_PATCH, '--apply', '--global-mode', mode],
                            capture_output=True, text=True)
         print(r.stdout.strip(), flush=True)
         if r.returncode != 0:
@@ -200,17 +195,13 @@ def generate_launch_description():
             d = yaml.safe_load(open(params_file, encoding='utf-8'))
         except Exception as e:                                  # noqa: BLE001
             raise RuntimeError(f'[nav_only] 参数文件解析失败：{e}') from e
-        # local-src=none 时局部**故意**没有视觉图层，别把它当成注入失败
-        want = [('global_costmap', 'vision_obstacle_layer')]
-        if local_src != 'none':
-            want.insert(0, ('local_costmap', 'vision_voxel_layer'))
-        for node_name, tag in want:
+        for node_name, tag in (('local_costmap', 'vision_voxel_layer'),
+                               ('global_costmap', 'vision_obstacle_layer')):
             got = d[node_name][node_name]['ros__parameters'].get('plugins') or []
             if tag not in got:
                 raise RuntimeError(f'[nav_only] {node_name}.plugins 缺 {tag}：{got}')
             print(f'[nav_only] ✓ {node_name}.plugins = {got}', flush=True)
-        print(f'[nav_only] ✓ 视觉层已接入（global-mode={mode}, local-src={local_src}, '
-              f'local-raytrace={local_rt}），'
+        print(f'[nav_only] ✓ 视觉层已接入（global-mode={mode}），'
               f'视觉节点订阅 /camera/depth/points', flush=True)
         return [vision]
 
@@ -262,15 +253,6 @@ def generate_launch_description():
                               description='true=按点云时间戳取 TF（修旋转鬼影）；false=旧行为'),
         DeclareLaunchArgument('vision_tf_debug', default_value='false',
                               description='true=TF 取不到时打印本节点 buffer 已知帧表（取证用）'),
-        DeclareLaunchArgument('vision_live_ttl_sec', default_value='0.0',
-                              description='改动3a：短 TTL 云窗口(秒)；0=关闭。'
-                                          '>0 时额外发布 /vision/live_ttl_cloud，'
-                                          '不再被观测的格会自动退场'),
-        DeclareLaunchArgument('vision_local_src', default_value='live',
-                              description='局部视觉层源：live=/vision/live_cloud（旧行为）；'
-                                          'ttl=/vision/live_ttl_cloud'),
-        DeclareLaunchArgument('vision_local_raytrace', default_value='3.5',
-                              description='局部视觉层 raytrace_max_range(m)'),
         DeclareLaunchArgument('vision_omega_gate', default_value='0.0',
                               description='改动1：|ω| 超过该值(rad/s)时只发 live 云、不写累积层；'
                                           '0=关闭（旧行为）'),
