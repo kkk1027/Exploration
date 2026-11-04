@@ -28,24 +28,51 @@ QUIET=0
 say() { [ "$QUIET" = "1" ] || echo "$@"; }
 
 NPROC=$(nproc)
+# ★★ 2026-10-28 域隔离（P0 误伤修复）：本机还有**域 0 的真车栈**在跑，
+# 之前把它们算进"ROS 遗孤/悬挂映射"，并删掉它们映射的 /dev/shm 段。
+# 这里所有判定只看仿真域（ROS_DOMAIN_ID=42），删 shm 也要求"全局零 ROS 进程"。
+SIM_DOMAIN_EXPECT="${SIM_DOMAIN_EXPECT:-42}"
+is_ours() { tr '\0' '\n' < "/proc/$1/environ" 2>/dev/null | grep -qx "ROS_DOMAIN_ID=${SIM_DOMAIN_EXPECT}"; }
+count_ours() {   # count_ours <pgrep 模式...>  → 只数本域
+  local n=0 p
+  for p in $(pgrep -f "$1" 2>/dev/null); do is_ours "$p" && n=$((n+1)); done
+  echo "$n"
+}
 FAIL=0
 WHY=()
 
 # 悬空段持有者计数：某进程 maps 里含 "fastrtps...(deleted)" ⇒ 它的 DDS 段被删掉了
-dangling_holders() {
-  local n=0
+dangling_holders() {   # 只数**本仿真域**里映射着已删段的进程
+  local n=0 pid
   for p in /proc/[0-9]*/maps; do
-    grep -q 'fastrtps.*(deleted)' "$p" 2>/dev/null && n=$((n + 1))
+    grep -q 'fastrtps.*(deleted)' "$p" 2>/dev/null || continue
+    pid=$(basename "$(dirname "$p")")
+    is_ours "$pid" && n=$((n + 1))
+  done
+  echo "$n"
+}
+other_domain_ros() {   # 其它域（含域0真车）的 ROS 进程数
+  local n=0 pid
+  for pid in $(pgrep -f '/opt/ros/humble|ros2 launch' 2>/dev/null); do
+    [ "$pid" = "$$" ] && continue
+    is_ours "$pid" || n=$((n + 1))
   done
   echo "$n"
 }
 # 只在"零持有者"时清无主残留段（顺序错了就是在删活人的内存）
 clean_orphan_shm() {
-  local hold n
+  local hold n others
   hold=$(dangling_holders)
   if [ "$hold" -gt 0 ]; then
     echo "dangling=$hold"
     return 1
+  fi
+  others=$(other_domain_ros)
+  if [ "${others:-0}" -gt 0 ]; then
+    # 别的域在跑 ⇒ 它们也可能映射 /dev/shm/fastrtps_*，删了就是误伤（已踩过）
+    n=$(ls /dev/shm 2>/dev/null | grep -cE '^fastrtps_|^sem\.fastrtps' || true)
+    echo "skip(other-domain=${others},shm=${n:-0})"
+    return 0
   fi
   n=$(ls /dev/shm 2>/dev/null | grep -cE '^fastrtps_|^sem\.fastrtps' || true)
   if [ "${n:-0}" -gt 0 ]; then
@@ -70,7 +97,10 @@ fi
 GZ=$(pgrep -cx gzserver 2>/dev/null || true); GZ=${GZ:-0}
 [ "$GZ" -gt 0 ] && { FAIL=1; WHY+=("gzserver=$GZ（>0：上一轮仿真没死透，会抢 Gazebo master）"); }
 
-ROS=$(ps -eo cmd | grep -E 'opt/ros/humble|stemm_(sim|explore|exploration)_ws/install' | grep -vc grep || true)
+ROS=0
+for pid in $(pgrep -f 'stemm_(sim|explore|exploration)_ws/install|/opt/ros/humble/lib/nav2_|ros2 launch stemm' 2>/dev/null); do
+  is_ours "$pid" && ROS=$((ROS + 1))
+done
 [ "${ROS:-0}" -gt 0 ] && { FAIL=1; WHY+=("ROS 进程=$ROS（>0：上一轮 launch 的遗孤）"); }
 
 HOLD=$(dangling_holders)

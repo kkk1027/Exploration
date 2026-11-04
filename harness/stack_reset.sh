@@ -20,6 +20,19 @@ set -u
 cd /home/kbf/stemm_exploration_sim_ws || exit 9
 PIDFILES=("$@")
 
+# ★★ 2026-10-28 域隔离：只处理仿真域（42），绝不动域 0 的真车栈；删 shm 也要
+#    求"全局没有别的域在跑"，否则跳过（之前删过真车正在映射的段，属误伤）。
+SIM_DOMAIN_EXPECT="${SIM_DOMAIN_EXPECT:-42}"
+is_ours() { tr '\0' '\n' < "/proc/$1/environ" 2>/dev/null | grep -qx "ROS_DOMAIN_ID=${SIM_DOMAIN_EXPECT}"; }
+other_domain_ros() {
+  local n=0 pid
+  for pid in $(pgrep -f '/opt/ros/humble|ros2 launch' 2>/dev/null); do
+    [ "$pid" = "$$" ] && continue
+    is_ours "$pid" || n=$((n + 1))
+  done
+  echo "$n"
+}
+
 echo "[reset] ① 收掉脱离生命周期的实验脚本（pidfile → 整个进程组）"
 for f in "${PIDFILES[@]:-}"; do
   [ -n "${f:-}" ] && [ -f "$f" ] || continue
@@ -38,7 +51,10 @@ bash harness/stack_kill.sh kill 2>&1 | tail -2
 
 echo "[reset] ③ 收掉 stack_kill 覆盖不到的零散节点（按 PID，不用宽 pkill）"
 PATTERNS='ros2 topic (hz|echo)|ros2 param |ros2 node |ros2 service |gazebo_ros/spawn_entity|ros2 daemon'
-STRAY=$(ps -eo pid,cmd | grep -E "$PATTERNS" | grep -v grep | awk '{print $1}' | grep -vw "$$" | grep -vw "$PPID")
+STRAY=""
+for pid in $(ps -eo pid,cmd | grep -E "$PATTERNS" | grep -v grep | awk '{print $1}' | grep -vw "$$" | grep -vw "$PPID"); do
+  is_ours "$pid" && STRAY="$STRAY $pid"
+done
 if [ -n "$STRAY" ]; then
   echo "[reset]   零散进程 $(echo "$STRAY" | wc -w) 个"
   for p in $STRAY; do kill -9 "$p" 2>/dev/null; done
@@ -61,12 +77,21 @@ sleep 1
 
 echo "[reset] ⑥ 断言零参与者之后才清 fastrtps 段（顺序错了就是在删活人的内存）"
 HOLD=0
-for p in /proc/[0-9]*/maps; do grep -q 'fastrtps.*(deleted)' "$p" 2>/dev/null && HOLD=$((HOLD + 1)); done
+for p in /proc/[0-9]*/maps; do
+  grep -q 'fastrtps.*(deleted)' "$p" 2>/dev/null || continue
+  is_ours "$(basename "$(dirname "$p")")" && HOLD=$((HOLD + 1))
+done
 if [ "$HOLD" -gt 0 ]; then
   echo "[reset] ✗ 仍有 $HOLD 个进程映射着已删的 fastrtps 段——先杀进程，不要删 shm"
   exit 1
 fi
-rm -f /dev/shm/fastrtps_* /dev/shm/sem.fastrtps_* 2>/dev/null
+OTHERS=$(other_domain_ros)
+if [ "${OTHERS:-0}" -gt 0 ]; then
+  echo "[reset] ⚠ 检测到其它 ROS 域有 ${OTHERS} 个进程（域 0 真车栈），**跳过** 删除 /dev/shm"
+  echo "[reset]   （删了会破坏它们的 DDS 段 —— 2026-10-28 已因此误伤过一次）"
+else
+  rm -f /dev/shm/fastrtps_* /dev/shm/sem.fastrtps_* 2>/dev/null
+fi
 rm -f /tmp/stemm_round.lock 2>/dev/null
 
 echo "[reset] ⑦ 还原注入的参数/补丁（可回退纪律）"
