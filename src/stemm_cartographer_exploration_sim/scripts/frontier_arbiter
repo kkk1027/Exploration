@@ -490,7 +490,13 @@ class Arbiter(Node):
         #   默认 False（行为与现状完全一致），灰度验证后由用户切 True。
         self.veto_inplace = self._as_bool(p('veto_inplace', False).value)
         self.inplace_radius = float(p('inplace_radius_m', 2.0).value)
-        self.inplace_tries = int(p('inplace_tries', 24).value)
+        self.inplace_tries = int(p('inplace_tries', 48).value)
+        # ★ inplace 专用判据：migrate 的 veto_migrate_min_move(1.0 m) 是为了"把目标挪开"，
+        #   而原地纠偏要的是"最近的合格点"，两者必须解耦；宽度阈值也单列（默认 0.70 m，
+        #   比 corridor_width 1.05 松，因为纠偏点是"临时落点"而不是"候选前沿"）。
+        self.inplace_min_width = float(p('inplace_min_width_m', 0.70).value)
+        self.inplace_min_robot = float(p('inplace_min_robot_m', 0.50).value)
+        self.inplace_min_goal = float(p('inplace_min_goal_m', 0.20).value)
         self.inplace_max = int(p('inplace_max', 3).value)
         self.inplace_cooldown = float(p('inplace_cooldown_sec', 3.0).value)
         self.inplace_min_disp = float(p('inplace_min_disp_m', 0.30).value)
@@ -1485,6 +1491,37 @@ class Arbiter(Node):
                 best = (d, nx, ny)
         return (best[1], best[2]) if best else None
 
+    def _inplace_ok(self, x, y, gx, gy):
+        """inplace 专用合格判据（与 migrate 解耦）。
+
+        * 离车不小于 inplace_min_robot（默认 0.5 m）——太近的点控制器没法收敛
+        * 与原目标不小于 inplace_min_goal（默认 0.2 m）——否则等于没改
+        * 落点代价门（cost_gate_reject：致命/内切/盘内占据）
+        * 区域复杂度（region_complexity：逃逸方向与 2 m 邻域占用率）仍必须过关
+        """
+        if self.pose is None:
+            return False
+        if math.hypot(x - self.pose[0], y - self.pose[1]) < self.inplace_min_robot:
+            return False
+        if math.hypot(x - gx, y - gy) < self.inplace_min_goal:
+            return False
+        if self.costmap is not None and self.cost_gate_reject(x, y, None, count=False):
+            return False
+        field = self.clearance_field()
+        if field is None:
+            return True
+        try:
+            f = self.region_complexity(field, x, y)
+        except Exception:                                   # noqa: BLE001
+            return False
+        if not f:
+            return False
+        if f['esc_dirs'] < self.veto_min_esc:
+            return False
+        if f['occ_frac_r2'] >= self.veto_occ_max:
+            return False
+        return True
+
     def _nearest_valid_point(self, gx, gy, radius):
         """确定性搜索「离原目标最近的合格自由点 G*」：按半径由小到大、圆周采样。
 
@@ -1505,7 +1542,7 @@ class Arbiter(Node):
             for k in range(n):
                 ang = 2.0 * math.pi * k / n
                 nx, ny = gx + r * math.cos(ang), gy + r * math.sin(ang)
-                if not self._veto_ok(nx, ny):
+                if not self._inplace_ok(nx, ny, gx, gy):
                     continue
                 tried += 1
                 if tried > max(1, self.inplace_tries):
@@ -1516,7 +1553,7 @@ class Arbiter(Node):
                     continue
                 if not reach:
                     continue
-                if min_w is not None and min_w < self.corridor_width:
+                if min_w is not None and min_w < self.inplace_min_width:
                     continue
                 return nx, ny
             r += res
