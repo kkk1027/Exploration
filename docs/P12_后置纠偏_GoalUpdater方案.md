@@ -122,3 +122,90 @@ manager 的 `no-progress` 看门狗是按**它自己派发的目标**算剩余�
 2. manager 订阅 `/goal_update` 同步跟踪目标 + 离线自测；
 3. arbiter 增加 `inplace` 模式（G\* 搜索 + 发布 `/goal_update` + `/goal_correction`）；
 4. 5 轮 A/B（`cancel` vs `inplace`），按 §5 判据决定是否切换默认。
+
+---
+
+# 实施记录（2026-11-04）
+
+## Step 1 完成（纯配置，已提交 dae3854 / 4fb5a01）
+- `stemm_cartographer_nav_to_pose.xml`：`GoalUpdater` 包在 `ComputePathIfNeeded` Fallback **外层**
+- `bt_navigator.goal_updater_topic = /goal_update`
+- 60 s 短轮验证：BT 加载无错、8 次派发 / 2 次取消、接触 0，行为不变。
+
+## Step 2 判定"无需改动"（有源码依据）
+nav2 的 `NavigateToPose` 反馈 `distance_remaining` = **当前路径剩余长度**
+（`nav2_bt_navigator/src/navigators/navigate_to_pose.cpp:147` `calculate_path_length`）；
+manager 的 `_distance_to_active_goal()` 优先取该反馈（`_distance_source == 'feedback'`）。
+⇒ 目标被原地改写后路径变化，看门狗的"剩余距离/净推进"自动跟随，**不需要额外订阅**。
+
+## Step 3 完成（arbiter inplace，已提交 edab1e4 / 9074f62）
+- 新参数：`veto_inplace`(默认 false) / `inplace_radius_m` / `inplace_tries` / `inplace_max`
+  / `inplace_cooldown_sec` / `inplace_min_disp_m` / `inplace_min_width_m` / `inplace_min_robot_m`
+  / `inplace_min_goal_m` / `inplace_fallback_cancel`；新话题 `/goal_update`、`/goal_correction`。
+- 离线单测 `harness/test_veto.py`：10 组 10 断言全过（含"inplace 不调用 cancel"与"回落旧逻辑"）。
+
+## 机制级验证（关键，PASS）
+`harness/verify_goal_updater.py` 在真实轮次里注入：
+```
+[verify] 当前计划末点=9.12,-6.82  车=7.03,-5.30
+[verify] 注入 /goal_update → 5.56,-7.32
+[verify] 注入后 5 条计划；最接近注入点的末点=5.56,-7.32 距离=0.01 m
+[verify] ✓ PASS：BT 已消费 /goal_update（重规划到注入点）
+```
+⇒ 订阅者 = `bt_navigator_navigate_to_pose_rclcpp_node`（BEST_EFFORT，与 RELIABLE 发布兼容）；
+外层 `NavigateToPose` 全程未取消。**方案链路成立。**
+
+## 踩到并修掉的两个真 bug
+1. **参数被覆盖**：`nav_params.py` 每轮从 `patches/stemm_safe_nav2_params.pristine.yaml`
+   **整份重写** YAML，Step1 写在运行副本里的 `goal_updater_topic` 被抹掉（实测计数 0）。
+   ⇒ 已写入 pristine 并强制入库（该路径被 .gitignore 忽略，需 `git add -f`）。
+2. **G\* 判据过严**：首版直接复用 migrate 的 `_veto_ok`（含 `veto_migrate_min_move=1.0 m`）
+   与 `corridor_width=1.05 m`，导致 5 轮只纠偏 4 次。⇒ 解耦出 `_inplace_ok`：
+   离车 ≥0.50 m、离原目标 ≥0.20 m、`cost_gate_reject` 通过、区域复杂度通过，
+   净宽阈值单列 `inplace_min_width_m=0.70`，尝试次数 24→48。
+
+## 第一轮 A/B（判据未达标，作为基线对照保留）
+| 指标 | A=cancel(5 轮) | B=inplace(5 轮, 旧严判据) |
+| --- | --- | --- |
+| 取消次数 | 33 | 22 |
+| 取消型迁移 | 24 | 13 |
+| 原地纠偏 | 0 | **4（太少，判据过严）** |
+| 无故打断 | 9 | 5 |
+| 已知面积中位 | 148.6 m² | 148.2 m² |
+| 卡死/停滞 | 22 / 202 s | 18 / 241 s |
+| 接触 | 0 | **8（1 轮，该轮纠偏=0，与 inplace 无关）** |
+
+> 结论：方向有效（取消 33→22、无故打断 9→5），但纠偏触发太少、且出现一轮既有形态的接触，
+> 需要按 §"G* 判据放宽"重跑 B 组后再判定。
+
+## Step 4 A/B 结果（2026-11-04，各组 5 轮 180 s，同口径）
+
+| 指标 | A=现状(取消型) | B=inplace+兜底(ab4) | B'=inplace 不兜底(ab5) |
+| --- | --- | --- | --- |
+| 取消次数（合计） | 33 | **23（−30%）** | **0（但见下）** |
+| 取消型迁移 | 24 | **10** | 0 |
+| 原地纠偏 | 0 | **5** | 6 |
+| 无故打断 | 9 | **5（−44%）** | —（轮次不健康） |
+| 中途更换 | 29 | 22 | — |
+| 已知面积中位 | 148.6 m² | 147.4 m²（−0.8%） | **79 m²（腰斩）** |
+| 占据面积 | 7.8 m² | 6.9 m² | 3.4~3.8 m² |
+| 卡死事件 | 22 | 26 | — |
+| 停滞总秒 | 202 | **369（翻倍）** | 136~138 s/轮 |
+| 物理接触 | 0 | **0** | 0 |
+
+### 判读
+1. **机制成立**（GoalUpdater 被 BT 消费、注入验证 0.01 m 命中），且 inplace 确实减少了取消
+   （33→23，−30%）与无故打断（9→5，−44%），覆盖面积几乎不变（−0.8%），无接触。
+2. **但纠偏触发率偏低（5 次/5 轮）**：后置判据的触发前提就是"落点邻域拥挤"，而我在
+   3.5 m 半径内还要求"代价门 + BFS 可达（+净宽）"，实测多数时候找不到合格点 → 回落取消。
+3. **"永不取消"（ab5）不可取**：取消降到 0，但停滞从 43 s/轮涨到 ~137 s/轮、覆盖腰斩到
+   79 m²，另有两轮起栈失败 ⇒ 停车被换成了卡死。**必须保留 cancel 兜底。**
+4. 因此**未达验收判据**（≤3 取消/5 轮、≤1 无故打断、停滞不升）。
+
+### 下一步建议（待批准）
+- **G\* 搜索质量**是唯一瓶颈：优先沿"当前计划回退"（rollback 档，最远 3.55 m）取点，
+  再退回圆周采样；并把净宽判据改为"≥车宽+0.1"（0.57 m）而不是 0.70/1.05。
+- 或者：把"落点不合格"的处置从"立刻改目标"改为"**先把该点拉黑，等本次目标自然结束后
+  再改目标**"（延迟纠偏），彻底避免中途变向。
+- 判据层面建议把"停滞总秒不升"作为硬约束优先于"取消次数"，避免再出现 ab5 那种
+  "取消归零但车不动"的假达标。
