@@ -1,0 +1,60 @@
+<!--
+  Cartographer exploration-only navigation tree.
+  Planner and controller failures are handled in context first.  Repeated
+  failures then advance through clear, collision-checked Spin, and Wait.
+  No BackUp behavior is used because rear clearance is not trusted.
+-->
+<root main_tree_to_execute="MainTree">
+  <BehaviorTree ID="MainTree">
+    <RecoveryNode number_of_retries="4" name="CartographerNavigateRecovery">
+      <PipelineSequence name="NavigateWithConditionalReplanning">
+        <RateController hz="1.0">
+          <RecoveryNode number_of_retries="1" name="ComputePathToPose">
+            <!-- ★ 2026-11-04 P12：GoalUpdater 包在 Fallback **外层**。
+                 它订阅 goal_updater_topic（默认 goal_update）的 PoseStamped，
+                 收到比当前 {goal} 更新的 stamp 就把黑板上的 {goal} 换成新目标，
+                 于是 GlobalUpdatedGoal 立刻判定"目标变了"→ 本层 Fallback 落到
+                 ComputePathToPose 用新目标重规划，**外层 NavigateToPose 动作不取消**。
+                 放在 Fallback 内部会死锁（条件先跑、看不到新目标，一直复用旧路径）。
+                 语义等价于 nav2 NavFn 的 tolerance 就近落点，但对 SMAC/Hybrid 也生效。 -->
+            <GoalUpdater input_goal="{goal}" output_goal="{goal}">
+              <Fallback name="ComputePathIfNeeded">
+                <ReactiveSequence name="UseCurrentPathIfValid">
+                  <Inverter>
+                    <GlobalUpdatedGoal/>
+                  </Inverter>
+                  <IsPathValid path="{path}"/>
+                </ReactiveSequence>
+                <ComputePathToPose goal="{goal}" path="{path}" planner_id="GridBased"/>
+              </Fallback>
+            </GoalUpdater>
+            <ClearEntireCostmap
+              name="ClearGlobalCostmap-Context"
+              service_name="global_costmap/clear_entirely_global_costmap"/>
+          </RecoveryNode>
+        </RateController>
+        <RecoveryNode number_of_retries="1" name="FollowPath">
+          <FollowPath path="{path}" controller_id="FollowPath"/>
+          <ClearEntireCostmap
+            name="ClearLocalCostmap-Context"
+            service_name="local_costmap/clear_entirely_local_costmap"/>
+        </RecoveryNode>
+      </PipelineSequence>
+      <ReactiveFallback name="RecoveryFallback">
+        <GoalUpdated/>
+        <RoundRobin name="RecoveryActions">
+          <Sequence name="ClearingActions">
+            <ClearEntireCostmap
+              name="ClearLocalCostmap-Subtree"
+              service_name="local_costmap/clear_entirely_local_costmap"/>
+            <ClearEntireCostmap
+              name="ClearGlobalCostmap-Subtree"
+              service_name="global_costmap/clear_entirely_global_costmap"/>
+          </Sequence>
+          <Spin spin_dist="1.57" time_allowance="10"/>
+          <Wait wait_duration="1"/>
+        </RoundRobin>
+      </ReactiveFallback>
+    </RecoveryNode>
+  </BehaviorTree>
+</root>
