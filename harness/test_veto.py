@@ -78,6 +78,23 @@ class FakeSelf:
         self._nav_seen = nav is not None
         self._active_uuid = [b'\x01' * 16]
         self.cancel_ok = True
+        # ★ 2026-11-04 P12：inplace 模式默认关（既有用例因此行为不变）
+        self.veto_inplace = False
+        self.veto_migrate = False
+        self.inplace_radius = 2.0
+        self.inplace_tries = 24
+        self.inplace_max = 3
+        self.inplace_cooldown = 3.0
+        self.inplace_min_disp = 0.30
+        self.inplace_fallback_cancel = True
+        self._inplace_last = 0.0
+        self._inplace_prev = None
+        self.pub_goal_update = None
+        self.pub_correction = None
+        self.frame = 'map'
+        self.yaw = 0.0
+        self.corridor_width = 1.05
+        self.costmap = None
         self.log = Logger()
 
     def clearance_field(self):
@@ -90,7 +107,11 @@ class FakeSelf:
         return self.log
 
     def _do_veto_cancel(self):
+        self.cancel_called = True
         return self.cancel_ok
+
+    def _nearest_valid_point(self, gx, gy, radius):
+        return getattr(self, 'inplace_reply', None)
 
 
 def build_methods(cls):

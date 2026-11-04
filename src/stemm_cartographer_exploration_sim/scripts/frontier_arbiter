@@ -482,6 +482,26 @@ class Arbiter(Node):
         self.veto_migrate_r = float(p('veto_migrate_radius_m', 2.0).value)
         self.veto_migrate_samples = int(p('veto_migrate_samples', 32).value)
         self.veto_migrate_min_move = float(p('veto_migrate_min_move_m', 1.0).value)
+        # ★ 2026-11-04 P12 Step3：后置纠偏「原地改目标」模式。
+        #   命中后置判据时**不取消** nav2 目标，而是把"最近的合格自由点 G*"通过
+        #   /goal_update 推给 nav2 BT 的 GoalUpdater ⇒ BT 原地改写 goal 并重规划，
+        #   外层 NavigateToPose 动作继续（到 G* 由 controller 判成功：
+        #   controller_server.cpp:439 用 path.poses.back() 做目标校验）。
+        #   默认 False（行为与现状完全一致），灰度验证后由用户切 True。
+        self.veto_inplace = self._as_bool(p('veto_inplace', False).value)
+        self.inplace_radius = float(p('inplace_radius_m', 2.0).value)
+        self.inplace_tries = int(p('inplace_tries', 24).value)
+        self.inplace_max = int(p('inplace_max', 3).value)
+        self.inplace_cooldown = float(p('inplace_cooldown_sec', 3.0).value)
+        self.inplace_min_disp = float(p('inplace_min_disp_m', 0.30).value)
+        self.inplace_fallback_cancel = self._as_bool(
+            p('inplace_fallback_cancel', True).value)
+        self._inplace_last = 0.0
+        self._inplace_prev = None
+        self.pub_goal_update = self.create_publisher(
+            PoseStamped, p('goal_update_topic', '/goal_update').value, 10)
+        self.pub_correction = self.create_publisher(
+            String, p('goal_correction_topic', '/goal_correction').value, 10)
         self._veto_last = 0.0
         self._veto_count = 0
         self._veto_prev = None         # (x, y, ts) 上一次 veto 的目标
@@ -1465,6 +1485,77 @@ class Arbiter(Node):
                 best = (d, nx, ny)
         return (best[1], best[2]) if best else None
 
+    def _nearest_valid_point(self, gx, gy, radius):
+        """确定性搜索「离原目标最近的合格自由点 G*」：按半径由小到大、圆周采样。
+
+        合格 = _veto_ok（区域复杂度 + 代价门 + 离车最小位移）
+              + path_and_width 可达（BFS）+ 沿途最小净宽 >= corridor_width。
+        path_and_width 较贵，所以先用便宜的 _veto_ok 预筛，并限制总尝试次数。
+        """
+        if self.costmap is None:
+            return None
+        try:
+            res = float(self.costmap.info.resolution) or 0.05
+        except Exception:                                   # noqa: BLE001
+            res = 0.05
+        tried = 0
+        r = res
+        while r <= radius + 1e-9:
+            n = max(8, int(2.0 * math.pi * r / max(res, 0.05)))
+            for k in range(n):
+                ang = 2.0 * math.pi * k / n
+                nx, ny = gx + r * math.cos(ang), gy + r * math.sin(ang)
+                if not self._veto_ok(nx, ny):
+                    continue
+                tried += 1
+                if tried > max(1, self.inplace_tries):
+                    return None
+                try:
+                    reach, _narrow_at, min_w, _unk = self.path_and_width(nx, ny)
+                except Exception:                            # noqa: BLE001
+                    continue
+                if not reach:
+                    continue
+                if min_w is not None and min_w < self.corridor_width:
+                    continue
+                return nx, ny
+            r += res
+        return None
+
+    def _publish_goal_update(self, x, y, reason, gx, gy, now):
+        """把 G* 推给 nav2 BT（/goal_update）；成功返回 True（调用方因此**不取消**目标）。"""
+        if self.pub_goal_update is None:
+            return False
+        if self.stats.get('veto_inplace', 0) >= self.inplace_max:
+            return False
+        if now - self._inplace_last < self.inplace_cooldown:
+            return False
+        if (self._inplace_prev is not None
+                and math.hypot(x - self._inplace_prev[0], y - self._inplace_prev[1])
+                < self.inplace_min_disp):
+            return False
+        msg = PoseStamped()
+        msg.header.frame_id = self.frame
+        msg.header.stamp = self.get_clock().now().to_msg()   # GoalUpdater 只接受更新的 stamp
+        msg.pose.position.x, msg.pose.position.y = float(x), float(y)
+        yaw = float(getattr(self, 'yaw', 0.0) or 0.0)
+        msg.pose.orientation.z = math.sin(yaw / 2.0)
+        msg.pose.orientation.w = math.cos(yaw / 2.0)
+        self.pub_goal_update.publish(msg)
+        self._inplace_last = now
+        self._inplace_prev = (x, y)
+        self.stats['veto_inplace'] = self.stats.get('veto_inplace', 0) + 1
+        dist = math.hypot(x - gx, y - gy)
+        try:
+            self.pub_correction.publish(String(data=json.dumps({
+                't': round(time.time(), 2), 'reason': reason,
+                'from': [round(gx, 2), round(gy, 2)], 'to': [round(x, 2), round(y, 2)],
+                'dist': round(dist, 2),
+                'n': self.stats.get('veto_inplace', 0)})))
+        except Exception:                                   # noqa: BLE001
+            pass
+        return True
+
     def veto_probe(self, gx, gy, tag=''):
         """对一个外部目标做后置否决判定（拆出来便于离线自测）。"""
         if not self.veto_enabled or self.pose is None:
@@ -1505,6 +1596,28 @@ class Arbiter(Node):
         if not why:
             return None
         reason = ','.join(why)
+        # ---- P12：原地纠偏（不取消目标）优先 ----
+        if self.veto_inplace:
+            rep0 = self._nearest_valid_point(gx, gy, self.inplace_radius)
+            if rep0 is not None and self._publish_goal_update(
+                    rep0[0], rep0[1], reason, gx, gy, now):
+                self._veto_last = now
+                self._veto_prev = (gx, gy, now)
+                self._veto_count += 1
+                self.stats['veto_inplace_ok'] = self.stats.get('veto_inplace_ok', 0) + 1
+                self.get_logger().warn(
+                    'V2-③ 后置纠偏（inplace 原地改目标，**不取消**，%s）'
+                    '(%.2f,%.2f) → (%.2f,%.2f) 距离 %.2f m；本轮第 %d/%d 次'
+                    % (reason, gx, gy, rep0[0], rep0[1],
+                       math.hypot(rep0[0] - gx, rep0[1] - gy),
+                       self.stats['veto_inplace_ok'], self.inplace_max))
+                return reason
+            if not self.inplace_fallback_cancel:
+                self.get_logger().info(
+                    'V2-③ 后置纠偏未找到合格点（或超限/冷却），按配置不回落取消：%s (%.2f,%.2f)'
+                    % (reason, gx, gy))
+                return reason
+
         # ---- 迁移优先：把落点换成一个合格点继续走，而不是停车 ----
         if self.veto_migrate:
             modes = [self.veto_migrate_mode] + [m for m in ('random', 'rollback')

@@ -1,0 +1,3149 @@
+#!/usr/bin/env python3
+"""frontier_arbiter —— 仿真侧前沿仲裁（S1）：可达性预筛 + 失败黑名单 + 最小前沿规模 + 目标回拉。
+
+背景：实测候选点产量充足（163 个/75 s），但派发目标成功率仅 33%（4/6 被取消），
+且 escape/blocked 恢复开销大。原因是候选点只经过"代价地图障碍判断"，
+没有做"规划器可达性"校验，也没消除已失败过的候选。
+
+做法（不改车端源码）：
+  /filtered_goal_points ──┐
+  /map (transient_local) ──┼─► 打分(未知格数) → 取前 N → 回拉 → ComputePathToPose 校验
+  /odom_combined ─────────┘                                        │
+                                                                   ▼
+                                              /validated_frontier_goal (PoseStamped)
+  manager 的 frontier_goal_topic 运行期指到本话题即可（无侵入）。
+
+参数：
+  min_unknown_cells  候选周围未知格数下限（默认 30，5cm 栅格 ≈ 0.075 m²）
+  check_radius       统计未知格与回拉用的半径（默认 1.0 m）
+  pullback_m         目标回拉距离，落到已知自由空间一侧（默认 0.6 m）
+  blacklist_sec      失败候点的黑名单时长（默认 60 s）
+  blacklist_radius   黑名单作用半径（默认 0.8 m）
+  max_candidates     每轮校验的候选数（默认 5）
+  republish_sec      最小重发间隔（默认 8 s）
+  path_timeout_sec   ComputePathToPose 超时（默认 4 s）
+"""
+import json
+from collections import deque
+import math
+import os
+import random
+import time
+
+# P9-L1：「在等」而不是「过不去」的状态词（来自 50 轮历史 timeline 的实测分类）
+FF_WAIT_WORDS = ('waiting_for_rrt_frontier', 'warming_up', 'arrived', 'canceled',
+                 'return_home_wait', 'clearance_restored', 'succeeded', 'stopped')
+
+import rclpy
+from action_msgs.msg import GoalStatusArray
+from geometry_msgs.msg import PoseStamped, Twist
+from nav_msgs.msg import OccupancyGrid, Odometry, Path
+from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from std_msgs.msg import String
+from wheeltec_rrt_msg.msg import PointArray
+
+
+
+# =====================================================================
+# 纯函数打分内核（不依赖 ROS，便于 harness/test_scoring.py 离线秒级验证）
+# grid = {'res','w','h','ox','oy','data'}；data: -1=未知, 0..24=自由, >=50=占据
+# =====================================================================
+FREE_MAX = 25
+OCC_MIN = 50
+
+
+def to_cell(g, x, y):
+    return int((x - g['ox']) / g['res']), int((y - g['oy']) / g['res'])
+
+
+def cell_stats(g, x, y, radius_m):
+    """半径内 未知格数 / 自由格数。"""
+    r = max(1, int(radius_m / g['res']))
+    cx, cy = to_cell(g, x, y)
+    unknown = free = 0
+    for j in range(max(0, cy - r), min(g['h'], cy + r + 1)):
+        base = j * g['w']
+        for i in range(max(0, cx - r), min(g['w'], cx + r + 1)):
+            v = g['data'][base + i]
+            if v < 0:
+                unknown += 1
+            elif v < FREE_MAX:
+                free += 1
+    return unknown, free
+
+
+def unknown_component_size(g, x, y, cap=2000, radius_m=3.0):
+    """候选点所在"未知连通块"的大小（BFS，半径内、上限 cap）。
+
+    这是"S3+S2 收益函数"的核心：大块未知（还没探过的大区域）值得优先，
+    而已经探得七零八落只剩碎角的地方，块大小很小 → 自然被压后。
+    """
+    res = g['res']
+    rmax = max(2, int(radius_m / res))
+    cx, cy = to_cell(g, x, y)
+    # 先找一个未知格做种子（候选点本身可能落在自由格/占据边上）
+    seed = None
+    for rad in range(0, rmax + 1):
+        for j in range(cy - rad, cy + rad + 1):
+            for i in (cx - rad, cx + rad) if rad else (cx,):
+                if 0 <= i < g['w'] and 0 <= j < g['h']:
+                    if g['data'][j * g['w'] + i] < 0:
+                        seed = (i, j)
+                        break
+            if seed:
+                break
+        if seed:
+            break
+    if seed is None:
+        return 0
+    seen = {(seed[0], seed[1])}
+    q = [seed]
+    n = 0
+    data = g['data']
+    w, h = g['w'], g['h']
+    while q and n < cap:
+        i, j = q.pop()
+        n += 1
+        for ni, nj in ((i + 1, j), (i - 1, j), (i, j + 1), (i, j - 1)):
+            if not (0 <= ni < w and 0 <= nj < h):
+                continue
+            if abs(ni - cx) > rmax or abs(nj - cy) > rmax:
+                continue
+            if (ni, nj) in seen:
+                continue
+            if data[nj * w + ni] < 0:
+                seen.add((ni, nj))
+                q.append((ni, nj))
+    return n
+
+
+def frontier_width(g, x, y, radius_m=1.5):
+    """前沿"宽度"代理：半径内与未知格相邻的自由格数。
+
+    用来替代"前沿段长度"（RRT 只给点，没有段）：碎角/单格突起会得到很小的值。
+    """
+    r = max(1, int(radius_m / g['res']))
+    cx, cy = to_cell(g, x, y)
+    w, h, data = g['w'], g['h'], g['data']
+    n = 0
+    for j in range(max(0, cy - r), min(h, cy + r + 1)):
+        base = j * w
+        for i in range(max(0, cx - r), min(w, cx + r + 1)):
+            if data[base + i] < 0 or data[base + i] >= FREE_MAX:
+                continue
+            adj_unknown = False
+            for ni, nj in ((i + 1, j), (i - 1, j), (i, j + 1), (i, j - 1)):
+                if 0 <= ni < w and 0 <= nj < h and data[nj * w + ni] < 0:
+                    adj_unknown = True
+                    break
+            if adj_unknown:
+                n += 1
+    return n
+
+
+def score_one(g, x, y, dist, cfg, penalty=0.0):
+    """单个候选的收益分（越大越好）。返回 dict 便于日志取证。"""
+    info_r = cfg['info_radius']
+    u, free = cell_stats(g, x, y, info_r)
+    blk = unknown_component_size(g, x, y, cap=cfg['block_cap'], radius_m=cfg['block_radius'])
+    width = frontier_width(g, x, y, radius_m=cfg['width_radius'])
+    ratio = u / float(u + free) if (u + free) > 0 else 0.0
+    info = u * (1.0 + cfg['w_block'] * min(blk, cfg['block_cap']) / float(cfg['block_cap']))
+    score = (info * (cfg['ratio_floor'] + (1.0 - cfg['ratio_floor']) * ratio)
+             + cfg['w_width'] * min(width, cfg['width_cap'])
+             - cfg['w_dist'] * dist
+             - penalty)
+    if width < cfg['min_width']:
+        score *= cfg['small_frontier_factor']     # 碎角：降权不硬拒（留到最后细化）
+    return {'x': x, 'y': y, 'unknown': u, 'free': free, 'block': blk,
+            'width': width, 'ratio': ratio, 'penalty': penalty, 'score': score}
+
+
+def prefilter_one(g, x, y, dist, cfg, penalty=0.0):
+    """便宜的一级打分：只用 未知格数 / 未知占比 / 距离 / 罚分（不做 BFS）。"""
+    u, free = cell_stats(g, x, y, cfg['info_radius'])
+    ratio = u / float(u + free) if (u + free) > 0 else 0.0
+    score = (u * (cfg['ratio_floor'] + (1.0 - cfg['ratio_floor']) * ratio)
+             - cfg['w_dist'] * dist - penalty)
+    return {'x': x, 'y': y, 'unknown': u, 'free': free, 'ratio': ratio,
+            'penalty': penalty, 'score': score}
+
+
+def rank_candidates(g, cands, cfg, penalty_fn=None, pose=None, prefilter_n=None):
+    """两级排序：先便宜预筛到 prefilter_n 个，再对它们做完整打分（连通块+前沿宽度）。
+
+    候选池可能有几百个，全量做 BFS 会让 1 Hz 的 tick 卡死 —— 这是实测必须的两级结构。
+    """
+    pre = []
+    for x, y in cands:
+        dist = math.hypot(x - pose[0], y - pose[1]) if pose is not None else 0.0
+        pen = penalty_fn(x, y) if penalty_fn else 0.0
+        pre.append(prefilter_one(g, x, y, dist, cfg, pen))
+    pre.sort(key=lambda r: r['score'], reverse=True)
+    top = pre[:prefilter_n] if prefilter_n else pre
+    out = []
+    for r in top:
+        dist = math.hypot(r['x'] - pose[0], r['y'] - pose[1]) if pose is not None else 0.0
+        out.append(score_one(g, r['x'], r['y'], dist, cfg, r['penalty']))
+    out.sort(key=lambda r: r['score'], reverse=True)
+    return out
+
+
+
+def unknown_in_cone(g, x, y, heading, dist_lo, dist_hi, half_deg, stride=1):
+    """候选点"前方"锥形区域里的未知格数（沿 heading 方向，距离 dist_lo..dist_hi，±half_deg）。
+
+    这是 v3 收益函数的核心：真正值得去的不是"周围一片未知"，而是"朝那个方向有一大块未知"。
+    v2 用"邻域未知占比"当主项，结果偏好往未测绘深处扎（实测撞进看不见的桌子底座），v3 反过来。
+    """
+    res = g['res']
+    w, h, data = g['w'], g['h'], g['data']
+    cx, cy = to_cell(g, x, y)
+    r_lo = int(dist_lo / res)
+    r_hi = int(dist_hi / res)
+    if r_hi <= r_lo:
+        return 0
+    tan_half = math.tan(math.radians(half_deg))
+    n = 0
+    for j in range(cy - r_hi, cy + r_hi + 1):
+        if not (0 <= j < h):
+            continue
+        base = j * w
+        dj = j - cy
+        for i in range(cx - r_hi, cx + r_hi + 1):
+            if not (0 <= i < w):
+                continue
+            di = i - cx
+            along = di * heading[0] + dj * heading[1]
+            if along < r_lo or along > r_hi:
+                continue
+            lateral = abs(-dj * heading[0] + di * heading[1])
+            if lateral > along * tan_half:
+                continue
+            if data[base + i] < 0:
+                n += 1
+    return n
+
+
+def near_ratio(g, x, y, radius_m):
+    """候选点周围"已知自由 / (已知自由+未知)"的比例 —— 用来判断它是不是真的"站在已知边界上"。"""
+    free = unknown = 0
+    r = max(1, int(radius_m / g['res']))
+    cx, cy = to_cell(g, x, y)
+    w, h, data = g['w'], g['h'], g['data']
+    for j in range(max(0, cy - r), min(h, cy + r + 1)):
+        base = j * w
+        for i in range(max(0, cx - r), min(w, cx + r + 1)):
+            v = data[base + i]
+            if v < 0:
+                unknown += 1
+            elif v < FREE_MAX:
+                free += 1
+    tot = free + unknown
+    return (free / float(tot)) if tot else 0.0, free, unknown
+
+
+def score_v3(g, x, y, dist, heading, cfg, penalty=0.0):
+    """收益函数 v3：朝向前方大块未知 + 站在已知边界上（approach 侧安全）。
+
+    score = 前方未知(cap) × (0.5 + 0.5×近邻已知占比) + 0.05×连通块 - 0.5×距离 - 罚分
+    另外：近邻已知占比 < gate 时（候选大半埋在未知里）重量降权，避免"往未测绘深处扎"。
+    """
+    u_ahead = unknown_in_cone(g, x, y, heading, cfg['cone_near'], cfg['cone_far'],
+                              cfg['cone_half_deg'])
+    nr, free_near, unk_near = near_ratio(g, x, y, cfg['near_radius'])
+    blk = unknown_component_size(g, x, y, cap=cfg['block_cap'], radius_m=cfg['block_radius'])
+    score = (min(u_ahead, cfg['cone_cap']) * (0.5 + 0.5 * nr)
+             + cfg['w_block3'] * min(blk, cfg['block_cap'])
+             - cfg['w_dist'] * dist
+             - penalty)
+    if nr < cfg['near_gate']:
+        score *= cfg['buried_factor']
+    return {'x': x, 'y': y, 'unknown': unknown_in_cone(g, x, y, heading, 0.2, 1.0, 90.0),
+            'ahead': u_ahead, 'near_ratio': nr, 'free_near': free_near,
+            'unk_near': unk_near, 'block': blk, 'ratio': nr,
+            'width': 0, 'penalty': penalty, 'score': score}
+
+
+def turn_angle_to(heading_from_robot, robot_yaw):
+    """从机头朝向到"机器人→候选"方向需要转的角度（弧度，取绝对值 0..pi）。"""
+    want = math.atan2(heading_from_robot[1], heading_from_robot[0])
+    d = math.atan2(math.sin(want - robot_yaw), math.cos(want - robot_yaw))
+    return abs(d)
+
+
+def prefilter_v3(g, x, y, dist, heading, cfg, penalty=0.0):
+    """v3 的便宜一级：只算近邻占比与前方锥（不做连通块 BFS）。"""
+    nr, free_near, unk_near = near_ratio(g, x, y, cfg['near_radius'])
+    u_ahead = unknown_in_cone(g, x, y, heading, cfg['cone_near'], cfg['cone_far'],
+                              cfg['cone_half_deg'])
+    score = (min(u_ahead, cfg['cone_cap']) * (0.5 + 0.5 * nr)
+             - cfg['w_dist'] * dist - penalty)
+    if nr < cfg['near_gate']:
+        score *= cfg['buried_factor']
+    return {'x': x, 'y': y, 'unknown': u_ahead, 'ahead': u_ahead, 'near_ratio': nr,
+            'free_near': free_near, 'unk_near': unk_near, 'ratio': nr,
+            'block': 0, 'width': 0, 'penalty': penalty, 'score': score}
+
+
+def rank_candidates_v3(g, cands, cfg, penalty_fn=None, pose=None, prefilter_n=None):
+    if pose is None:
+        pose = (0.0, 0.0)
+    pre = []
+    for x, y in cands:
+        dist = math.hypot(x - pose[0], y - pose[1])
+        dx, dy = x - pose[0], y - pose[1]
+        n = math.hypot(dx, dy) or 1.0
+        heading = (dx / n, dy / n)
+        pen = penalty_fn(x, y) if penalty_fn else 0.0
+        r = prefilter_v3(g, x, y, dist, heading, cfg, pen)
+        r['heading'] = heading
+        r['dist'] = dist
+        pre.append(r)
+    pre.sort(key=lambda r: r['score'], reverse=True)
+    top = pre[:prefilter_n] if prefilter_n else pre
+    out = []
+    for r in top:
+        out.append(score_v3(g, r['x'], r['y'], r['dist'], r['heading'], cfg, r['penalty']))
+    out.sort(key=lambda r: r['score'], reverse=True)
+    return out
+
+
+class Arbiter(Node):
+    def __init__(self):
+        super().__init__('frontier_arbiter')
+        p = self.declare_parameter
+        self.min_unknown = int(p('min_unknown_cells', 30).value)
+        # D4：v3 的规模门槛原本只看"近处 1 m 未知格"，而真正进分的是 0.3~3.0 m 前方锥。
+        # 保守做法：两个判据取"或"——原本能过的照样过，只是把"近处少、前方一大片"的候选也放进来。
+        self.min_ahead = int(p('min_ahead_cells', 300).value)
+        self.radius = float(p('check_radius', 1.0).value)
+        self.pullback = float(p('pullback_m', 0.6).value)
+        self.bl_sec = float(p('blacklist_sec', 60.0).value)
+        self.bl_r = float(p('blacklist_radius', 0.8).value)
+        self.max_cand = int(p('max_candidates', 5).value)
+        # D8：候选 30 s 太陈旧（地图早变了）、池 400 且同片多点重复竞争
+        self.cand_max_age = float(p('candidate_max_age_sec', 15.0).value)
+        self.cand_pool = int(p('cand_pool_size', 800).value)
+        self.repub = float(p('republish_sec', 8.0).value)
+        self.path_timeout = float(p('path_timeout_sec', 4.0).value)
+        self.frame = str(p('frame_id', 'map').value)
+        # P0-4：前向净空预检——必须穿过窄缝才能到达的候选直接丢弃
+        self.corridor_check = bool(p('corridor_check', True).value)
+        # 保守口径：走廊净宽下限 0.90 → 1.05 m。
+        # 理由（2026-10-23 实测）：两张 cafe_table 的"细立柱"之间在 /map 里是 0.92 m 宽，
+        # 机器人在此判据下会钻进去，而它们 0.56 m 见方的贴地底座实际只有 0.36 m 净距
+        # （雷达 0.225 m 高度看不见）→ f2 轮 690 次轮子接触全在这里。抬高净宽下限后这类
+        # "看着能过、实际过不去"的口子会被前向净空预检直接否掉。
+        # ===== 通行保证式判据（2026-10-25 P0，替代"走廊阈值随场景调"的做法）=====
+        # 判据只由车体尺寸 + 误差决定，不允许按房间/世界切换：
+        #   要求整条路径上"垂直自由带宽" >= 车宽 + 2×安全余量
+        #   = 0.47 + 2×0.215 ≈ 0.90 m（车宽取运行时补丁后的 0.47 m）
+        # 另加两条硬约束（这次 P0 的核心：不再允许"勉强能过"）：
+        #   * 窄段（带宽 < pass_width）累计长度 > narrow_len_max → 否决；
+        #   * 连续未知段 > unknown_span_max → 否决（未知一律按障碍算，只允许短跨度例外）。
+        self.pass_width = float(p('pass_width_m', 0.90).value)
+        self.narrow_len_max = float(p('narrow_len_max_m', 1.00).value)
+        self.unknown_span_max = float(p('unknown_span_max_m', 0.35).value)
+        # 兼容旧参数：corridor_width 不再按世界给默认值，统一取 pass_width
+        self.corridor_width = float(p('corridor_width_m', self.pass_width).value)
+        # 硬下限：低于这个净宽一律不派（车宽 0.40 + 车端前向安全闸 0.45 的几何下界 0.90，
+        # 取 0.92 留 2 cm 余地）；未知占比过高说明"这块还没探"，同样不派。
+        self.corridor_hard = float(p('corridor_hard_m', 0.92).value)
+        self.corridor_unknown_max = float(p('corridor_unknown_max', 0.35).value)
+        # D1：末端也查（原来 skip=1.2 m 会整段跳过目标点附近）；保留参数名做兼容，
+        # 但语义改为"末端额外加密采样距离"，不再"跳过"。
+        self.corridor_tail_dense = float(p('corridor_tail_dense_m', 0.8).value)
+        # 2026-10-26 修：这个属性一直"只有使用、没有声明"（历史遗留）。
+        # 只要 path_and_width 走到"没有净空场"的回退分支就 AttributeError，
+        # 把仲裁节点当场打死 —— 车端于是拿不到任何新目标，
+        # 用户看到的就是"路径不刷新、车长时间卡住"。默认 0.0：整条路径都查。
+        self.corridor_skip_far = float(p('corridor_skip_far_m', 0.0).value)
+        # D2/D3：用"到最近障碍的距离"代替轴向法向扫线（斜通道不再被高估 1.41 倍），
+        # 障碍集合 = /map 占据 ∪ 视觉障碍栅格占据
+        self.clearance_mode = str(p('clearance_mode', 'distance').value).lower()
+        self.use_vision_obstacles = bool(p('corridor_use_vision', True).value)
+        self.vision_grid_topic = str(p('vision_grid_topic', '/vision/obstacle_grid').value)
+        # 候选质量探针（2026-10-24）：记录每个"实际派发"的候选在**统一障碍图**
+        # （激光∪视觉）上的复杂度/可脱困性指标，供离线统计"哪类候选会导致卡死"。
+        self.probe_log = str(p('probe_log', '').value)
+        # 观测工作流 v2：每拍一行时间线（1 Hz），供 round_digest 画轨迹图并和
+        # probe / supervisor / launch.log 做秒级交叉核对。
+        # 兜底：launch 参数没送到时用环境变量（实测在整轮里 timeline_log 偶发丢失，
+        # 导致 digest 退化成 10 s 采样、卡死秒级判定不可用；环境变量由 round.sh 导出）
+        self.timeline_log = (str(p('timeline_log', '').value)
+                             or os.environ.get('STEMM_TIMELINE_LOG', ''))
+        self._tl_fh = None
+        self._tl_n = 0
+        self._tl_last_wall = 0.0
+        self.probe_escape_r = float(p('probe_escape_clear_m', 0.60).value)
+        self.probe_narrow_r = float(p('probe_narrow_clear_m', 0.35).value)
+        self.probe_radius = float(p('probe_radius_m', 2.0).value)
+        # ===== 候选闸门 V1（2026-10-24）=====
+        # 只治"能防住"的那类：落点是死口袋/过挤（激光∪视觉统一障碍图上的可脱困性）。
+        # 依据 10 轮 85 派发/13 卡死：esc_dirs=0 → 83% 卡死，5-8 → 4%；comp_r2<=100 → 83%。
+        # 硬拒仅用 esc_dirs/comp_r2（误杀率 10.6%）；occ 复杂度只重罚不硬拒
+        # （实测 esc_dirs=6 / occ=0.31 的安全点若硬拒会被误杀）。
+        # 2026-10-24 V1 实测退化（10 轮 PASS 100%→70%、返航失败 0→3、接触 0→1，而静止 12→12 没改善）
+        # ⇒ 按"退化先回退"默认关闭。原因见 P6 报告：卡死 62% 来自 manager 绕过仲裁，
+        # 只查仲裁候选的闸门对总量无效，反而带来 442 次/轮的拒绝 churn。
+        # 类型提示同 veto_enabled：launch 传 gate:=true 会被归一化成 bool，
+        # 用字符串默认值 declare 会抛 InvalidParameterTypeException 打死节点。
+        self.gate_enabled = self._as_bool(p('gate_enabled', False).value)
+        self.gate_esc_min = int(p('gate_esc_dirs_min', 3).value)
+        self.gate_comp_min = int(p('gate_comp_min_cells', 500).value)
+        self.gate_occ_soft = float(p('gate_occ_soft', 0.30).value)
+        self.gate_occ_penalty = float(p('gate_occ_penalty', 1200.0).value)
+        self.gate_esc_weights = (1.0, 0.70, 0.35, 0.10)   # esc_dirs 5-8 / 3-4 / 1-2 / 0
+        # ===== V2-② 保底安全候选（2026-10-24）=====
+        # 目的：仲裁器"挑不出合格候选"时不再什么都不派 —— 否则 manager 会在
+        # rrt_fallback_wait 之后自己采样（实测卡死 62% 来自那条路径）。
+        # 做法：从前 max_cand 个候选里挑一个"开阔、连通、离车不远"的点当观察点。
+        self.fallback_enabled = str(p('fallback_goal_enabled', 'true').value).lower() in ('true','1','yes')
+        # 收紧后的默认值：B0/V3 两组里各有一轮是在"保底观察点把车送去远角"之后
+        # 出现接触/硬倒车，所以把观察点限制在更近、更开阔的范围（宁可不派）。
+        self.fallback_min_esc = int(p('fallback_min_esc_dirs', 6).value)
+        self.fallback_min_comp = int(p('fallback_min_comp_cells', 1000).value)
+        self.fallback_max_dist = float(p('fallback_max_dist_m', 2.0).value)
+        self.fallback_cooldown = float(p('fallback_cooldown_sec', 10.0).value)
+        self.fallback_max_total = int(p('fallback_max_total', 10).value)
+        self._fb_last = 0.0
+        self._fb_count = 0
+        # ===== V2-③ 后置 veto（2026-10-24）=====
+        # 目的：闸门只看"落点"，管不到"manager 在窗口之外自己采样的目标"。
+        # 做法：订阅 /plan，取末位点当"当前真正在执行的目标"；若它既不是本节点
+        # 最近派过的点、又命中硬闸门（esc_dirs 太小 / 复杂度过高），就取消它。
+        # 安全约束（吃过教训，见 docs/P7 第 4 节）：
+        #   * 只在探索期生效（nav_state 里 mapping_done=false 且无返航迹象）；
+        #   * 目标落在 map 原点近旁（返航终点）一律不碰；
+        #   * 每局限 2 次、30 s 冷却、同一目标 20 s 内不重复 veto；
+        #   * 只取消"当前 EXECUTING 的那个 goal_id"，绝不用 cancel-all。
+        # 注意：launch 传 veto:=true 时 ROS 会把它解析成 **bool**，
+        # 若这里用字符串默认值 declare，rclpy 会直接抛
+        # InvalidParameterTypeException 把整个仲裁节点打死（实测第 1 轮即崩）。
+        # 所以默认值用 bool，并同时容忍字符串/数字写法。
+        self.veto_enabled = self._as_bool(p('veto_enabled', False).value)
+        # P9-⑥（用户 2026-10-26："路径永远不经过略宽于车身的窄处"）
+        # 候选闸门查的是**仲裁器自己 BFS 出来的那条路**，而真正开的是 nav2 planner
+        # 在代价地图上算出的 /plan —— 不是同一条路。这里对 /plan 再做一次体检：
+        #   plan_guard_log  : 只记录（每轮统计计划的最小净宽 / 最长窄段）
+        #   plan_guard_veto : 命中判据就取消目标（"宁可不走"）
+        self.plan_guard_log = self._as_bool(p('plan_guard_log', False).value)
+        self.plan_guard_veto = self._as_bool(p('plan_guard_veto', False).value)
+        self.plan_guard_max_cancel = int(p('plan_guard_max_cancel', 6).value)
+        # ---- P9-L1/L2：卡死治理「确定过不去 → 报失败/换目标」----
+        # 阈值来自 50 轮历史 timeline 的离线复算（harness/analyze_failfast.py）：
+        #   滑窗 20 s / 漂移 <=0.20 m / front 中位 <0.60 m 或 nav=blocked_*
+        #   → 命中 62 次，确认(同 2 m 内 60 s >=2 次) 0.38 次/轮，误报 5/50 轮，覆盖 7/11 顶住类事件。
+        # 注意：历史数据证明"里程 >=0.6 m"这条不能当必要条件（真卡死时里程≈0，会把事件全滤掉）。
+        self.failfast_enabled = self._as_bool(p('failfast_enabled', False).value)
+        self.ff_window = float(p('failfast_window_sec', 20.0).value)
+        self.ff_drift = float(p('failfast_drift_m', 0.20).value)
+        self.ff_front = float(p('failfast_front_m', 0.60).value)
+        self.ff_confirm = max(1, int(p('failfast_confirm_hits', 2).value))
+        self.ff_ttl = float(p('failfast_ttl_sec', 60.0).value)
+        self.ff_hard_radius = float(p('failfast_hard_radius_m', 1.2).value)
+        self.ff_zone_radius = float(p('failfast_zone_radius_m', 2.0).value)
+        self.ff_max_actions = int(p('failfast_max_actions', 8).value)
+        self.ff_escalate_sec = float(p('failfast_escalate_sec', 40.0).value)
+        # 拉黑单位＝"死角/自由连通域"（用户 2026-10-26 批准）：只拉黑落点半径挡不住
+        # "同一墙角的另一侧"，实测 L2 动作 10 次仍出现 82/99 s 长停滞。
+        self.ff_comp_radius = float(p('failfast_comp_radius_m', 6.0).value)
+        self._ff_cells = {}        # {(ci, cj): until}  禁入连通域的栅格
+
+        self._ff_hist = deque(maxlen=240)   # [(t, x, y)]（deque：_update_failfast 里 popleft）
+        self._ff_hits = []          # [(t, x, y)]
+        self._ff_hard = []          # [(x, y, until)] 本轮禁入区
+        self._ff_actions = 0
+        self._ff_last_action = 0.0
+        self._ff_stuck_since = None
+        self._ff_blocked_since = None
+        self.ff_blocked_sec = float(p('failfast_blocked_sec', 15.0).value)
+        self._pg_cancels = 0
+        self._pg_logged_plan = None
+        self.veto_min_esc = int(p('veto_min_esc_dirs', 3).value)
+        self.veto_occ_max = float(p('veto_occ_frac_max', 0.30).value)
+        self.veto_self_r = float(p('veto_self_radius_m', 0.60).value)
+        self.veto_self_sec = float(p('veto_self_window_sec', 8.0).value)
+        self.veto_max = int(p('veto_max_per_session', 2).value)
+        self.veto_cooldown = float(p('veto_cooldown_sec', 30.0).value)
+        self.veto_home_guard = float(p('veto_home_guard_m', 0.80).value)
+        # ==== 后置否决改为"迁移"（2026-10-27 用户方案）====
+        # 原始 V2-③ 命中就取消 → 车停车等下一个候选（实测等候选最长 27~92 s）。
+        # 改成：命中后**不取消落点本身**，而是把它迁到一个合格点继续执行。
+        # 两档策略（可切换）：
+        #   random   ：在原落点附近随机采样，取最近的合格点（用户方案，默认）
+        #   rollback ：在正在执行的 /plan 上从末位往回，取最后一个合格位姿
+        # 两档都失败才回落成"取消"。合格判据与后置否决同一套（esc_dirs/occ），
+        # 代价地图可用时再叠加落点代价判据。配额/冷却沿用 veto 的（默认每局 2 次）。
+        self.veto_migrate = self._as_bool(p('veto_migrate', True).value)
+        self.veto_migrate_mode = str(p('veto_migrate_mode', 'random').value).lower()
+        self.veto_migrate_r = float(p('veto_migrate_radius_m', 2.0).value)
+        self.veto_migrate_samples = int(p('veto_migrate_samples', 32).value)
+        self.veto_migrate_min_move = float(p('veto_migrate_min_move_m', 1.0).value)
+        self._veto_last = 0.0
+        self._veto_count = 0
+        self._veto_prev = None         # (x, y, ts) 上一次 veto 的目标
+        self._nav_payload = None       # 最近一帧 nav_state 解析结果
+        self._nav_seen = False
+        self._active_uuid = []         # 当前 ACCEPTED/EXECUTING 的 goal uuid（bytes）
+        self._veto_detail = []
+        # ===== 探索末段"停车友好"偏置（2026-10-24）=====
+        # 实测最主要的残余失败模式：探索时间到时车停在贴障位置，车端 manager 以
+        # "current pose is too close to occupied /map cells" / "front obstacle too
+        # close" 拒绝启动返航，3 次重试 6 秒内耗尽 → 整轮返航失败
+        # （272 轮历史里这条消息出现在 21 轮 = 7.7%，且新几组失败几乎全是它）。
+        # 做法：最后 tail_sec 秒里给"四周不够开阔"的候选加罚，让车尽量停在空地；
+        #       同时把保底观察点的门槛临时放宽，避免末段干脆没有目标。
+        # 2026-10-24 十轮实测：开着它反而更差（全绿 10/10→8/10、返航失败 0→2、
+        # 卡死 12→16）。末段把车往开阔处送，等于让它在收尾阶段多跑一段路，
+        # 反而更容易在截止那一刻卡在半路。⇒ 默认关闭，实现与参数保留备查。
+        self.tail_park_enabled = self._as_bool(p('tail_park_enabled', False).value)
+        self.explore_sec = float(p('explore_sec', 180.0).value)
+        self.tail_sec = float(p('tail_park_sec', 25.0).value)
+        self.tail_min_esc = int(p('tail_park_min_esc_dirs', 5).value)
+        self.tail_penalty_value = float(p('tail_park_penalty', 900.0).value)
+        self._first_pub_t = None
+        # ===== "可达但不可返回"检查 + 脱困目标（2026-10-25）=====
+        # myrun 事故：车在 (-1.05,3.82) 死角里停了 100 秒 —— 每个前沿候选的路径都要
+        # 过同一个窄口（走廊预检不过），仲裁于是每拍"全部被拒"，一个目标都不派；
+        # manager 自己的采样也过不去，车就一直原地待着，脱困单元也失败。
+        # 两处补齐：
+        #  1) return_check：派发前要求目标附近**有掉头空间**（车对角线 ~0.81 m），
+        #     否则这地方"进得去出不来"；
+        #  2) escape_goal：真的所有前沿都派不出去时，从一个**本地环**里挑
+        #     "净空最大、当前能到"的点先派出去，把车挪出死角，而不是什么都不做。
+        self.return_check = self._as_bool(p('return_check_enabled', True).value)
+        self.return_turn_width = float(p('return_turn_width_m', 0.85).value)
+        # P9-⑦（用户 2026-10-26 提问）：候选输出会不会把 nav2 的 allow_unknown 纳入判据？
+        # 原来**不会**：候选闸门的通行 BFS 走代价地图（未知编码 -1 会被挡），
+        # 但"沿路净宽"是在 /map 上算的，而 /map 里未知格**按可通行**处理，只靠
+        # unknown_span_max(0.35 m) 给一小段容差。nav2 一旦设成 allow_unknown:false，
+        # 两边口径就不一致：仲裁认为能到、规划器却拒绝，或反过来把车带进"没看清"的角。
+        # unknown_block=True 把容差清零（任何未知段都不许），并额外要求落点本身是已知自由格。
+        self.unknown_block = self._as_bool(p('unknown_block', False).value)
+        # P9-D（用户 2026-10-26 批准，根治"真窄卡死族"的前提）：
+        # 判宽时把**未知格按障碍计**。原来未知只用于统计占比，距离场只由已知障碍生成，
+        # 于是"半侧还没观测到"的缝在决策时刻被量成宽路 —— 这正是 19 次窄点卡死里
+        # 大部分"决策时看着能过、进去后墙才出现"的机制来源。
+        self.width_unknown_block = self._as_bool(p('width_unknown_block', False).value)
+        if self.unknown_block:
+            self.unknown_span_max = 0.0
+        # P9-A（用户 2026-10-26 批准的方向，2026-10-26 夜实测后重定义）：把"一刀切 pass_width
+        # 否决"换成"0.752 m 硬禁 + 1.6~1.05 m 带可退出性判定"。原因：pass_width=1.05 上线后
+        # rejected_narrow 涨到 587~671/轮（供给被掐掉一半），而真窄卡死仍有 19 次/14 轮；
+        # 单纯再加一条更低阈值的否决是空操作（<1.05 的路径早就被否决了）。所以 A 的语义是：
+        # * 路径最小净宽 < noexit_pinch_m(0.752) → 照旧硬否决（真挤不过去）；
+        # * 落在 [pinch, pass_width) → 判"能不能退出"：能退出就**放行**（恢复供给），
+        #   不能退出才否决并单独计 reject_noexit；这样才能同时压卡死与提高覆盖。
+        self.noexit_enabled = self._as_bool(p('noexit_enabled', False).value)
+        self.noexit_pinch_m = float(p('noexit_pinch_m', 0.752).value)
+        self.noexit_short_m = float(p('noexit_short_m', 0.35).value)
+        self.noexit_retreat_m = float(p('noexit_retreat_m', 1.20).value)
+        self.noexit_turn_m = float(p('noexit_turn_m', 0.81).value)
+        self.noexit_retreat_need_m = float(p('noexit_retreat_need_m', 1.00).value)
+        self.noexit_turn_hold_m = float(p('noexit_turn_hold_m', 0.30).value)
+        # P9-S0（2026-10-27 用户批准"接触闭环三件套"）：
+        # ① 物理接触 → 取消当前目标（原来只把接触点记为候选降权，当前目标会一直往障碍里推，
+        #    实测 c3r4 贴着 Dumbbell 研磨 175 s）；
+        # ② 同一处重复接触 → 记忆时间递增（反复撞比撞一次更该避开）；
+        # ③ 接触触发的受限倒车在监督侧（escape_supervisor::contact_panic）。
+        self.contact_fail_enabled = self._as_bool(p('contact_fail_enabled', False).value)
+        self.contact_fail_max = int(p('contact_fail_max', 6).value)
+        self.contact_fail_cooldown_sec = float(p('contact_fail_cooldown_sec', 3.0).value)
+        self.contact_hits = {}
+        self._cf_count = 0
+        self._cf_last = 0.0
+        # P9-CORR（2026-10-27 用户批准机制 1/2/4，**不跨轮持久**）：
+        #   1) 计划体检授权：/plan 穿 <pass_width 的缝 → 直接取消（plan_guard_veto）
+        #   2) 走廊级记忆：把"穿窄处"的窄点记成不可通行走廊（本轮内存，命中递增 TTL）
+        #   4) 统一入口：在 on_plan 里对所有来源的 /plan 都查走廊，不只查我方候选
+        self.corridor_block_enabled = self._as_bool(p('corridor_block_enabled', True).value)
+        self.corridor_radius_m = float(p('corridor_radius_m', 0.35).value)
+        self.corridor_ttl_sec = float(p('corridor_ttl_sec', 30.0).value)
+        self.corridor_ttl_max_sec = float(p('corridor_ttl_max_sec', 180.0).value)
+        self.corridors = []        # [{x,y,r,w,exp,hits}] 仅本轮内存（用户明确不跨轮持久）
+        self._corr_last = 0.0
+        self._corr_veto_min_gap = float(p('corridor_veto_min_gap', 2.0).value)
+        self._last_path_reject = None
+        # 半径取 0.6 m："这一脚到那儿能不能转过身"，而不是"附近某处有片空地"。
+        # 取 1.2 m 时实测 3 轮里一次都没触发（房间尺度上总能找到空地），等于没生效。
+        self.return_scan_radius = float(p('return_scan_radius_m', 0.60).value)
+        self.escape_goal_enabled = self._as_bool(p('escape_goal_enabled', True).value)
+        self.escape_min_clearance = float(p('escape_min_clearance_m', 0.55).value)
+        self.escape_max_dist = float(p('escape_max_dist_m', 1.60).value)
+        self.escape_cooldown = float(p('escape_cooldown_sec', 8.0).value)
+        self.escape_max_total = int(p('escape_max_total', 20).value)
+        # P9-⑤(b)：脱困落点是否必须留出掉头空间（默认开）
+        self.escape_need_turn = bool(p('escape_need_turn', True).value)
+        self._esc_last = 0.0
+        self._esc_count = 0
+        self.corridor_stride = max(1, int(p('corridor_stride_cells', 2).value))
+        self.narrow_penalty_sec = float(p('narrow_blacklist_sec', 45.0).value)
+        # ==== 候选后验门（2026-10-27）====
+        # 现象：候选是在"当时的地图"上选的；雷达/深度相机扫到那一带后，同一位置可能
+        # 已被膨胀/占据/视觉障碍覆盖，却没有任何环节复核 → 派出去才发现过不去。
+        # 这里在下发前用**当前全局代价地图**再判一次；不通过就拒 + 进黑名单。
+        # 视觉障碍只存在于代价地图（/map 里没有），所以这一关必须看代价地图。
+        self.cost_gate = bool(p('cost_gate', False).value)
+        self.cost_gate_hard = int(p('cost_gate_hard', 99).value)
+        self.cost_gate_disc = float(p('cost_gate_disc_m', 0.35).value)
+        self.cost_gate_free_ratio = float(p('cost_gate_free_ratio', 0.80).value)
+        # ==== 方向黏性"软约束"（2026-10-27 用户决策：方向不得一票否决候选）====
+        # 车端原来的 ±80° 转角门禁把"车后/侧后、需 ~150° 掉头"的候选整片拒掉，
+        # 连拒 4 次才解锁、解锁后又去吃队列里的远点（12~15 m）→ 规划超迭代失败 →
+        # 车原地等。实测 10 轮里这样被拒 79 次（中位 151°、≤3 m 占 27%）。
+        # 这里改为：转角只作为**打分惩罚**，永不拒；并加"近处可执行优先"。
+        self.turn_pen_k = float(p('turn_penalty_k', 60.0).value)
+        self.near_first = self._as_bool(p('near_first', True).value)
+        self.near_first_r = float(p('near_first_radius_m', 3.0).value)
+        # ==== 区域新度打分（2026-10-28 用户要求：优先级看"哪片区域没探过"）====
+        # 旧口径只数目标周围 0.6 m 的未知格；改为叠加"2 m 半径未知格"作为主权重，
+        # 并对"已探明区"（2 m 内已知空闲占比 >= repeat_ff）重罚，避免车被反复送回老地方。
+        # 注意：launch 传参会被 YAML 推断类型，整数（250）与 float 声明不匹配会抛
+        # InvalidParameterTypeException 把整个仲裁器打崩（2026-10-28 实测一次）。
+        # 这里统一用容错读取：先取 value，再用 float(str(...)) 兜一层。
+        def _f(name, default):
+            try:
+                return float(p(name, default).value)
+            except Exception:                    # noqa: BLE001
+                return float(default)
+        # 修复点质量（2026-10-28 用户要求）：随机合格点若只"代价低"而综合质量差，
+        # 车容易过不去/出不来。所以修复后必须再过两关：
+        #   ① nav2 可通行先验：用仲裁器自己的 path_and_width（BFS 路径 + 沿途净宽）
+        #   ② 一般候选判据：region_complexity（esc_dirs / occ_frac_r2）与 candidate_gate
+        self.repair_verify = self._as_bool(p('cost_repair_verify', True).value)
+        self.repair_verify_tries = int(p('cost_repair_verify_tries', 3).value)
+        self.repair_tick_cap = int(p('cost_repair_tick_cap', 6).value)
+        # 校验失败的兜底：若所有采样点都过不了"可通行 + 候选判据"，仍然改投
+        # **仅过代价门**的最近点（而不是回落到否决）。依据：rp6 实测严格校验后
+        # 每轮 68~164 个候选被否决掉 ⇒ 供给被掐、等候选 16→22 s、停滞 9→15 s。
+        self.repair_fallback = self._as_bool(p('cost_repair_fallback', True).value)
+        self.novelty_w = _f('novelty_w', 0.0)
+        self.novelty_r = _f('novelty_radius_m', 2.0)
+        self.repeat_ff = _f('repeat_free_frac', 0.90)
+        self.repeat_pen = _f('repeat_penalty', 0.0)
+        self.near_first_band = _f('near_first_band', 0.10)
+        # 候选后验"修复"（2026-10-27 用户方案）：后验不合格**不再一律否决**，
+        # 而是在原候选附近随机采样，改投最近的合格点位。理由：否决会掐断供给
+        # （实测单源化后 manager 连续 93 s 无目标），修复则保留仲裁通道的主导地位
+        # （合格点仍走 /validated_frontier_goal，TTL 优先），RRT 只是兜底。
+        self.repair_on = bool(p('cost_repair', True).value)
+        self.repair_radius = float(p('cost_repair_radius_m', 1.20).value)
+        self.repair_samples = int(p('cost_repair_samples', 24).value)
+        self.repair_keep_unknown = float(p('cost_repair_keep_unknown', 0.30).value)
+        self.repair_min_unknown = int(p('cost_repair_min_unknown', 20).value)
+        # 物理接触区（撞过的地方）：强降权 + 长记忆，避免反复撞同一张桌子
+        # 陷阱记忆：撞过的地方半径放大到 2.5 m（两张桌子底座之间这种"地图上开阔、
+        # 物理上过不去"的陷阱，一次撞到就把整片圈起来），时长 300 s、罚 1500。
+        self.contact_zone_sec = float(p('contact_zone_sec', 300.0).value)
+        self.contact_zone_radius = float(p('contact_zone_radius_m', 2.5).value)
+        self.contact_zone_penalty = float(p('contact_zone_penalty', 1500.0).value)
+        # D7：把"撞过的地方"从软降权升级为**近半径内等效硬拒**（1e5 远高于主项上限 3000），
+        # 但仍是罚分而非硬 skip —— 万一所有候选都在禁区，也要能派出最不坏的那个，不许饿死。
+        self.contact_hard_radius = float(p('contact_hard_radius_m', 1.5).value)
+        self.contact_hard_penalty = float(p('contact_hard_penalty', 1e5).value)
+        # 收益函数 v2（S3+S2）：大块未知优先、碎角降权、已探完区域降权
+        self.cfg = {
+            'info_radius': float(p('info_radius', 1.0).value),
+            'block_cap': int(p('block_cap', 6000).value),
+            'block_radius': float(p('block_radius', 6.0).value),
+            'width_radius': float(p('width_radius', 1.5).value),
+            'min_width': int(p('min_frontier_width', 6).value),
+            'width_cap': int(p('width_cap', 8).value),
+            'w_block': float(p('w_block', 1.5).value),
+            'w_width': float(p('w_width', 40.0).value),
+            'w_dist': float(p('w_dist', 0.5).value),
+            'ratio_floor': float(p('ratio_floor', 0.35).value),
+            'small_frontier_factor': float(p('small_frontier_factor', 0.4).value),
+        }
+        self.retry_penalty = float(p('retry_penalty', 60.0).value)
+        self.retry_radius = float(p('retry_radius_m', 1.2).value)
+        self.retry_window = float(p('retry_window_sec', 300.0).value)
+        self.pub_history = []        # [(x, y, ts)] 已派发过的目标（用于"反复拉锯"降权）
+        self._last_plan = None       # 最近一条 /plan 的位姿序列（供后置迁移的 rollback 档）
+        # D13：区域级（1 m 网格）被拒计数 —— 同一片"陷阱区"会持续生产候选，
+        # 点级黑名单压不住，这里按区域整体降权（仍是罚分，不做硬拒）
+        self.region_sec = float(p('region_penalty_sec', 120.0).value)
+        self.region_penalty = float(p('region_penalty', 150.0).value)
+        self.region_cap = int(p('region_penalty_cap', 900).value)
+        self.region_refuse_hard = int(p('region_refuse_hard_count', 6).value)
+        self.region = {}            # (i,j) -> [ts, ...] 被拒时刻
+        self.verbose_rank = str(p('verbose_rank', True).value).lower() in ('true', '1', 'yes')
+        # 两级打分：昂贵指标只算前 N 个（候选池可能几百个）
+        self.prefilter_n = int(p('prefilter_n', 12).value)
+        # 与 manager 的 80° 转向门对齐（留 5° 余量），避免"派发了但被拒 → 原地转 → 再派发"
+        self.turn_limit_deg = float(p('turn_limit_deg', 75.0).value)
+        # D12：全部候选都在机头外时，不再"回退派发最优者"（manager 的 80° 门必拒 → 空转 5~10 s），
+        # 改为本拍不派、让 RRT 重新采样；turn_hard_skip=0 可退回旧行为。
+        self.turn_hard_skip = str(p('turn_hard_skip', 'true').value).lower() in ('true', '1', 'yes')
+        # 收益函数 v2 开关：实测在 2026-10-23 的整轮里明显退化（两轮都出现 200+ 次物理接触、
+        # 返航失败），按"出现退化先回退"的约定默认关闭；内核与离线测试保留，供后续做同种子 A/B。
+        self.scoring = str(p('scoring', 'v1').value).lower()
+        if str(p('scoring_v2', False).value).lower() in ('true', '1', 'yes'):
+            self.scoring = 'v2'
+        self.cfg3 = {
+            'cone_near': float(p('cone_near_m', 0.3).value),
+            'cone_far': float(p('cone_far_m', 3.0).value),
+            'cone_half_deg': float(p('cone_half_deg', 60.0).value),
+            'cone_cap': int(p('cone_cap', 3000).value),
+            'near_radius': float(p('near_radius', 0.6).value),
+            'near_gate': float(p('near_gate', 0.15).value),
+            'buried_factor': float(p('buried_factor', 0.25).value),
+            'w_block3': float(p('w_block3', 0.02).value),
+            # 复用 v2 已声明的参数（同一节点里重复 declare 会抛
+            # ParameterAlreadyDeclaredException —— smoke 自检 90 s 内就抓到了）
+            'block_cap': self.cfg['block_cap'],
+            'block_radius': self.cfg['block_radius'],
+            'w_dist': self.cfg['w_dist'],
+        }
+
+        self.map = None
+        self.pose = None
+        self.yaw = 0.0
+        self.cands = []          # [(x, y, ts)]
+        self._cand_cells = {}    # 1 m 网格 → (x, y, ts)：同格只留最新，抑制重复竞争
+        self.blacklist = []      # [(x, y, expire_ts)]
+        self.last_pub = 0.0
+        self.last_goal = None
+        self.pending = None
+        self.cmd = (0.0, 0.0)
+        self.mgr_busy = False
+        self.stuck_zones = []     # [(x, y, expire)]
+        self.contact_zones = []   # [(x, y, expire)] 物理撞过的位置
+        self._stuck_ref = None    # (t, x, y)
+        self.stats = {'seen': 0, 'rejected_size': 0, 'rejected_path': 0,
+                      'rejected_black': 0, 'published': 0,
+                      'rejected_narrow': 0, 'narrow_fallback': 0, 'narrow_blocked_all': 0,
+                      'reject_noexit': 0, 'noexit_passed': 0, 'noexit_checked': 0,
+                      'gate_reject': 0, 'gate_penalized': 0,
+                      'reject_cost': 0, 'cost_checked': 0, 'repair_cost': 0,
+                      'escape_zones': 0}
+
+        qmap = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
+                          durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.create_subscription(OccupancyGrid, '/map', self.on_map, qmap)
+        self.create_subscription(PointArray, '/filtered_goal_points', self.on_cands, 10)
+        self.create_subscription(Odometry, '/odom_combined', self.on_odom, 20)
+        self.create_subscription(Twist, '/cmd_vel', self.on_cmd, 20)
+        # S2：当前是否有 Nav2 活动目标（无目标时立刻给下一个候选）
+        # 车端 manager 的状态流里带 escape/blocked/retreat 等事件
+        self.create_subscription(String, '/stemm_cartographer/nav_state',
+                                 self.on_nav_state, 10)
+        self.create_subscription(GoalStatusArray, '/navigate_to_pose/_action/status',
+                                 self.on_status, 10)
+        # V2-③：planner_server 的 /plan 末位点 = 正在执行的目标
+        self.create_subscription(Path, '/plan', self.on_plan, 5)
+        self.pub = self.create_publisher(PoseStamped, '/validated_frontier_goal', 10)
+        self.costmap = None
+        self.create_subscription(OccupancyGrid, '/global_costmap/costmap', self.on_costmap, qmap)
+        # P0-3 的脱困监督会把"这里脱困失败"发过来，作为受阻区降权
+        self.create_subscription(PoseStamped, '/escape_blocked_zone', self.on_escape_zone, 10)
+        self.create_subscription(PoseStamped, '/collision_contact_zone',
+                                 self.on_contact_zone, 10)
+        # D3：视觉障碍也参与"净空/宽窄"判定（此前只用于代价地图）
+        self.vision_grid = None
+        self._vg_seq = 0
+        self._map_seq = 0
+        self._clear_key = None
+        self._clear_field = None
+        self.create_subscription(OccupancyGrid, self.vision_grid_topic,
+                                 self.on_vision_grid, qmap)
+        self.create_timer(1.0, self.tick)
+        self.get_logger().info(
+            'frontier_arbiter 就绪：可达性预筛/黑名单/最小前沿/回拉｜scoring=%s '
+            'candidate_probe=%s' % (getattr(self, 'scoring', '?'), repr(self.probe_log)))
+
+    # ---- 回调 ----
+    def on_map(self, m):
+        self.map = m
+        self._map_seq += 1
+
+    def on_vision_grid(self, m):
+        self.vision_grid = m
+        self._vg_seq += 1
+
+    def on_cmd(self, m):
+        self.cmd = (m.linear.x, m.angular.z)
+
+    def on_status(self, m):
+        busy = False
+        uu = []
+        for st in m.status_list:
+            if st.status in (1, 2, 3):      # ACCEPTED / EXECUTING / CANCELING
+                busy = True
+                if st.status == 2:          # EXECUTING —— veto 只取消这一个
+                    try:
+                        uu.append(bytes(st.goal_info.goal_id.uuid))
+                    except Exception:       # noqa: BLE001
+                        pass
+        self.mgr_busy = busy
+        self._active_uuid = uu
+
+    def on_nav_state(self, m):
+        txt_raw = m.data or ''
+        txt = txt_raw.lower()
+        # V2-③ 阶段判定：nav_state 是车端 manager 发的 JSON（见 stemm_nav2_manager.manager）
+        try:
+            o = json.loads(txt_raw)
+            if isinstance(o, dict):
+                self._nav_payload = o
+                self._nav_seen = True
+        except Exception:                    # noqa: BLE001
+            pass
+        # 只认真正处于 escape/blocked 的动作态；排除返航与 retry_recovery 这类常态字串
+        hit = ('escape_' in txt or 'blocked_' in txt or '"escape' in txt or '"blocked' in txt)
+        if hit and 'return' not in txt and 'retry_recovery' not in txt:
+            now = time.monotonic()
+            if now - getattr(self, '_last_zone', 0.0) < 5.0:
+                return
+            self._last_zone = now
+            if self.pose is not None:
+                self.stuck_zones.append(
+                    (self.pose[0], self.pose[1], time.monotonic() + self.bl_sec))
+                if len(self.stuck_zones) > 15:
+                    self.stuck_zones = self.stuck_zones[-15:]
+                self.get_logger().warn(
+                    f'受阻区记录（事件驱动 {txt[:24]}）：({self.pose[0]:.2f},{self.pose[1]:.2f})')
+
+    def on_escape_zone(self, m):
+        now = time.monotonic()
+        self.stuck_zones.append((m.pose.position.x, m.pose.position.y, now + self.bl_sec))
+        if len(self.stuck_zones) > 15:
+            self.stuck_zones = self.stuck_zones[-15:]
+        self.stats['escape_zones'] = self.stats.get('escape_zones', 0) + 1
+        self.get_logger().warn(
+            '脱困失败受阻区（监督节点上报）：(%.2f,%.2f)'
+            % (m.pose.position.x, m.pose.position.y))
+
+    def on_contact_zone(self, m):
+        x, y = float(m.pose.position.x), float(m.pose.position.y)
+        key = (round(x, 1), round(y, 1))
+        n = int(self.contact_hits.get(key, 0)) + 1
+        self.contact_hits[key] = n
+        ttl = self.contact_zone_sec * min(6, n)     # 同一处反复撞 → 记忆更久
+        self.contact_zones.append((x, y, time.monotonic() + ttl))
+        if len(self.contact_zones) > 20:
+            self.contact_zones = self.contact_zones[-20:]
+        self.stats['contact_zones'] = self.stats.get('contact_zones', 0) + 1
+        self.get_logger().warn(
+            '物理接触区记录：(%.2f,%.2f) 第 %d 次（记忆 %.0fs）；统计 %s'
+            % (x, y, n, ttl, self.stats))
+        self._maybe_fail_on_contact(x, y)
+
+    def _maybe_fail_on_contact(self, x, y):
+        """接触即失败（默认关）：物理接触时取消正在执行的目标，别让它继续往里推。
+
+        纪律边界：返航期不动（返航失败只记录不解决）；有冷却与每轮上限。
+        """
+        if not self.contact_fail_enabled:
+            return
+        pay = self._nav_payload or {}
+        blob = (str(pay.get('mode', '')) + ' ' + str(pay.get('navigation_state', ''))).lower()
+        if 'return' in blob or 'home' in blob:
+            return
+        now = time.monotonic()
+        if now - self._cf_last < self.contact_fail_cooldown_sec:
+            return
+        if self._cf_count >= self.contact_fail_max:
+            return
+        if self._do_veto_cancel():
+            self._cf_count += 1
+            self._cf_last = now
+            self.stats['contact_fail_cancel'] = self.stats.get('contact_fail_cancel', 0) + 1
+            self.get_logger().warn(
+                '物理接触 → 取消当前目标（第 %d 次）：(%.2f,%.2f）' % (self._cf_count, x, y))
+
+    def on_costmap(self, m):
+        self.costmap = m
+
+    def reachable(self, x, y):
+        """在全局代价地图上做 BFS 连通性判定（未知/致命格视为不可通行）。"""
+        cm = self.costmap
+        if cm is None or self.pose is None:
+            return True                      # 代价地图未就绪时不阻塞
+        info = cm.info
+        res = info.resolution
+        w, h = info.width, info.height
+        ox, oy = info.origin.position.x, info.origin.position.y
+        sx = int((self.pose[0] - ox) / res); sy = int((self.pose[1] - oy) / res)
+        gx = int((x - ox) / res);            gy = int((y - oy) / res)
+        if not (0 <= sx < w and 0 <= sy < h) or not (0 <= gx < w and 0 <= gy < h):
+            return False
+        data = cm.data
+        if data[gy * w + gx] < 0 or data[gy * w + gx] >= 90:
+            return False                     # 终点本身不可通行
+        from collections import deque
+        seen = bytearray(w * h)
+        q = deque([(sx, sy)])
+        seen[sy * w + sx] = 1
+        budget = 60000
+        while q and budget > 0:
+            cx, cy = q.popleft(); budget -= 1
+            if cx == gx and cy == gy:
+                return True
+            for nx, ny in ((cx+1,cy),(cx-1,cy),(cx,cy+1),(cx,cy-1)):
+                if 0 <= nx < w and 0 <= ny < h:
+                    idx = ny * w + nx
+                    if seen[idx]:
+                        continue
+                    v = data[idx]
+                    if v < 0 or v >= 90:     # 未知或致命/内切
+                        continue
+                    seen[idx] = 1
+                    q.append((nx, ny))
+        return False
+
+
+    def _note_uniq(self, kind, x, y):
+        """D5：同一 tick 里同一个候选只计一次，给出"唯一候选数"口径。"""
+        seen = getattr(self, '_tick_uniq', None)
+        if seen is None:
+            self._tick_uniq = seen = set()
+        key = (kind, round(x, 1), round(y, 1))
+        if key in seen:
+            return
+        seen.add(key)
+        k = kind + '_uniq'
+        self.stats[k] = self.stats.get(k, 0) + 1
+
+    def note_refusal(self, x, y):
+        """D13：把"这个候选被拒"记到 1 m 网格区域表里。"""
+        now = time.monotonic()
+        key = (int(math.floor(x)), int(math.floor(y)))
+        lst = self.region.setdefault(key, [])
+        lst.append(now)
+        if len(lst) > 40:
+            del lst[:-40]
+        # 顺手过期清理（限制表大小）
+        if len(self.region) > 400:
+            self.region = {k: v for k, v in self.region.items()
+                           if v and now - v[-1] < self.region_sec}
+
+    def region_penalty_of(self, x, y):
+        now = time.monotonic()
+        key = (int(math.floor(x)), int(math.floor(y)))
+        lst = [t for t in self.region.get(key, []) if now - t < self.region_sec]
+        if lst:
+            self.region[key] = lst
+        n = len(lst)
+        if n == 0:
+            return 0.0
+        pen = min(self.region_cap, self.region_penalty * n)
+        if n >= self.region_refuse_hard:
+            pen += 1e4                      # 该区域反复被拒 → 等效"最后才考虑"
+        return pen
+
+    # ---- D1/D2/D3：净空场 ----
+    def vision_occ_mask(self):
+        """视觉障碍在 **/map 栅格坐标** 下的 bool 掩码（按视觉栅格序号缓存）。"""
+        m = self.map
+        vg = self.vision_grid
+        if m is None or vg is None or not self.use_vision_obstacles:
+            return None
+        key = (self._vg_seq, self._map_seq)
+        if getattr(self, '_vis_key', None) == key:
+            return self._vis_mask
+        import numpy as np
+        info = m.info
+        w, h, res = info.width, info.height, info.resolution
+        ox, oy = info.origin.position.x, info.origin.position.y
+        mask = np.zeros((h, w), dtype=bool)
+        vr = vg.info.resolution
+        if vr > 0:
+            v = np.asarray(vg.data, dtype=np.int16).reshape(vg.info.height, vg.info.width)
+            occ = np.argwhere(v == 100)
+            if occ.size:
+                vwx = vg.info.origin.position.x + (occ[:, 1] + 0.5) * vr
+                vwy = vg.info.origin.position.y + (occ[:, 0] + 0.5) * vr
+                ci = ((vwx - ox) / res).astype(np.int32)
+                cj = ((vwy - oy) / res).astype(np.int32)
+                ok = (ci >= 0) & (ci < w) & (cj >= 0) & (cj < h)
+                if ok.any():
+                    mask[cj[ok], ci[ok]] = True
+        self._vis_key = key
+        self._vis_mask = mask
+        return mask
+
+    def clearance_field(self):
+        """返回 (dist_m, ox, oy, res, w, h, unknown) 或 None。
+
+        dist_m[i,j] = 该格到最近**障碍**的距离（米）。障碍集合 = `/map` 占据(>=50)
+        ∪ 视觉障碍栅格占据(==100)。用 scipy 的精确距离变换：
+          * D2：不再沿轴向扫法向，斜通道不会被高估（原来 ≈1.41 倍）；
+          * D3：视觉障碍（桌底座等雷达盲区）也计入；
+          * D1：配合调用方"整条路径到末端都采样"，不再跳过目标附近。
+        `unknown` 是 /map 的未知掩码，仅用于算"未知占比"。
+        缓存按 (/map 序号, 视觉栅格序号) 失效，1 Hz tick 下每轮最多重建一次。
+        """
+        m = self.map
+        if m is None:
+            return None
+        info = m.info
+        res = info.resolution
+        if res <= 0:
+            return None
+        w, h = info.width, info.height
+        ox, oy = info.origin.position.x, info.origin.position.y
+        key = (self._map_seq, self._vg_seq, w, h, round(res, 6), round(ox, 4), round(oy, 4),
+               bool(self.width_unknown_block))
+        if key == self._clear_key and self._clear_field is not None:
+            return self._clear_field
+        try:
+            import numpy as np
+            from scipy import ndimage
+        except Exception:                     # noqa: BLE001 - 没装 scipy 就退回轴向扫线
+            self._clear_key = None
+            self._clear_field = None
+            return None
+        arr = np.asarray(m.data, dtype=np.int16).reshape(h, w)
+        blocked = arr >= 50
+        unknown = arr < 0
+        if self.width_unknown_block:
+            # 未知格按障碍计（P9-D）：距离场因此把"没看清"的地方也当成走不通
+            blocked = blocked | unknown
+        vg = self.vision_grid
+        if self.use_vision_obstacles and vg is not None:
+            vr = vg.info.resolution
+            vox, voy = vg.info.origin.position.x, vg.info.origin.position.y
+            v = np.asarray(vg.data, dtype=np.int16).reshape(vg.info.height, vg.info.width)
+            occ = np.argwhere(v == 100)
+            if occ.size and vr > 0:
+                wx = vox + (occ[:, 1] + 0.5) * vr
+                wy = voy + (occ[:, 0] + 0.5) * vr
+                ci = ((wx - ox) / res).astype(np.int32)
+                cj = ((wy - oy) / res).astype(np.int32)
+                ok = (ci >= 0) & (ci < w) & (cj >= 0) & (cj < h)
+                if ok.any():
+                    blocked = blocked.copy()
+                    blocked[cj[ok], ci[ok]] = True
+        dist_cells = ndimage.distance_transform_edt(~blocked)
+        field = (dist_cells * res, ox, oy, res, w, h, unknown)
+        self._clear_key = key
+        self._clear_field = field
+        return field
+
+    def region_complexity(self, field, wx, wy):
+        """候选点周围 2 m 的"复杂度/可脱困性"（基于激光∪视觉的统一净空场）。
+
+        指标（都在 probe_radius 内）：
+          vis_occ_r2   视觉障碍格数量（激光看不到的那类复杂源）
+          narrow_r2    净空 <0.35 m 的格数（"窄/挤"的量）
+          free_r2      净空 >=0.30 m 的格数（可走动空间）
+          comp_r2      与候选点连通的自由格数（BFS，封顶 4000）—— 太小=死角
+          esc_dirs     8 个方向里能"走出去 >=probe_escape_clear_m"的方向数（0=四向皆堵）
+        """
+        import numpy as np
+        dist_m, ox, oy, res, w, h, unknown = field
+        ci = int((wx - ox) / res); cj = int((wy - oy) / res)
+        if not (0 <= ci < w and 0 <= cj < h):
+            return {}
+        k = max(1, int(self.probe_radius / res))
+        i0, i1 = max(0, ci - k), min(w, ci + k + 1)
+        j0, j1 = max(0, cj - k), min(h, cj + k + 1)
+        win = dist_m[j0:j1, i0:i1]
+        narrow = int((win < self.probe_narrow_r).sum())
+        free = int((win >= 0.30).sum())
+        # 连通域（8 邻域，自由定义 dist>=0.30）
+        free_mask = win >= 0.30
+        comp = 0
+        if free_mask.size:
+            from collections import deque
+            si, sj = ci - i0, cj - j0
+            if 0 <= si < free_mask.shape[1] and 0 <= sj < free_mask.shape[0] and free_mask[sj, si]:
+                seen = np.zeros_like(free_mask, dtype=bool)
+                seen[sj, si] = True
+                q = deque([(sj, si)]); comp = 1
+                while q and comp < 4000:
+                    y, x = q.popleft()
+                    for dy in (-1, 0, 1):
+                        for dx in (-1, 0, 1):
+                            ny, nx = y + dy, x + dx
+                            if 0 <= ny < free_mask.shape[0] and 0 <= nx < free_mask.shape[1] \
+                                    and not seen[ny, nx] and free_mask[ny, nx]:
+                                seen[ny, nx] = True; q.append((ny, nx)); comp += 1
+        # 8 方向可逃逸性：沿该方向连续 probe_escape_clear_m 都保持 >=该净空
+        esc = 0
+        step = max(1, int(0.10 / res))
+        for ang in [i * math.pi / 4.0 for i in range(8)]:
+            ok = True
+            for d in range(step, int(self.probe_escape_r / res) + 1, step):
+                x = ci + int(round(math.cos(ang) * d)); y = cj + int(round(math.sin(ang) * d))
+                if not (0 <= x < w and 0 <= y < h) or dist_m[y, x] < self.probe_narrow_r:
+                    ok = False
+                    break
+            esc += 1 if ok else 0
+        vis_occ = 0
+        vmask = self.vision_occ_mask()
+        if vmask is not None:
+            vis_occ = int(vmask[j0:j1, i0:i1].sum())
+        return {'vis_occ_r2': vis_occ, 'narrow_r2': narrow, 'free_r2': free,
+                'comp_r2': comp, 'esc_dirs': esc,
+                # 口径与 harness/analyze_candidates.py 完全一致：
+                # occ_frac_r2 = 2m 窗口内"净空<0.30m"的格占比。
+                # 之前这里没返回该键，导致 gate_adjusted_penalty 里
+                # f.get('occ_frac_r2',0.0) 永远取默认 0 → 软惩罚形同虚设。
+                'occ_frac_r2': (1.0 - free / float(win.size)) if win.size else 0.0}
+
+    def pick_safe_observation(self, cands):
+        """V2-②：从候选里挑一个"开阔、连通、离车不远"的观察点（作为保底目标）。
+
+        与闸门相反：闸门是"排除坏点"，这里是"在坏点之外找一个还能站的点"。
+        找不到就返回 None（宁可不派，也不派危险点）。
+        """
+        if not self.fallback_enabled or self.pose is None:
+            return None
+        if self._fb_count >= self.fallback_max_total:
+            return None
+        now = time.monotonic()
+        field = self.clearance_field()
+        if field is None:
+            return None
+        # 末段窗口里放宽门槛与冷却：宁可派个"还算开阔"的点，也不要让车在
+        # 探索结束那一刻处于"无目标 + 停在贴障位置"的状态（返航会被车端拒绝）。
+        min_esc = self.fallback_min_esc
+        max_dist = self.fallback_max_dist
+        cooldown = self.fallback_cooldown
+        if self.in_tail_window():
+            min_esc = min(min_esc, max(3, self.tail_min_esc - 1))
+            max_dist = max(max_dist, 2.5)
+            cooldown = min(cooldown, 4.0)
+        if now - self._fb_last < cooldown:
+            return None
+        best, best_score = None, -1e9
+        for (x, y) in cands[:max(8, self.max_cand * 2)]:
+            gx, gy = self.pull_back(x, y)
+            dist = math.hypot(gx - self.pose[0], gy - self.pose[1])
+            if dist > max_dist or dist < 0.8:
+                continue
+            try:
+                f = self.region_complexity(field, gx, gy)
+            except Exception:                      # noqa: BLE001
+                continue
+            if not f:
+                continue
+            if f['esc_dirs'] < min_esc or f['comp_r2'] < self.fallback_min_comp:
+                continue
+            # 开阔优先 + 近一点：esc_dirs 高、距离近、窄格占比低。
+            # 注意 region_complexity 返回的是 narrow_r2/free_r2（绝对格数），
+            # 直接拿绝对格数当占比会把大面积开阔区误判成"挤"，所以先换算成占比。
+            tot = f['narrow_r2'] + f['free_r2'] + 1
+            narrow_frac = f['narrow_r2'] / tot
+            sc = (f['esc_dirs'] * 10 - dist * 3 - narrow_frac * 20
+                  - f['vis_occ_r2'] * 0.05)
+            if sc > best_score:
+                best_score, best = sc, (gx, gy)
+        if best is None:
+            return None
+        self._fb_last = now
+        self._fb_count += 1
+        return best
+
+    # ===== V2-③ 后置 veto ====================================================
+    @staticmethod
+    def _as_bool(v):
+        if isinstance(v, bool):
+            return v
+        return str(v).strip().lower() in ('true', '1', 'yes', 'on')
+
+    def _explore_phase(self):
+        """现在是不是"探索期"（决定 veto 能不能动）。
+
+        保守到宁可不动作：没收到过 nav_state 就一律 false —— 车端状态流断了的时候
+        我们无从判断是不是已经在返航，此时去 cancel 就可能重演"自己人掐掉返航目标"。
+        """
+        if not self._nav_seen or self._nav_payload is None:
+            return False
+        p = self._nav_payload
+        try:
+            if p.get('mapping_done') is True:
+                return False
+            if p.get('pending_home_goal'):          # 已有返航目标在路上
+                return False
+            if int(p.get('return_home_retry_count') or 0) > 0:
+                return False
+        except Exception:                           # noqa: BLE001
+            return False
+        return True
+
+    def plan_width_profile(self, poses):
+        """沿 nav2 规划出的 /plan 逐点查净宽。
+
+        返回 (min_w, 最长窄段 m, 未知占比最大值, 最窄点序号, 最窄点世界坐标, 点数,
+        起点净宽)。2026-10-27 增补后四项：用户报"地图上有红障碍、路径却横穿"，需要区分
+        **起点就在障碍里**（车贴着障碍的假象）与**中途真的穿过障碍**（真 bug）。
+        """
+        field = self.clearance_field()
+        if field is None or not poses:
+            return None
+        res, ox_, oy_, fw_, fh_ = field[3], field[1], field[2], field[4], field[5]
+        step = max(1, int(round(0.05 / res)))
+        min_w = 9.9
+        min_i = -1
+        min_xy = None
+        first_w = None
+        oob = 0
+        narrow_len = narrow_max = 0.0
+        unk_max = 0.0
+        for i, ps in enumerate(poses):
+            if i % step:
+                continue
+            px_, py_ = float(ps.pose.position.x), float(ps.pose.position.y)
+            # 2026-10-27：**地图范围外必须跳过**。clearance_at 对越界点返回 0.0（保守设计），
+            # 而规划的目标常常指向尚未建图的 frontier —— 越界点会被当成"净宽 0 的穿障"，
+            # 把"往未知区规划"误报成"横穿障碍"（实测 v8ar1 的 5 条最差计划全属此类）。
+            ci = (px_ - ox_) / res
+            cj = (py_ - oy_) / res
+            if not (0 <= ci < fw_ and 0 <= cj < fh_):
+                oob += 1
+                continue
+            d, unk = self.clearance_at(field, px_, py_)
+            wd = 2.0 * d
+            if first_w is None:
+                first_w = wd
+            if wd < min_w:
+                min_w = wd
+                min_i = i
+                min_xy = (px_, py_)
+            if wd < self.pass_width:
+                narrow_len += 0.05
+                narrow_max = max(narrow_max, narrow_len)
+            else:
+                narrow_len = 0.0
+            if unk > 0.5:
+                unk_max = max(unk_max, unk)
+        return (min_w, narrow_max, unk_max, min_i, min_xy, len(poses),
+                -1.0 if first_w is None else first_w, oob)
+
+    def on_plan(self, m):
+        """V2-③：拿 /plan 的末位点当"正在执行的目标"，命中硬闸门就取消。
+
+        只处理"不是本节点派的"目标 —— 自己派的点在派发时已经过闸门，
+        再 veto 一次等于自己打自己，还会把派发节奏搞乱。
+        例外：P9-⑥ 的 plan_guard 对所有计划（含自己派的）做窄处体检。
+        """
+        if not m.poses:
+            return
+        # 供 veto 迁移的 rollback 档使用：保留最近一条计划的位姿序列
+        try:
+            self._last_plan = [(p.pose.position.x, p.pose.position.y) for p in m.poses]
+        except Exception:                       # noqa: BLE001
+            pass
+        if self.plan_guard_log or self.plan_guard_veto:
+            prof = self.plan_width_profile(m.poses)
+            if prof is not None:
+                (min_w, narrow_run, unk_share, min_i, min_xy, n_pts,
+                 first_w, oob) = prof
+                key = (round(min_w, 2), len(m.poses))
+                if key != self._pg_logged_plan:
+                    self._pg_logged_plan = key
+                    self.stats['plan_min_w'] = round(min_w, 2)
+                    self.stats['plan_narrow_run'] = round(narrow_run, 2)
+                    bad = (narrow_run > self.narrow_len_max) or (unk_share > 0.5)
+                    if bad:
+                        self.stats['plan_narrow_plans'] = self.stats.get('plan_narrow_plans', 0) + 1
+                    xy = ('%.2f,%.2f' % min_xy) if min_xy else '?'
+                    self.get_logger().info(
+                        '计划窄处体检：/plan %d 点，最小净宽 %.2f m@#%d(%s)，起点净宽 %.2f m，'
+                        '最长窄段 %.2f m，越界(未建图)点 %d 个'
+                        '（pass_width=%.2f / narrow_len_max=%.2f）→ %s'
+                        % (n_pts, min_w, min_i, xy, first_w, narrow_run, oob,
+                           self.pass_width, self.narrow_len_max,
+                           '穿窄处' if bad else 'OK'))
+                    if bad and (self.plan_guard_veto or self.corridor_block_enabled):
+                        if min_xy is not None:
+                            self._corridor_add(min_xy[0], min_xy[1], min_w)
+                    if bad and self.plan_guard_veto \
+                            and self._pg_cancels < self.plan_guard_max_cancel:
+                        self._pg_cancels += 1
+                        self.stats['plan_veto'] = self.stats.get('plan_veto', 0) + 1
+                        self.get_logger().warn(
+                            '✗ 计划穿窄处（最窄 %.2f m、窄段 %.2f m）→ 取消该目标；第 %d 次'
+                            % (min_w, narrow_run, self._pg_cancels))
+                        self._do_veto_cancel()
+                        return
+        # P9-CORR 机制4：**所有来源**的 /plan 都先查走廊（含车端 RRT 派发的目标），
+        # 不必等逐点体检；命中就取消，并对同一走廊做 2 s 限速，避免与 manager 拉锯。
+        if self.corridor_block_enabled and self.corridors and self._explore_phase():
+            pts = [m.poses[0].pose.position, m.poses[-1].pose.position]
+            hit = None
+            for pp in pts:
+                hit = self._corridor_hit(float(pp.x), float(pp.y))
+                if hit is not None:
+                    break
+            if hit is not None:
+                now_c = time.monotonic()
+                if now_c - self._corr_last >= self._corr_veto_min_gap \
+                        and self._pg_cancels < self.plan_guard_max_cancel + 6:
+                    if self._do_veto_cancel():
+                        self._corr_last = now_c
+                        self._pg_cancels += 1
+                        self.stats['corridor_veto'] = self.stats.get('corridor_veto', 0) + 1
+                        self.get_logger().warn(
+                            '✗ 目标落在已知不可通行走廊内（净宽 %.2f m @(%.2f,%.2f)）→ 取消'
+                            % (hit['w'], hit['x'], hit['y']))
+                        return
+        if not self.veto_enabled:
+            return
+        try:
+            pos = m.poses[-1].pose.position
+            gx, gy = float(pos.x), float(pos.y)
+        except Exception:                       # noqa: BLE001
+            return
+        self.veto_probe(gx, gy, tag='plan')
+
+    # ---------------- P9-CORR：走廊级记忆（本轮内存） ----------------
+    def _corridor_add(self, x, y, w):
+        """把"穿窄处"的窄点记成不可通行走廊；同一处重复命中则延长失效时间。"""
+        if not self.corridor_block_enabled:
+            return
+        now = time.monotonic()
+        for c in self.corridors:
+            if math.hypot(x - c['x'], y - c['y']) <= 0.6:
+                c['hits'] = int(c.get('hits', 1)) + 1
+                c['w'] = min(float(c.get('w', w)), float(w))
+                ttl = min(self.corridor_ttl_max_sec, self.corridor_ttl_sec * c['hits'])
+                c['exp'] = now + ttl
+                self.get_logger().warn(
+                    '走廊记忆更新：(%.2f,%.2f) 净宽 %.2f m，第 %d 次，记忆 %.0fs'
+                    % (c['x'], c['y'], c['w'], c['hits'], ttl))
+                return
+        self.corridors.append({'x': x, 'y': y, 'r': self.corridor_radius_m,
+                               'w': float(w), 'hits': 1,
+                               'exp': now + self.corridor_ttl_sec})
+        if len(self.corridors) > 30:
+            self.corridors = self.corridors[-30:]
+        self.get_logger().warn(
+            '走廊记忆新增：(%.2f,%.2f) 净宽 %.2f m（本轮内存，%0.f s）'
+            % (x, y, w, self.corridor_ttl_sec))
+
+    def _corridor_prune(self):
+        if not self.corridors:
+            return
+        now = time.monotonic()
+        keep = [c for c in self.corridors if c['exp'] > now]
+        if len(keep) != len(self.corridors):
+            self.corridors = keep
+            self.stats['corridors_active'] = len(keep)
+
+    def _corridor_hit(self, x, y):
+        """点是否落在某条"不可通行走廊"里（本轮内存、带 TTL）。"""
+        if not self.corridor_block_enabled or not self.corridors:
+            return None
+        now = time.monotonic()
+        for c in self.corridors:
+            if c['exp'] <= now:
+                continue
+            if math.hypot(x - c['x'], y - c['y']) <= max(c['r'], 0.3):
+                return c
+        return None
+
+    def _corridor_blocked_path(self, path, res, ox, oy, w):
+        """BFS 路径是否穿过任一条走廊（每隔 4 个点采样）。"""
+        if not self.corridor_block_enabled or not self.corridors:
+            return None
+        for i in range(0, len(path), 4):
+            idx = path[i]
+            wx = (idx % w) * res + ox
+            wy = (idx // w) * res + oy
+            c = self._corridor_hit(wx, wy)
+            if c is not None:
+                return (wx, wy, c)
+        return None
+
+    def _area_stats(self, x, y, radius):
+        """(radius) 圆内：未知格数、已知空闲占"已知格"的比例（用于候选打分口径）。"""
+        m = self.map
+        if m is None:
+            return None, None
+        info = m.info
+        res = info.resolution
+        if res <= 0:
+            return None, None
+        n = max(1, int(radius / res))
+        ci = int((x - info.origin.position.x) / res)
+        cj = int((y - info.origin.position.y) / res)
+        unk = free = occ = 0
+        for dj in range(-n, n + 1):
+            j = cj + dj
+            if not (0 <= j < info.height):
+                continue
+            base = j * info.width
+            for di in range(-n, n + 1):
+                if di * di + dj * dj > n * n:
+                    continue
+                i = ci + di
+                if not (0 <= i < info.width):
+                    continue
+                v = m.data[base + i]
+                if v < 0 or v == 205:
+                    unk += 1
+                elif v == 0:
+                    occ += 1
+                else:
+                    free += 1
+        known = free + occ
+        # 返回（未知格数, 已知格占比）。注意不要返回"已知里的空闲占比"——
+        # 一片全新的区域里 free/(free+occ) 也会是 1.0，会把它误判成"已探明"。
+        frac = round(known / float(known + unk), 3) if (known + unk) else None
+        return unk, frac
+
+    def _turn_to(self, x, y):
+        """车头朝向量与"车→候选"方向的夹角（0..π）。位姿不可用时返回 0。"""
+        if self.pose is None or len(self.pose) < 3:
+            return 0.0
+        dx, dy = x - self.pose[0], y - self.pose[1]
+        if abs(dx) < 1e-9 and abs(dy) < 1e-9:
+            return 0.0
+        want = math.atan2(dy, dx)
+        d = abs(math.atan2(math.sin(want - self.pose[2]),
+                           math.cos(want - self.pose[2])))
+        return min(d, math.pi)
+
+    def near_first_reorder(self, top, band=None):
+        """近处可执行优先（2026-10-27 用户要求 2）。
+
+        top 里若有"距车 <= near_first_r"的候选，则把它们提到最前面（按距离升序），
+        其余保持原打分顺序。依据：车就在旁边却干等 30 s，比掉头 4~7 s 贵得多。
+        """
+        if not self.near_first or self.pose is None or not top:
+            return top
+        b = self.near_first_band if band is None else band
+        best = top[0][0] if isinstance(top[0][0], (int, float)) else None
+        floor = (best * (1.0 - b)) if (best is not None and best > 0) else None
+        near, far = [], []
+        for item in top:
+            x, y = item[2], item[3]
+            d = math.hypot(x - self.pose[0], y - self.pose[1])
+            ok_band = (floor is None) or (item[0] >= floor)
+            (near if (d <= self.near_first_r and ok_band) else far).append((d, item))
+        if not near:
+            return top
+        near.sort(key=lambda t: t[0])
+        self.stats['near_first_pick'] = self.stats.get('near_first_pick', 0) + 1
+        return [it for _, it in near] + [it for _, it in far]
+
+    def _veto_ok(self, x, y):
+        """后置否决判据的反面：该点是否**合格**（用于迁移目标）。"""
+        field = self.clearance_field()
+        if field is None:
+            return False
+        try:
+            f = self.region_complexity(field, x, y)
+        except Exception:                       # noqa: BLE001
+            return False
+        if not f:
+            return False
+        if f['esc_dirs'] < self.veto_min_esc:
+            return False
+        if f['occ_frac_r2'] >= self.veto_occ_max:
+            return False
+        if self.costmap is not None and self.cost_gate_reject(x, y, None, count=False):
+            return False
+        if self.pose is not None and math.hypot(x - self.pose[0], y - self.pose[1]) < self.veto_migrate_min_move:
+            return False
+        return True
+
+    def _veto_migrate_point(self, gx, gy, mode):
+        """找一个合格的迁移落点；找不到返回 None。mode: random / rollback。"""
+        if mode == 'rollback':
+            plan = getattr(self, '_last_plan', None) or []
+            for (px, py) in reversed(plan):
+                if self._veto_ok(px, py):
+                    return px, py
+            return None
+        best = None
+        for _ in range(max(1, self.veto_migrate_samples)):
+            ang = random.uniform(0.0, 2.0 * math.pi)
+            rad = self.veto_migrate_r * math.sqrt(random.random())
+            nx, ny = gx + rad * math.cos(ang), gy + rad * math.sin(ang)
+            if not self._veto_ok(nx, ny):
+                continue
+            d = math.hypot(nx - gx, ny - gy)
+            if best is None or d < best[0]:
+                best = (d, nx, ny)
+        return (best[1], best[2]) if best else None
+
+    def veto_probe(self, gx, gy, tag=''):
+        """对一个外部目标做后置否决判定（拆出来便于离线自测）。"""
+        if not self.veto_enabled or self.pose is None:
+            return None
+        if not self._explore_phase():
+            return None
+        now = time.monotonic()
+        # 1) 自己派的点：最近 veto_self_sec 内、距离 < veto_self_r
+        for hx, hy, ts in reversed(self.pub_history[-25:]):
+            if now - ts <= self.veto_self_sec and math.hypot(gx - hx, gy - hy) < self.veto_self_r:
+                return None
+        # 2) 原点近旁（返航终点/原地观察）不碰
+        if math.hypot(gx, gy) < self.veto_home_guard:
+            return None
+        # 3) 额度与冷却
+        if self._veto_count >= self.veto_max:
+            return None
+        if now - self._veto_last < self.veto_cooldown:
+            return None
+        # 4) 同一目标 20 s 内不重复 veto（否则会跟 manager 拉锯）
+        pv = self._veto_prev
+        if pv is not None and now - pv[2] < 20.0 and math.hypot(gx - pv[0], gy - pv[1]) < 0.50:
+            return None
+        field = self.clearance_field()
+        if field is None:
+            return None
+        try:
+            f = self.region_complexity(field, gx, gy)
+        except Exception:                       # noqa: BLE001
+            return None
+        if not f:
+            return None
+        why = []
+        if f['esc_dirs'] < self.veto_min_esc:
+            why.append('esc_dirs=%d<%d' % (f['esc_dirs'], self.veto_min_esc))
+        if f['occ_frac_r2'] >= self.veto_occ_max:
+            why.append('occ=%.2f>=%.2f' % (f['occ_frac_r2'], self.veto_occ_max))
+        if not why:
+            return None
+        reason = ','.join(why)
+        # ---- 迁移优先：把落点换成一个合格点继续走，而不是停车 ----
+        if self.veto_migrate:
+            modes = [self.veto_migrate_mode] + [m for m in ('random', 'rollback')
+                                                if m != self.veto_migrate_mode]
+            for mode in modes:
+                rep = self._veto_migrate_point(gx, gy, mode)
+                if rep is None:
+                    continue
+                if not self._do_veto_cancel():
+                    continue                      # 取消不掉就别改投（否则两个目标打架）
+                self._veto_last = now
+                self._veto_prev = (gx, gy, now)
+                self._veto_count += 1
+                self.stats['veto_migrate'] = self.stats.get('veto_migrate', 0) + 1
+                self.stats['veto_migrate_' + mode] = \
+                    self.stats.get('veto_migrate_' + mode, 0) + 1
+                self.publish_goal(rep[0], rep[1], None)
+                self.get_logger().warn(
+                    'V2-③ 后置迁移（%s，%s）(%.2f,%.2f) → (%.2f,%.2f) 距离 %.2f m；'
+                    '本轮第 %d/%d 次'
+                    % (mode, reason, gx, gy, rep[0], rep[1],
+                       math.hypot(rep[0] - gx, rep[1] - gy),
+                       self._veto_count, self.veto_max))
+                return reason
+        ok = self._do_veto_cancel()
+        self._veto_last = now
+        self._veto_prev = (gx, gy, now)
+        if ok:
+            self._veto_count += 1
+            self.stats['veto'] = self.stats.get('veto', 0) + 1
+            self._veto_detail.append((round(now, 2), round(gx, 2), round(gy, 2), reason))
+            self.get_logger().warn(
+                'V2-③ 后置否决：外部目标 (%.2f,%.2f) 命中硬闸门 %s（%s）→ 已取消；'
+                '本轮第 %d/%d 次' % (gx, gy, reason, tag, self._veto_count, self.veto_max))
+        else:
+            self.get_logger().warn(
+                'V2-③ 后置否决判定命中 %s @(%.2f,%.2f)，但取消失败（无活跃目标或服务未就绪）'
+                % (reason, gx, gy))
+        return reason if ok else None
+
+    def _do_veto_cancel(self):
+        """只取消当前 EXECUTING 的那一个 goal_id（绝不用 cancel-all）。"""
+        if not self._active_uuid:
+            return False
+        try:
+            from action_msgs.srv import CancelGoal
+            from action_msgs.msg import GoalInfo
+            from unique_identifier_msgs.msg import UUID
+        except Exception:                       # noqa: BLE001
+            return False
+        cli = getattr(self, 'cancel_cli', None)
+        if cli is None:
+            try:
+                cli = self.cancel_cli = self.create_client(
+                    CancelGoal, '/navigate_to_pose/_action/cancel_goal')
+            except Exception:                   # noqa: BLE001
+                return False
+        if not cli.service_is_ready():
+            return False
+        req = CancelGoal.Request()
+        gi = GoalInfo()
+        uid = UUID()
+        uid.uuid = list(self._active_uuid[0])
+        gi.goal_id = uid
+        req.goal_info = gi
+        try:
+            cli.call_async(req)
+            return True
+        except Exception:                       # noqa: BLE001
+            return False
+
+    def turn_space_near(self, gx, gy):
+        """目标附近**最大可掉头净空**（= 2×到最近障碍的距离，单位 m）。
+
+        "可达但不可返回"的物理含义：差速车开进一条比自身对角线还窄的通道后，
+        既转不过身、又不允许长距离倒车（我们只批了 0.15 m 小步），于是**出不来**。
+        车体对角线 sqrt(0.47² + 0.66²) ≈ 0.81 m，所以这里要找一个
+        "直径 ≥ return_turn_width" 的空地。
+        """
+        field = self.clearance_field()
+        if field is None:
+            return None
+        dist_m, ox, oy, res, w, h, _unknown = field
+        ci = int((gx - ox) / res); cj = int((gy - oy) / res)
+        if not (0 <= ci < w and 0 <= cj < h):
+            return None
+        k = max(1, int(self.return_scan_radius / res))
+        i0, i1 = max(0, ci - k), min(w, ci + k + 1)
+        j0, j1 = max(0, cj - k), min(h, cj + k + 1)
+        win = dist_m[j0:j1, i0:i1]
+        if not win.size:
+            return None
+        return 2.0 * float(win.max())
+
+    def return_infeasible(self, gx, gy):
+        """返回 (是否"进得去出不来", 掉头空间)。"""
+        if not self.return_check:
+            return False, None
+        turn = self.turn_space_near(gx, gy)
+        if turn is None:
+            return False, None
+        return (turn < self.return_turn_width), turn
+
+    def pick_escape_goal(self):
+        """所有前沿候选都派不出去时，挑一个"先把车挪出去"的本地目标。
+
+        只在**车周围 escape_max_dist 内的自由格**里找，要求：
+          * 当前能到（costmap BFS，与前沿用同一套通行规则，但路径短得多）；
+          * 落点附近掉头空间 >= return_turn_width（挪过去之后能转过身）；
+          * 按"净空大、距离近"打分。
+        宁可不派也不乱派：找不到就返回 None。
+        """
+        if not self.escape_goal_enabled or self.pose is None:
+            return None
+        if self._esc_count >= self.escape_max_total:
+            return None
+        now = time.monotonic()
+        if now - self._esc_last < self.escape_cooldown:
+            return None
+        field = self.clearance_field()
+        if field is None:
+            return None
+        dist_m, ox, oy, res, w, h, _unknown = field
+        best, best_score = None, -1e9
+        r = 0.5
+        while r <= self.escape_max_dist + 1e-6:
+            for k in range(16):
+                ang = 2.0 * math.pi * k / 16.0
+                gx = self.pose[0] + math.cos(ang) * r
+                gy = self.pose[1] + math.sin(ang) * r
+                ci = int((gx - ox) / res); cj = int((gy - oy) / res)
+                if not (0 <= ci < w and 0 <= cj < h):
+                    continue
+                d_here = float(dist_m[cj, ci])
+                if 2.0 * d_here < self.escape_min_clearance:
+                    continue
+                # P9-⑤(b)：脱困目标是"挪出去"用的，落点必须**转得动身**
+                # （差速车对角线 0.81 m，掉头空间 < return_turn_width 就是换个地方继续卡）。
+                # 原来只查了净空 escape_min_clearance(0.55) < 0.85，等于没管掉头。
+                if self.escape_need_turn:
+                    turn = self.turn_space_near(gx, gy)
+                    if turn is not None and turn < self.return_turn_width:
+                        continue
+                ok, narrow, _min_w, _unk = self.path_and_width(gx, gy)
+                if not ok or narrow is not None:
+                    continue
+                sc = 2.0 * d_here - 0.6 * r
+                if sc > best_score:
+                    best_score, best = sc, (gx, gy, d_here, r)
+            r += 0.25
+        if best is None:
+            return None
+        self._esc_last = now
+        self._esc_count += 1
+        self.stats['escape_goal'] = self.stats.get('escape_goal', 0) + 1
+        self.get_logger().warn(
+            '前沿全部派不出去 → 派脱困目标 (%.2f,%.2f)（净空 %.2f m、距车 %.2f m）；第 %d 次'
+            % (best[0], best[1], best[2], best[3], self._esc_count))
+        return (best[0], best[1])
+
+    def candidate_gate(self, gx, gy):
+        """候选闸门 V1：返回 (reject_reason 或 None, features 或 None)。
+
+        只防"落点本身是死口袋/过挤"这一类（约占可治理卡死的多数）；
+        落点开阔但整片复杂、manager 自派、返航卡死不在本层范围。
+        """
+        if not self.gate_enabled:
+            return None, None
+        field = self.clearance_field()
+        if field is None:
+            return None, None
+        try:
+            f = self.region_complexity(field, gx, gy)
+        except Exception:                       # noqa: BLE001
+            return None, None
+        if not f:
+            return None, None
+        if f['esc_dirs'] < self.gate_esc_min:
+            return 'esc_dirs=%d<%d' % (f['esc_dirs'], self.gate_esc_min), f
+        if f['comp_r2'] < self.gate_comp_min:
+            return 'comp_r2=%d<%d' % (f['comp_r2'], self.gate_comp_min), f
+        return None, f
+
+    def in_tail_window(self):
+        """是否处在"探索末段"窗口（决定要不要偏置停车友好）。"""
+        if not self.tail_park_enabled or self.explore_sec <= 0.0:
+            return False
+        if self._first_pub_t is None:
+            return False
+        remain = self.explore_sec - (time.monotonic() - self._first_pub_t)
+        return 0.0 <= remain <= self.tail_sec
+
+    def tail_penalty(self, gx, gy, f=None):
+        """末段偏置：不够开阔的候选加罚（不硬拒，避免把自己饿死）。"""
+        if not self.in_tail_window():
+            return 0.0
+        if f is None:
+            field = self.clearance_field()
+            if field is None:
+                return 0.0
+            try:
+                f = self.region_complexity(field, gx, gy)
+            except Exception:                   # noqa: BLE001
+                return 0.0
+        if not f:
+            return 0.0
+        if (f.get('esc_dirs', 0) >= self.tail_min_esc
+                and f.get('occ_frac_r2', 1.0) < self.gate_occ_soft):
+            return 0.0
+        return self.tail_penalty_value
+
+    def gate_adjusted_penalty(self, f):
+        """occ 复杂度 → 罚分（不硬拒，避免误杀 esc_dirs 高的安全点）。"""
+        if not f:
+            return 0.0
+        pen = 0.0
+        if f.get('occ_frac_r2', 0.0) >= self.gate_occ_soft:
+            pen += self.gate_occ_penalty
+        esc = int(f.get('esc_dirs', 8))
+        w = self.gate_esc_weights[3] if esc == 0 else (
+            self.gate_esc_weights[2] if esc <= 2 else (
+                self.gate_esc_weights[1] if esc <= 4 else self.gate_esc_weights[0]))
+        # 把"可脱困性"折算成收益折扣：等价于扣掉 (1-w) 比例的未知收益
+        return pen + (1.0 - w) * 400.0
+
+    def write_timeline(self, extra=None):
+        """每拍落一行时间线（若配置了 timeline_log）。"""
+        if not self.timeline_log:
+            return
+        try:
+            now_wall = time.time()
+            if now_wall - self._tl_last_wall < 0.9:      # 限 1 Hz
+                return
+            self._tl_last_wall = now_wall
+            if self._tl_fh is None:
+                os.makedirs(os.path.dirname(self.timeline_log) or '.', exist_ok=True)
+                self._tl_fh = open(self.timeline_log, 'a', encoding='utf-8')
+            sim_t = None
+            try:
+                sim_t = self.get_clock().now().nanoseconds / 1e9
+            except Exception:                            # noqa: BLE001
+                pass
+            _pay = self._nav_payload or {}
+            _mp = _pay.get('pose') or {}
+            row = {
+                't': round(now_wall, 3), 'sim': None if sim_t is None else round(sim_t, 3),
+                'x': None if self.pose is None else round(self.pose[0], 3),
+                'y': None if self.pose is None else round(self.pose[1], 3),
+                'yaw': None if getattr(self, 'yaw', None) is None else round(self.yaw, 3),
+                # 2026-10-27：x/y 是 **odom 帧**（来自 /odom_combined），而目标/计划/map 都是 map 帧。
+                # 出生点不在原点时两者差一个固定偏移，事后按 x/y 筛点位会筛空（踩过一次）。
+                # 这里直接从车端 nav_state 的 pose（map 帧）再记一份，归因一律用 mx/my。
+                'mx': (round(float(_mp['x']), 3) if _mp.get('x') is not None else None),
+                'my': (round(float(_mp['y']), 3) if _mp.get('y') is not None else None),
+                'cmd': [None if self.cmd is None else round(self.cmd[0], 3),
+                        None if self.cmd is None else round(self.cmd[1], 3)],
+                'busy': bool(getattr(self, 'mgr_busy', False)),
+                'n_cands': len(getattr(self, 'cands', []) or []),
+                'mode': (self._nav_payload or {}).get('mode') if getattr(self, '_nav_payload', None) else None,
+                'nav': (self._nav_payload or {}).get('navigation_state') if getattr(self, '_nav_payload', None) else None,
+                'front': (self._nav_payload or {}).get('front_min_range') if getattr(self, '_nav_payload', None) else None,
+                'last_goal': None if self.last_goal is None else [round(self.last_goal[0], 3), round(self.last_goal[1], 3)],
+                'published': self.stats.get('published', 0),
+                'veto': self.stats.get('veto', 0),
+                'escape_goal': self.stats.get('escape_goal', 0),
+                'fallback_obs': self.stats.get('fallback_obs', 0),
+                'rejected_narrow': self.stats.get('rejected_narrow', 0),
+                'rejected_oneway': self.stats.get('rejected_oneway', 0),
+                # P9-A 观测：A 打开后必须能看到"救回多少供给 / 否决多少不可退出"
+                'contact_fail_cancel': self.stats.get('contact_fail_cancel', 0),
+                'corridor_veto': self.stats.get('corridor_veto', 0),
+                'reject_corridor': self.stats.get('reject_corridor', 0),
+                'corridors_active': len(self.corridors),
+                'reject_noexit': self.stats.get('reject_noexit', 0),
+                'noexit_passed': self.stats.get('noexit_passed', 0),
+                'noexit_checked': self.stats.get('noexit_checked', 0),
+                'pinch_len_max': self.stats.get('pinch_len_max', 0.0),
+                'reject_cost': self.stats.get('reject_cost', 0),
+                'cost_checked': self.stats.get('cost_checked', 0),
+                'repair_cost': self.stats.get('repair_cost', 0),
+            }
+            if extra:
+                row.update(extra)
+            self._tl_fh.write(json.dumps(row) + '\n')
+            self._tl_fh.flush()
+            self._tl_n += 1
+        except Exception as exc:                          # noqa: BLE001
+            try:
+                self.get_logger().warn(f'timeline 写入失败（忽略）：{type(exc).__name__}: {exc}')
+                self.timeline_log = ''
+            except Exception:                             # noqa: BLE001
+                pass
+
+    def probe_candidate(self, gx, gy, r, min_w, unk):
+        """把"本次派发的候选"的完整特征写一行 JSONL（离线统计用）。"""
+        if not self.probe_log:
+            return None
+        try:
+            field = self.clearance_field()
+            cx = self.region_complexity(field, gx, gy) if field is not None else {}
+        except Exception as exc:                       # noqa: BLE001
+            cx = {'error': f'{type(exc).__name__}: {exc}'}
+            self.get_logger().warn(f'候选探针失败（忽略）：{cx["error"]}')
+        # 2026-10-28：补"打分质量"字段（用户要求给候选打分单独一套验收指标）
+        try:
+            _u2, _k2 = self._area_stats(gx, gy, 2.0)
+        except Exception:                       # noqa: BLE001
+            _u2 = _k2 = None
+        row = {'t': round(time.time(), 3), 'goal': [round(gx, 3), round(gy, 3)],
+               'robot': [round(self.pose[0], 3), round(self.pose[1], 3)] if self.pose else None,
+               'min_w': None if min_w is None else round(float(min_w), 3),
+               'unknown': None if unk is None else unk,
+               # 2 m 半径内的未知格数 / 已知空闲占比：派发时的"区域新度"
+               'unk_2m': _u2, 'free_frac_2m': _k2,
+               'turn_deg': round(math.degrees(self._turn_to(gx, gy)), 1),
+               'dispatch_idx': self.stats.get('published', 0) + 1,
+               'dist_to_robot': (round(math.hypot(gx - self.pose[0], gy - self.pose[1]), 2)
+                                 if self.pose else None),
+               'ahead': (r or {}).get('ahead'), 'near_ratio': (r or {}).get('near_ratio'),
+               'block': (r or {}).get('block'), 'penalty': (r or {}).get('penalty'),
+               'score': (r or {}).get('score')}
+        row.update(cx or {})
+        try:
+            os.makedirs(os.path.dirname(self.probe_log) or '.', exist_ok=True)
+            with open(self.probe_log, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(row, ensure_ascii=False) + '\n')
+        except Exception:                              # noqa: BLE001
+            pass
+        return row
+
+    def clearance_at(self, field, wx, wy):
+        """世界坐标 → (到最近障碍距离 m, 未知占比 0..1)；窗口按 0.5 m 统计未知占比。"""
+        dist_m, ox, oy, res, w, h, unknown = field
+        import numpy as np
+        ci = int((wx - ox) / res)
+        cj = int((wy - oy) / res)
+        if not (0 <= ci < w and 0 <= cj < h):
+            return 0.0, 1.0
+        d = float(dist_m[cj, ci])
+        r = max(1, int(0.5 / res))
+        lo_i, hi_i = max(0, ci - r), min(w, ci + r + 1)
+        lo_j, hi_j = max(0, cj - r), min(h, cj + r + 1)
+        win = unknown[lo_j:hi_j, lo_i:hi_i]
+        tot = int(win.size) or 1
+        return d, float(int(win.sum()) / tot)
+
+    def _noexit_verdict(self, wlist, step_m):
+        """A 层：沿途 pinch 的"可退出性"判定（docs/P9 §15 重定义后的语义）。
+
+        wlist: [(宽度, 世界x, 世界y), ...] 与路径同序，索引 0 = 车这一侧。
+        返回 None = 所有 pinch 区都能退出（放行，恢复供给）；否则返回 (wx, wy) =
+        第一个"进得去出不来"的 pinch 区中点（调用方据此否决并计 reject_noexit）。
+
+        判据（任一成立即该区放行）：
+          ① 穿透跨度 <= noexit_short_m（只擦车角）；
+          ② 掉头空间：区内存在**连续** noexit_turn_hold_m 的 w >= noexit_turn_m
+             （车对角线 0.81 m；只认连续段，避免一格测量毛刺被当成凹室）；
+          ③ 回退空间：区起点向车一侧 noexit_retreat_m 窗口内，w >= pinch_m 的连续段
+             长度 >= noexit_retreat_need_m（能沿原路退出来）。
+        相邻子缝之间如果只隔很短（< noexit_turn_m 的路径长度），合并成一个区一起判 ——
+        否则"缝-凹室-缝"会被拆成两段各自判死，而这恰恰是能掉头退出的形状。
+        """
+        pinch = self.noexit_pinch_m
+        short = self.noexit_short_m
+        turn = self.noexit_turn_m
+        step = max(step_m, 1e-6)
+        back_n = max(1, int(round(self.noexit_retreat_m / step)))
+        need_n = max(2, int(round(self.noexit_retreat_need_m / step)))
+        turn_n = max(2, int(round(getattr(self, 'noexit_turn_hold_m', 0.30) / step)))
+        merge_gap_n = max(1, int(round(turn / step)))
+        n = len(wlist)
+        # ---- 1) 提取子缝 ----
+        segs = []
+        i = 0
+        while i < n:
+            if wlist[i][0] >= pinch:
+                i += 1
+                continue
+            j = i
+            while j + 1 < n and wlist[j + 1][0] < pinch:
+                j += 1
+            segs.append([i, j])
+            i = j + 1
+        # ---- 2) 合并挨得近的子缝（缝-凹室-缝）----
+        zones = []
+        for a, b in segs:
+            if zones and a - zones[-1][1] <= merge_gap_n:
+                zones[-1][1] = b
+            else:
+                zones.append([a, b])
+        # ---- 3) 逐个区判可退出性 ----
+        for a, b in zones:
+            span = (b - a + 1) * step
+            if span <= short:
+                continue                                  # ① 只擦车角
+            run = best_turn = 0
+            for k in range(a, b + 1):
+                if wlist[k][0] >= turn:
+                    run += 1
+                    best_turn = max(best_turn, run)
+                else:
+                    run = 0
+            if best_turn >= turn_n:
+                continue                                  # ② 区内能掉头
+            run = best_ret = 0
+            for k in range(max(0, a - back_n), a):
+                if wlist[k][0] >= pinch:
+                    run += 1
+                    best_ret = max(best_ret, run)
+                else:
+                    run = 0
+            if best_ret >= need_n:
+                continue                                  # ③ 能沿原路退出
+            self.stats['pinch_len_max'] = round(
+                max(self.stats.get('pinch_len_max', 0.0), span), 2)
+            m = (a + b) // 2
+            return (wlist[m][1], wlist[m][2])
+        return None
+
+    def path_and_width(self, x, y):
+        """BFS 出整条路径，再沿路径查"垂直于路径的连续自由宽度"。
+
+        返回 (reachable, narrow_at, min_width, unknown_share)。
+        narrow_at 为走廊宽度不足处坐标；min_width 为路径实测最小净宽（未知格按半宽计），
+        unknown_share 为该处的未知占比（用来判断"看着宽其实是没探到"）。
+        判据：路径上任一点，垂直方向上连续自由格（<90 且已知）的总长必须 >= corridor_width，
+        以免把目标派到"必须挤过窄缝"的地方 —— 这正是反复楔死的来源。
+        """
+        cm = self.costmap
+        if cm is None or self.pose is None:
+            return True, None, None, 0.0
+        info = cm.info
+        res = info.resolution
+        if res <= 0:
+            return True, None, None, 0.0
+        w, h = info.width, info.height
+        ox, oy = info.origin.position.x, info.origin.position.y
+        data = cm.data
+        sx = int((self.pose[0] - ox) / res)
+        sy = int((self.pose[1] - oy) / res)
+        gx = int((x - ox) / res)
+        gy = int((y - oy) / res)
+        if not (0 <= sx < w and 0 <= sy < h) or not (0 <= gx < w and 0 <= gy < h):
+            return False, None, None, 0.0
+        if data[gy * w + gx] < 0 or data[gy * w + gx] >= 90:
+            return False, None, None, 0.0
+        # P9-⑦：allow_unknown:false 时，落点必须落在**已知自由**的 /map 格里
+        # （nav2 不会再"跨未知区"到目标；落点在未知里必然规划失败）
+        if self.unknown_block and self.map is not None:
+            occ = self.map
+            ores2 = occ.info.resolution
+            oox2, ooy2 = occ.info.origin.position.x, occ.info.origin.position.y
+            mi = int((x - oox2) / ores2)
+            mj = int((y - ooy2) / ores2)
+            if not (0 <= mi < occ.info.width and 0 <= mj < occ.info.height):
+                return False, None, None, 0.0
+            mv = occ.data[mj * occ.info.width + mi]
+            if mv < 0 or mv >= 50:
+                return False, None, None, 0.0
+        from collections import deque
+        parent = {}
+        seen = bytearray(w * h)
+        start = sy * w + sx
+        seen[start] = 1
+        q = deque([(sx, sy)])
+        budget = max(80000, w * h * 2)     # D11：预算随地图面积走，避免远处目标被误判不可达
+        found = False
+        while q and budget > 0:
+            cx, cy = q.popleft(); budget -= 1
+            if cx == gx and cy == gy:
+                found = True
+                break
+            for nx, ny in ((cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1)):
+                if 0 <= nx < w and 0 <= ny < h:
+                    idx = ny * w + nx
+                    if seen[idx]:
+                        continue
+                    v = data[idx]
+                    if v < 0 or v >= 90:
+                        continue
+                    seen[idx] = 1
+                    parent[idx] = cy * w + cx
+                    q.append((nx, ny))
+        if not found:
+            return False, None, None, 0.0
+        if not self.corridor_check:
+            return True, None, None, 0.0
+        # 回溯路径
+        path = []
+        cur = gy * w + gx
+        while cur != start:
+            path.append(cur)
+            cur = parent.get(cur)
+            if cur is None:
+                break
+        path.reverse()
+        # 宽度判据换到 /map（占据栅格：>=50 才是障碍，-1 未知按可通行算）。
+        # 用 costmap 会踩膨胀层的坑：值 <90 的格已经是"离障碍 >=0.52 m"，
+        # 直接按净宽读会把 1.05 m 的通道误判成窄缝。
+        occ = self.map
+        if occ is None:
+            return True, None, None, 0.0
+        ores = occ.info.resolution
+        ow, oh = occ.info.width, occ.info.height
+        oox, ooy = occ.info.origin.position.x, occ.info.origin.position.y
+        odata = occ.data
+
+        def map_val(mx, my):
+            if mx < 0 or my < 0 or mx >= ow or my >= oh:
+                return 100
+            return odata[my * ow + mx]
+
+        # P9-CORR：路径穿过已知"不可通行走廊" → 直接否决（机制2 的消费端）
+        self._corridor_prune()
+        if self.corridor_block_enabled and self.corridors:
+            blk = self._corridor_blocked_path(path, res, ox, oy, w)
+            if blk is not None:
+                self.stats['reject_corridor'] = self.stats.get('reject_corridor', 0) + 1
+                self._note_uniq('reject_corridor', blk[0], blk[1])
+                self._last_path_reject = 'corridor'
+                return True, (blk[0], blk[1]), None, 0.0
+        # ---- D1/D2/D3：优先用"到最近障碍的距离场"（含视觉障碍，且整条路径到末端都查）----
+        field = self.clearance_field() if self.clearance_mode == 'distance' else None
+        if field is not None:
+            # 逐格扫描（不再 stride 跳点：跳点会漏掉只有一两格宽的"勉强能过"的坎）
+            idxs = list(range(len(path)))
+            if len(idxs) > 4000:               # 极端长路径上限保护
+                idxs = idxs[:2000] + idxs[-2000:]
+            min_w = float('inf')
+            min_unk = 0.0
+            min_at = None
+            narrow_len = 0.0
+            narrow_len_max_run = 0.0
+            unknown_run = 0.0
+            unknown_run_max = 0.0
+            step_m = res
+            wlist = []          # A 层用：与路径同序的 (宽度, 世界x, 世界y)
+            for i in idxs:
+                idx = path[i]
+                cx_, cy_ = idx % w, idx // w
+                wxp_ = cx_ * res + ox
+                wyp_ = cy_ * res + oy
+                d, unk_ = self.clearance_at(field, wxp_, wyp_)
+                width_ = 2.0 * d                    # 自由带宽 ≈ 2×到最近障碍的距离
+                wlist.append((width_, wxp_, wyp_))
+                if width_ < min_w:
+                    min_w, min_unk, min_at = width_, unk_, (wxp_, wyp_)
+                if width_ < self.pass_width:
+                    narrow_len += step_m
+                    narrow_len_max_run = max(narrow_len_max_run, narrow_len)
+                else:
+                    narrow_len = 0.0
+                # 未知占比高 = 这一段其实"没看清"，按障碍算；只允许短跨度
+                if unk_ > 0.5:
+                    unknown_run += step_m
+                    unknown_run_max = max(unknown_run_max, unknown_run)
+                else:
+                    unknown_run = 0.0
+            self.stats['pass_narrow_len_max'] = round(
+                max(self.stats.get('pass_narrow_len_max', 0.0), narrow_len_max_run), 2)
+            self.stats['pass_unknown_max'] = round(
+                max(self.stats.get('pass_unknown_max', 0.0), unknown_run_max), 2)
+            if min_at is None:
+                self._last_path_reject = None
+                return True, None, None, 0.0
+            if narrow_len_max_run > self.narrow_len_max and not self.noexit_enabled:
+                self._last_path_reject = 'narrow'
+                return True, min_at, min_w, min_unk      # 窄段太长 → 否决
+            if unknown_run_max > self.unknown_span_max:
+                self._last_path_reject = 'unknown'
+                return True, min_at, min_w, min_unk      # 未知段太长 → 否决
+            if min_w < self.pass_width:
+                # A 层（noexit_enabled）：pass_width 只做"上限"，真正的判据是"能不能退出"。
+                # 采样点不连续（超长路径截断）时放弃 A，退回原判据，避免把长度算错。
+                contiguous = (len(wlist) == len(path))
+                if self.noexit_enabled and contiguous and min_w >= self.noexit_pinch_m:
+                    self.stats['noexit_checked'] = self.stats.get('noexit_checked', 0) + 1
+                    bad_at = self._noexit_verdict(wlist, step_m)
+                    if bad_at is None:
+                        self.stats['noexit_passed'] = self.stats.get('noexit_passed', 0) + 1
+                        self._last_path_reject = None
+                        return True, None, min_w, min_unk   # 能退出 → 放行（恢复供给）
+                    self._last_path_reject = 'noexit'
+                    return True, bad_at, min_w, min_unk
+                self._last_path_reject = 'narrow'
+                return True, min_at, min_w, min_unk
+            self._last_path_reject = None
+            return True, None, min_w, min_unk
+
+        need = self.corridor_width
+        skip = int(self.corridor_skip_far / res)
+        half = int(need / ores / 2) + 1
+        min_w = float('inf')       # 路径上实测最小净宽（未知格按半宽计）
+        min_unk = 0.0              # 取到最小宽度处的未知占比
+        min_at = None
+        for i in range(0, max(0, len(path) - skip), self.corridor_stride):
+            idx = path[i]
+            cx, cy = idx % w, idx // w
+            # 用父节点方向求切向，再取垂直方向
+            par = parent.get(idx)
+            if par is None:
+                tx, ty = 1, 0
+            else:
+                tx, ty = cx - par % w, cy - par // w
+            n = math.hypot(tx, ty) or 1.0
+            px, py = -ty / n, tx / n        # 垂直方向
+            # 路径格坐标（costmap 系）→ /map 格坐标，两者分辨率可能不同
+            wxp = cx * res + ox
+            wyp = cy * res + oy
+            mcx = int((wxp - oox) / ores)
+            mcy = int((wyp - ooy) / ores)
+            if half * ores > 2.0:              # 分辨率异常时保护
+                half = int(2.0 / ores)
+            # 逐格扫：免费格按 1 计、未知格按 0.5 计（2026-10-23：原来把未知当自由，
+            # 门洞半米没探到就以为"1.05 m 宽"，车开进去才发现只有 0.9 m）
+            def scan(sign):
+                known = 0.0
+                unk = 0.0
+                k = 1
+                while k <= half:
+                    mx = int(round(mcx + sign * px * k)); my = int(round(mcy + sign * py * k))
+                    v = map_val(mx, my)
+                    if v >= 50:
+                        break
+                    if v < 0:
+                        unk += 1.0
+                        if unk > 0.5 * half:      # 未知太多就不再看更远
+                            break
+                    else:
+                        known += 1.0
+                    k += 1
+                return known, unk
+
+            klo, ulo = scan(+1)
+            khi, uhi = scan(-1)
+            n_cells = klo + khi + 1.0
+            n_unk = ulo + uhi
+            width = (n_cells - 0.5 * n_unk) * ores
+            if width < min_w:
+                min_w = width
+                min_unk = n_unk / max(1.0, n_cells)
+                min_at = (wxp, wyp)
+        if min_at is None:
+            return True, None, None, 0.0
+        if min_w < need:
+            return True, min_at, min_w, min_unk
+        return True, None, min_w, min_unk
+
+    def on_odom(self, m):
+        q = m.pose.pose.position
+        o = m.pose.pose.orientation
+        self.pose = (q.x, q.y)
+        self.yaw = math.atan2(2.0 * (o.w * o.z + o.x * o.y),
+                              1.0 - 2.0 * (o.y * o.y + o.z * o.z))
+
+    def on_cands(self, m):
+        now = time.monotonic()
+        cells = self._cand_cells
+        for pt in m.points:
+            key = (int(math.floor(pt.x)), int(math.floor(pt.y)))
+            cells[key] = (pt.x, pt.y, now)       # 同格覆盖 ⇒ 只留最新采样
+        self.stats['seen'] += len(m.points)
+        # 过期清理 + 容量限制（按时间保留最新的 cand_pool 个）
+        fresh = [(k, v) for k, v in cells.items() if now - v[2] <= self.cand_max_age]
+        if len(fresh) > self.cand_pool:
+            fresh.sort(key=lambda kv: kv[1][2], reverse=True)
+            fresh = fresh[:self.cand_pool]
+            self._cand_cells = dict(fresh)
+        else:
+            self._cand_cells = dict(fresh)
+        self.cands = list(self._cand_cells.values())
+
+    # ---- 工具 ----
+    def unknown_cells(self, x, y):
+        m = self.map
+        if m is None:
+            return 0
+        info = m.info
+        r = int(self.radius / info.resolution)
+        cx = int((x - info.origin.position.x) / info.resolution)
+        cy = int((y - info.origin.position.y) / info.resolution)
+        n = 0
+        for j in range(max(0, cy - r), min(info.height, cy + r + 1)):
+            base = j * info.width
+            for i in range(max(0, cx - r), min(info.width, cx + r + 1)):
+                if m.data[base + i] < 0:
+                    n += 1
+        return n
+
+    def blacklisted(self, x, y, now):
+        self.blacklist = [b for b in self.blacklist if b[2] > now]
+        if len(self.blacklist) > 40:                 # 限容量，最旧的先丢
+            self.blacklist = self.blacklist[-40:]
+        return any(math.hypot(x - b[0], y - b[1]) < self.bl_r for b in self.blacklist)
+
+    # ================= 候选后验门（2026-10-27）=================
+    def cost_at(self, x, y):
+        """当前全局代价地图在 (x,y) 的代价；越界/未就绪返回 None。"""
+        cm = self.costmap
+        if cm is None:
+            return None
+        info = cm.info
+        res = info.resolution
+        if res <= 0:
+            return None
+        i = int((x - info.origin.position.x) / res)
+        j = int((y - info.origin.position.y) / res)
+        if not (0 <= i < info.width and 0 <= j < info.height):
+            return None
+        return cm.data[j * info.width + i]
+
+    def _map_known_free_ratio(self, x, y):
+        """(x,y) 单格在 /map 上的状态：'free' / 'occ' / 'unk'。"""
+        m = self.map
+        if m is None:
+            return None
+        info = m.info
+        i = int((x - info.origin.position.x) / info.resolution)
+        j = int((y - info.origin.position.y) / info.resolution)
+        if not (0 <= i < info.width and 0 <= j < info.height):
+            return None
+        v = m.data[j * info.width + i]
+        if v < 0:
+            return 'unk'
+        return 'free' if v < 50 else 'occ'
+
+    def cost_gate_reject(self, x, y, now, count=True):
+        """候选后验：用**当前**全局代价地图复核落点。返回 None=通过，否则返回原因串。
+
+        三项判据（任一不过就拒）：
+          1) 落点格代价 < cost_gate_hard（默认 99，即致命/内切一律不可派发）；
+          2) cost_gate_disc 半径圆盘内没有致命格（车体+余量，默认 0.35 m）；
+          3) 圆盘内 /map 已知空闲比例 >= cost_gate_free_ratio（默认 0.8），
+             挡"孤岛自由格"——落点本身空闲、四周全是未知/占据。
+        代价地图未就绪时不阻塞（与 reachable() 同口径）；cost_gate 默认关。
+        """
+        if not self.cost_gate:
+            return None
+        cm = self.costmap
+        if cm is None:
+            return None
+        if count:
+            self.stats['cost_checked'] = self.stats.get('cost_checked', 0) + 1
+        v0 = self.cost_at(x, y)
+        if v0 is None:
+            return 'out_of_costmap'
+        if v0 >= self.cost_gate_hard:
+            return 'goal_cost=%d' % v0
+        res = cm.info.resolution
+        n = max(1, int(self.cost_gate_disc / res))
+        lethal = 0
+        free = occ = 0
+        for dj in range(-n, n + 1):
+            for di in range(-n, n + 1):
+                if di * di + dj * dj > n * n:
+                    continue
+                px, py = x + di * res, y + dj * res
+                v = self.cost_at(px, py)
+                if v is not None and v >= self.cost_gate_hard:
+                    lethal += 1
+                st = self._map_known_free_ratio(px, py)
+                if st == 'free':
+                    free += 1
+                elif st == 'occ':
+                    occ += 1
+        if lethal > 0:
+            return 'lethal_in_disc=%d' % lethal
+        # 注意：**未知格不算否决**。探索候选天生贴着未知边界，把未知计入分母会把
+        # 正常候选全毙掉（实测 666/744 次否决都来自这一条，属于判据写错）。
+        # 这里只要求"已知部分里空闲占比达标"，即盘内不得有已知占据。
+        if free + occ > 0 and (free / float(free + occ)) < self.cost_gate_free_ratio:
+            return 'occ_ratio=%.2f' % (occ / float(free + occ))
+        return None
+
+    def cost_repair_point(self, x, y, u_orig, now):
+        """后验修复：在原候选附近随机采样，返回**最近的合格点位**；找不到返回 None。
+
+        判据（全部通过才算合格）：
+          * cost_gate_reject 通过（落点代价、盘内致命格、盘内已知占据占比）；
+          * 附近的未知格数 >= max(repair_min_unknown, keep_unknown × 原候选未知数)
+            —— 否则修复点只是把车送进已探索区，失去探索意义；
+          * 与原候选的最短距离（在 radius 内随机取点，取最近者）。
+        """
+        if not (self.repair_on and self.cost_gate):
+            return None
+        if self.costmap is None:
+            return None
+        need = max(self.repair_min_unknown, int(round(self.repair_keep_unknown * u_orig)))
+        cand = []
+        for _ in range(max(1, self.repair_samples)):
+            ang = random.uniform(0.0, 2.0 * math.pi)
+            rad = self.repair_radius * math.sqrt(random.random())
+            nx = x + rad * math.cos(ang)
+            ny = y + rad * math.sin(ang)
+            if self.cost_gate_reject(nx, ny, now, count=False) is not None:
+                continue
+            if self.unknown_cells(nx, ny) < need:
+                continue
+            cand.append((math.hypot(nx - x, ny - y), nx, ny))
+        if not cand:
+            return None
+        cand.sort()
+        if not self.repair_verify:
+            return cand[0][1], cand[0][2]
+        # 按距离从近到远逐个做"综合质量"验证，取第一个通过者
+        if getattr(self, '_repair_tick_n', 0) >= self.repair_tick_cap:
+            self.stats['repair_tick_capped'] = self.stats.get('repair_tick_capped', 0) + 1
+            return cand[0][1], cand[0][2]
+        for (_d, nx, ny) in cand[:max(1, self.repair_verify_tries)]:
+            self._repair_tick_n = getattr(self, '_repair_tick_n', 0) + 1
+            # ① nav2 可通行先验：BFS 路径可达 + 沿途最小净宽
+            try:
+                ok, narrow, min_w, _unk = self.path_and_width(nx, ny)
+            except Exception:                   # noqa: BLE001
+                ok, narrow, min_w = False, None, None
+            if not ok or narrow is not None:
+                self.stats['repair_plan_fail'] = self.stats.get('repair_plan_fail', 0) + 1
+                continue
+            # ② 一般候选判据（与候选闸门同一套区域复杂度）
+            try:
+                _reason, _f = self.candidate_gate(nx, ny)
+            except Exception:                   # noqa: BLE001
+                _reason, _f = None, None
+            if _reason:
+                self.stats['repair_gate_fail'] = self.stats.get('repair_gate_fail', 0) + 1
+                continue
+            self.stats['repair_verified'] = self.stats.get('repair_verified', 0) + 1
+            return nx, ny
+        if self.repair_fallback:
+            self.stats['repair_fallback'] = self.stats.get('repair_fallback', 0) + 1
+            return cand[0][1], cand[0][2]
+        return None
+
+    def pull_back(self, x, y):
+        if self.pose is None or self.pullback <= 0:
+            return self.snap_known_free(x, y)
+        dx, dy = self.pose[0] - x, self.pose[1] - y
+        d = math.hypot(dx, dy)
+        if d < 1e-6:
+            return self.snap_known_free(x, y)
+        k = min(self.pullback, d * 0.5) / d
+        return self.snap_known_free(x + dx * k, y + dy * k)
+
+    def snap_known_free(self, x, y, max_r_m=0.35):
+        """D9：回拉点若落进未知/占据格，吸附到最近"已知自由"格（螺旋搜索 ≤0.35 m）。
+
+        原因：BFS 把未知当不可通行，回拉点落在未知里会让候选直接被判"不可达"
+        （实测 rejected_path 131–494/轮）。找不到就原样返回，不改变语义。
+        """
+        m = self.map
+        if m is None:
+            return x, y
+        info = m.info
+        res = info.resolution
+        if res <= 0:
+            return x, y
+        w, h = info.width, info.height
+        ox, oy = info.origin.position.x, info.origin.position.y
+        ci = int((x - ox) / res)
+        cj = int((y - oy) / res)
+
+        def known_free(i, j):
+            if not (0 <= i < w and 0 <= j < h):
+                return False
+            v = m.data[j * w + i]
+            return 0 <= v < 50
+
+        if known_free(ci, cj):
+            return x, y
+        rmax = max(1, int(max_r_m / res))
+        for r in range(1, rmax + 1):
+            best = None
+            for dj in range(-r, r + 1):
+                for di in range(-r, r + 1):
+                    if max(abs(di), abs(dj)) != r:
+                        continue
+                    if known_free(ci + di, cj + dj):
+                        d2 = di * di + dj * dj
+                        if best is None or d2 < best[0]:
+                            best = (d2, ci + di, cj + dj)
+            if best is not None:
+                return (ox + (best[1] + 0.5) * res, oy + (best[2] + 0.5) * res)
+        return x, y
+
+    def reachable_async(self, x, y):
+        """异步可达性校验：返回 future 或 None（不可用/已有在途请求）"""
+        if self.pending is not None:
+            return None
+        if getattr(self, 'cli', None) is None:      # 服务客户端从未创建（历史遗留），直接放弃
+            return
+        if not self.cli.service_is_ready():
+            if not self.cli.wait_for_service(timeout_sec=0.2):
+                return None
+        req = ComputePathToPose.Request()
+        req.goal = PoseStamped()
+        req.goal.header.frame_id = self.frame
+        req.goal.header.stamp = self.get_clock().now().to_msg()
+        req.goal.pose.position.x, req.goal.pose.position.y = x, y
+        req.goal.pose.orientation.w = 1.0
+        req.use_start = False
+        fut = self.cli.call_async(req)
+        self.pending = (fut, x, y)
+        return fut
+
+    # ---- 主循环 ----
+    def _update_stuck(self, now):
+        """S3：有速度指令但位移几乎为 0 → 记为受阻区（60 s 衰减）"""
+        if self.pose is None:
+            return
+        moving_cmd = abs(self.cmd[0]) > 0.05 or abs(self.cmd[1]) > 0.05
+        if not moving_cmd:
+            self._stuck_ref = None
+            return
+        if self._stuck_ref is None:
+            self._stuck_ref = (now, self.pose[0], self.pose[1])
+            return
+        t0, x0, y0 = self._stuck_ref
+        if now - t0 >= 2.0:
+            if math.hypot(self.pose[0] - x0, self.pose[1] - y0) < 0.01:
+                self.stuck_zones.append((self.pose[0], self.pose[1], now + self.bl_sec))
+                self.get_logger().warn(
+                    f'受阻区记录：({self.pose[0]:.2f},{self.pose[1]:.2f}) 持续 {now-t0:.1f}s 无位移')
+            self._stuck_ref = (now, self.pose[0], self.pose[1])
+        self.stuck_zones = [z for z in self.stuck_zones if z[2] > now]
+
+    # ---------------- P9-L1：「确定过不去」判定 ----------------
+    def _ff_state(self):
+        """从 manager 的 nav_state JSON 里取 (front_min_range, nav, mode)。"""
+        o = getattr(self, '_nav_payload', None) or {}
+        front = o.get('front_min_range')
+        try:
+            front = float(front) if front is not None else None
+        except (TypeError, ValueError):
+            front = None
+        nav = str(o.get('navigation_state') or '').lower()
+        mode = str(o.get('mode') or '').lower()
+        return front, nav, mode
+
+    def _update_failfast(self, now):
+        """滑窗判「确定过不去」；确认后取消目标 + 拉黑该点 + 标记本轮禁入区。
+
+        判据（离线标定，见 harness/analyze_failfast.py 与 docs/P9）：
+          1) 窗口内位姿包围盒对角线 <= ff_drift（同一小范围）
+          2) 净空证据：front_min_range < ff_front  或  nav 处于 blocked_*
+          3) 非"等"状态：mode/nav 不在 waiting/arrived/canceled 一类
+        连续满足 >= ff_window 秒算一次命中；同一 2 m 内 ff_ttl 秒内有 ff_confirm 次命中
+        才真正动手（避免把正常探索的短暂停顿当成过不去）。
+        """
+        if not self.failfast_enabled or self.pose is None:
+            return
+        self._ff_hist.append((now, self.pose[0], self.pose[1]))
+        while self._ff_hist and now - self._ff_hist[0][0] > self.ff_window * 1.5:
+            self._ff_hist.popleft()
+        win = [h for h in self._ff_hist if now - h[0] <= self.ff_window]
+        if len(win) < 5 or (win[-1][0] - win[0][0]) < self.ff_window * 0.8:
+            return
+        xs = [w[1] for w in win]
+        ys = [w[2] for w in win]
+        drift = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
+        if drift > self.ff_drift:
+            self._ff_stuck_since = None
+            return
+        front, nav, mode = self._ff_state()
+        blocked = ('blocked_' in nav) or ('blocked_' in mode)
+        # L1-b（2026-10-26 补）：车端自己进入 blocked_waiting_clearance 超过
+        # ff_blocked_sec（默认 15 s）也算"确定过不去"——实测 76 s / 125 s 那两次长停滞
+        # 就属于这一类（front 未进 0.60 m，旧判据漏检）。
+        if blocked:
+            if self._ff_blocked_since is None:
+                self._ff_blocked_since = now
+            if now - self._ff_blocked_since >= self.ff_blocked_sec:
+                clear = True
+            else:
+                clear = (front is not None and front < self.ff_front)
+        else:
+            self._ff_blocked_since = None
+            clear = front is not None and front < self.ff_front
+        waiting = any(w in nav for w in FF_WAIT_WORDS) or any(w in mode for w in FF_WAIT_WORDS)
+        if not clear or waiting:
+            self._ff_stuck_since = None
+            return
+        if self._ff_stuck_since is None:
+            self._ff_stuck_since = now
+            return
+        # 已连续满足 ff_window 秒 → 记一次命中（10 s 内不重复记账）
+        if now - self._ff_stuck_since < self.ff_window:
+            return
+        if self._ff_hits and now - self._ff_hits[-1][0] < 10.0:
+            return
+        x, y = self.pose[0], self.pose[1]
+        self._ff_hits.append((now, x, y))
+        self.stats['failfast_hit'] = self.stats.get('failfast_hit', 0) + 1
+        near = [h for h in self._ff_hits
+                if now - h[0] <= self.ff_ttl
+                and math.hypot(h[1] - x, h[2] - y) <= self.ff_zone_radius]
+        self.get_logger().warn(
+            'L1 判定：在 (%.2f,%.2f) 已 %.0f s 同一小范围（漂移 %.2f m、front=%s、nav=%s），'
+            '同区命中 %d/%d 次'
+            % (x, y, now - self._ff_stuck_since, drift,
+               ('%.2f' % front) if front is not None else 'n/a', nav or mode or 'n/a',
+               len(near), self.ff_confirm))
+        if len(near) < self.ff_confirm:
+            return
+        if self._ff_actions >= self.ff_max_actions:
+            return
+        if now - self._ff_last_action < 15.0:
+            return
+        # ---- L2 动作：取消 → 拉黑 → 立即允许重派（同拍换目标）----
+        span = near[-1][0] - near[0][0]
+        hard = (len(near) >= self.ff_confirm + 1) or (span >= self.ff_escalate_sec)
+        self._ff_actions += 1
+        self._ff_last_action = now
+        self.stats['failfast_action'] = self.stats.get('failfast_action', 0) + 1
+        self.blacklist.append((x, y, now + self.ff_ttl))
+        self.stuck_zones.append((x, y, now + self.ff_ttl))
+        if hard:
+            self._ff_hard.append((x, y, now + self.ff_ttl))
+            cells = self._ff_flood(x, y, now)
+            self.stats['failfast_zone_cells'] = len(self._ff_cells)
+            self.get_logger().warn(
+                'L2 升级：把这一整块自由连通域（%d 格，半径 %.1f m）记为本轮禁入区' % (cells, self.ff_comp_radius))
+            self.stats['failfast_hardzone'] = self.stats.get('failfast_hardzone', 0) + 1
+        cancelled = self._do_veto_cancel()
+        self.last_pub = 0.0          # 关键：允许下一拍立刻派别的目标（等于"报告失败并换目标"）
+        self.get_logger().warn(
+            '✗ L2 判失败：位置 (%.2f,%.2f) 判定过不去（同区命中 %d 次、跨度 %.0f s）→ '
+            '取消目标=%s、拉黑 %.0f s%s；第 %d 次'
+            % (x, y, len(near), span, '是' if cancelled else '否(无活跃目标)',
+               self.ff_ttl, '、并升级为本轮禁入区' if hard else '', self._ff_actions))
+        self._ff_hits = [h for h in self._ff_hits if now - h[0] <= self.ff_ttl]
+
+    def _ff_flood(self, x, y, now):
+        """从 (x,y) 出发在 /map 的自由格上做 flood fill，把这一整块"死角"记成本轮禁入区。
+
+        只填自由格（/map < 50），半径上限 ff_comp_radius（默认 6 m），
+        这样"同一死角换到另一侧前沿"也会被挡住。
+        """
+        occ = self.map
+        if occ is None:
+            return 0
+        ores = occ.info.resolution
+        ow, oh = occ.info.width, occ.info.height
+        oox, ooy = occ.info.origin.position.x, occ.info.origin.position.y
+        data = occ.data
+        ci = int((x - oox) / ores)
+        cj = int((y - ooy) / ores)
+        if not (0 <= ci < ow and 0 <= cj < oh):
+            return 0
+        rmax = int(self.ff_comp_radius / ores)
+        rad2 = rmax * rmax
+        seen = set()
+        dq = deque([(ci, cj)])
+        n = 0
+        until = now + self.ff_ttl
+        while dq and n < 20000:
+            i, j = dq.popleft()
+            if (i, j) in seen:
+                continue
+            if (i - ci) ** 2 + (j - cj) ** 2 > rad2:
+                continue
+            if not (0 <= i < ow and 0 <= j < oh):
+                continue
+            v = data[j * ow + i]
+            if v >= 50 or v < 0:          # 障碍/未知：不扩
+                continue
+            seen.add((i, j))
+            self._ff_cells[(i, j)] = until
+            n += 1
+            dq.extend(((i + 1, j), (i - 1, j), (i, j + 1), (i, j - 1)))
+        return n
+
+    def failfast_blocked(self, x, y, now):
+        """候选是否落在"本轮禁入区"内（L2 升级后的硬过滤）。"""
+        if not self.failfast_enabled:
+            return False
+        self._ff_hard = [z for z in self._ff_hard if z[2] > now]
+        for zx, zy, _ in self._ff_hard:
+            if math.hypot(x - zx, y - zy) <= self.ff_hard_radius:
+                return True
+        # 连通域（死角）判定：落点所在栅格若被登记过就直接拒绝
+        if self._ff_cells:
+            if len(self._ff_cells) > 60000:
+                self._ff_cells = {k: v for k, v in self._ff_cells.items() if v > now}
+            occ = self.map
+            if occ is not None:
+                ores = occ.info.resolution
+                oox, ooy = occ.info.origin.position.x, occ.info.origin.position.y
+                ci = int((x - oox) / ores)
+                cj = int((y - ooy) / ores)
+                until = self._ff_cells.get((ci, cj))
+                if until is not None and until > now:
+                    return True
+        return False
+
+    def zone_penalty(self, x, y, now):
+        """"禁入/降权"区域罚分（v1 与 v2/v3 共用）。
+
+        包含：受阻区、碰撞区（D7：近半径等效硬拒）、区域级被拒历史（D13）。
+        一律用**罚分**而非硬 skip —— 全都落在禁区时仍能派出最不坏的那个。
+        """
+        pen = 0.0
+        for zx, zy, _ in self.stuck_zones:
+            if math.hypot(x - zx, y - zy) < 1.5:
+                pen += 400.0
+                break
+        self.contact_zones = [z for z in self.contact_zones if z[2] > now]
+        for zx, zy, _ in self.contact_zones:
+            d = math.hypot(x - zx, y - zy)
+            if d < self.contact_hard_radius:
+                pen += self.contact_hard_penalty
+                break
+            if d < self.contact_zone_radius:
+                pen += self.contact_zone_penalty
+                break
+        pen += self.region_penalty_of(x, y)
+        return pen
+
+    def _stuck_penalty(self, x, y, now):
+        return self.zone_penalty(x, y, now)
+
+    def grid(self):
+        """把 /map 转成打分内核要的 dict（只做一次浅转换，避免每候选重复取属性）。"""
+        m = self.map
+        if m is None:
+            return None
+        info = m.info
+        return {'res': info.resolution, 'w': info.width, 'h': info.height,
+                'ox': info.origin.position.x, 'oy': info.origin.position.y,
+                'data': m.data}
+
+    def penalty(self, x, y):
+        """所有"别去那儿"的来源合并成一个罚分（罚分制，不硬拒，避免整片被吃）。"""
+        now = time.monotonic()
+        pen = 0.0
+        self.blacklist = [b for b in self.blacklist if b[2] > now]
+        for bx, by, _ in self.blacklist:
+            if math.hypot(x - bx, y - by) < self.bl_r:
+                pen += 250.0
+                self.stats['penalized_black'] = self.stats.get('penalized_black', 0) + 1
+                self._note_uniq('penalized_black', x, y)
+                break
+        pen += self.zone_penalty(x, y, now)
+        # 反复拉锯：同一个位置附近被派发过很多次却没推进 → 降权
+        self.pub_history = [h for h in self.pub_history if now - h[2] < self.retry_window]
+        n = sum(1 for hx, hy, _ in self.pub_history
+                if math.hypot(x - hx, y - hy) < self.retry_radius)
+        pen += self.retry_penalty * n
+        return pen
+
+    def tick(self):
+        self._tick_uniq = set()
+        self.write_timeline()
+        if self.scoring == 'v3':
+            return self._tick_v3()
+        if self.scoring == 'v2':
+            return self._tick_v2()
+        return self._tick_v1()
+
+    def _tick_v1(self):
+        now = time.monotonic()
+        self._repair_tick_n = 0          # 每拍修复验证预算（防止一拍内跑太多 BFS）
+        self._update_stuck(now)
+        self._update_failfast(now)
+        if self.map is None or self.pose is None or not self.cands:
+            return
+        if self.mgr_busy and now - self.last_pub < self.repub:
+            return
+        cands = [c for c in self.cands if now - c[2] < self.cand_max_age]
+        if not cands:
+            return
+        scored = []
+        for x, y, _ in cands:
+            if self.failfast_blocked(x, y, now):
+                self.stats['failfast_reject'] = self.stats.get('failfast_reject', 0) + 1
+                self._note_uniq('failfast_reject', x, y)
+                continue
+            u = self.unknown_cells(x, y)
+            if self.blacklisted(x, y, now):
+                self.stats['penalized_black'] = self.stats.get('penalized_black', 0) + 1
+                u -= 250
+            if u < self.min_unknown:
+                self.stats['rejected_size'] += 1
+                continue
+            u_eff = u - self._stuck_penalty(x, y, now)
+            # 转角惩罚（软约束）：朝后方的候选只降分，不再被拒
+            if self.turn_pen_k > 0.0:
+                u_eff -= self.turn_pen_k * (self._turn_to(x, y) / math.pi)
+            # 区域新度：2 m 半径未知格加分；已探明区（已知空闲占比高）重罚
+            if self.novelty_w > 0.0 or self.repeat_pen > 0.0:
+                _unk2, _ff2 = self._area_stats(x, y, self.novelty_r)
+                if _unk2 is not None and self.novelty_w > 0.0:
+                    u_eff += self.novelty_w * _unk2
+                if _ff2 is not None and self.repeat_pen > 0.0 and _ff2 >= self.repeat_ff:
+                    u_eff -= self.repeat_pen
+                    self.stats['repeat_pen'] = self.stats.get('repeat_pen', 0) + 1
+            scored.append((u_eff, -math.hypot(x - self.pose[0], y - self.pose[1]), x, y))
+        scored.sort(reverse=True)
+        # V1：对前 max_cand 个候选先算区域特征 → 闸门硬拒 + occ/esc 罚分重排
+        top, feats = [], {}
+        for u, negd, x, y in scored[:self.max_cand]:
+            gx0, gy0 = self.pull_back(x, y)
+            reason, f = self.candidate_gate(gx0, gy0)
+            if reason:
+                self.stats['gate_reject'] = self.stats.get('gate_reject', 0) + 1
+                self._note_uniq('gate_reject', gx0, gy0)
+                self.blacklist.append((gx0, gy0, now + self.narrow_penalty_sec))
+                self.note_refusal(gx0, gy0)
+                self.get_logger().info(
+                    '候选闸门否决（%s）目标 (%.2f,%.2f)' % (reason, gx0, gy0))
+                continue
+            pen = self.gate_adjusted_penalty(f) + self.tail_penalty(gx0, gy0, f)
+            if pen > 0:
+                self.stats['gate_penalized'] = self.stats.get('gate_penalized', 0) + 1
+            top.append((u - pen, negd, x, y))
+            feats[(round(x, 2), round(y, 2))] = f
+        top.sort(reverse=True)
+        top = self.near_first_reorder(top)
+        fallback = None
+        for u, negd, x, y in top:
+            gx, gy = self.pull_back(x, y)
+            cost_why = self.cost_gate_reject(gx, gy, now)
+            if cost_why:
+                # 先尝试"修复"：就近随机采样到最近的合格点（保留供给，不掐断）
+                rep = self.cost_repair_point(gx, gy, self.unknown_cells(gx, gy), now)
+                if rep is not None:
+                    self.stats['repair_cost'] = self.stats.get('repair_cost', 0) + 1
+                    self._note_uniq('repair_cost', rep[0], rep[1])
+                    self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
+                    self.get_logger().info(
+                        '候选后验修复（%s）(%.2f,%.2f) → (%.2f,%.2f) 距离 %.2f m'
+                        % (cost_why, gx, gy, rep[0], rep[1],
+                           math.hypot(rep[0] - gx, rep[1] - gy)))
+                    gx, gy = rep
+                else:
+                    self.stats['reject_cost'] = self.stats.get('reject_cost', 0) + 1
+                    self._note_uniq('reject_cost', gx, gy)
+                    self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
+                    self.note_refusal(gx, gy)
+                    self.get_logger().info(
+                        '候选后验否决（%s）目标 (%.2f,%.2f)' % (cost_why, gx, gy))
+                    continue
+            ok, narrow, min_w, unk = self.path_and_width(gx, gy)
+            if not ok:
+                self.blacklist.append((gx, gy, now + self.bl_sec))
+                self.stats['rejected_path'] += 1
+                self._note_uniq('rejected_path', gx, gy)
+                self.note_refusal(gx, gy)
+                continue
+            if narrow is not None:
+                if self._last_path_reject == 'noexit':
+                    self.stats['reject_noexit'] = self.stats.get('reject_noexit', 0) + 1
+                    self._note_uniq('reject_noexit', gx, gy)
+                else:
+                    self.stats['rejected_narrow'] += 1
+                    self._note_uniq('rejected_narrow', gx, gy)
+                self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
+                self.note_refusal(gx, gy)
+                if (min_w is not None and min_w >= self.corridor_hard
+                        and unk <= self.corridor_unknown_max and fallback is None):
+                    fallback = (gx, gy)
+                self.get_logger().info(
+                    '前向净空预检否决：走廊 < %.2fm @(%.2f,%.2f)，目标 (%.2f,%.2f)'
+                    % (self.corridor_width, narrow[0], narrow[1], gx, gy))
+                continue
+            # 可达但不可返回：目标附近没有掉头空间 → 派过去就出不来
+            oneway, turn = self.return_infeasible(gx, gy)
+            if oneway:
+                self.stats['rejected_oneway'] = self.stats.get('rejected_oneway', 0) + 1
+                self._note_uniq('rejected_oneway', gx, gy)
+                self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
+                self.note_refusal(gx, gy)
+                self.get_logger().info(
+                    '可达但不可返回否决：目标 (%.2f,%.2f) 附近掉头空间仅 %.2f m < %.2f m'
+                    % (gx, gy, turn, self.return_turn_width))
+                continue
+            self.probe_candidate(gx, gy, None, min_w, u)
+            self.publish_goal(gx, gy, None, u)
+            return
+        if fallback is not None:
+            self.stats['narrow_fallback'] += 1
+            self.get_logger().warn(
+                '候选全部需要穿窄缝，回退派发最优点 (%.2f,%.2f)；统计 %s'
+                % (fallback[0], fallback[1], self.stats))
+            self.publish_goal(fallback[0], fallback[1], None, 0)
+            return
+        obs = self.pick_safe_observation([(x, y) for _, _, x, y in scored])
+        if obs is not None:
+            self.stats['fallback_obs'] = self.stats.get('fallback_obs', 0) + 1
+            self.get_logger().warn(
+                '本拍无可派候选 → 派保底观察点 (%.2f,%.2f)（第 %d 次）；统计 %s'
+                % (obs[0], obs[1], self._fb_count, self.stats))
+            self.publish_goal(obs[0], obs[1], None, 0)
+            return
+        # 最后一道：前沿全都派不出去（比如车正卡在"进得去出不来"的角落），
+        # 与其什么都不派、让车在那儿待着，不如派一个本地脱困目标把车挪出来。
+        esc = self.pick_escape_goal()
+        if esc is not None:
+            self.publish_goal(esc[0], esc[1], None, 0)
+            return
+        self.get_logger().warn(f'本轮候选全部被拒：{self.stats}')
+
+    def _tick_v3(self):
+        now = time.monotonic()
+        self._update_failfast(now)
+        self._update_stuck(now)
+        if self.map is None or self.pose is None or not self.cands:
+            return
+        if self.mgr_busy and now - self.last_pub < self.repub:
+            return
+        cands = [(x, y) for x, y, t in self.cands if now - t < self.cand_max_age]
+        if not cands:
+            return
+        g = self.grid()
+        if g is None:
+            return
+        # 先按"机头朝向"过一遍：manager 自己会拒绝 >80° 的转向目标（日志实测因此空转 5~10 s），
+        # 这里提前筛掉/降权，省掉那次拒绝与随后的原地旋转。
+        turn_limit = math.radians(self.turn_limit_deg)
+        filtered = []
+        dropped_turn = 0
+        for x, y in cands:
+            dx, dy = x - self.pose[0], y - self.pose[1]
+            n = math.hypot(dx, dy) or 1.0
+            if turn_angle_to((dx / n, dy / n), self.yaw) > turn_limit:
+                dropped_turn += 1
+                continue
+            filtered.append((x, y))
+        if dropped_turn:
+            self.stats['turn_dropped'] = self.stats.get('turn_dropped', 0) + dropped_turn
+        if not filtered:
+            if self.turn_hard_skip:
+                # D12：本拍不派 —— manager 的 80° 门会先原地转再拒，实测白烧 5~10 s。
+                # 空一拍让 RRT 重新采样（republish 1.5 s 会很快给新候选）。
+                self.stats['turn_skip_all'] = self.stats.get('turn_skip_all', 0) + 1
+                if now - getattr(self, '_last_turn_skip_log', 0.0) > 10.0:
+                    self._last_turn_skip_log = now
+                    self.get_logger().info(
+                        '本拍全部候选都在机头 %.0f° 之外（%d 个）→ 跳过派发，等 RRT 重新采样'
+                        % (self.turn_limit_deg, dropped_turn))
+                return
+            self.stats['turn_fallback'] = self.stats.get('turn_fallback', 0) + 1
+            self.get_logger().info(
+                f'[v3] 全部候选都在机头 {self.turn_limit_deg:.0f}° 之外（{dropped_turn} 个），'
+                f'回退派发最优候选')
+            filtered = list(cands)
+        try:
+            ranked = rank_candidates_v3(g, filtered, self.cfg3, penalty_fn=self.penalty,
+                                        pose=self.pose, prefilter_n=self.prefilter_n)
+        except Exception as exc:                          # noqa: BLE001
+            self.get_logger().error(f'v3 打分异常，回退 v1：{type(exc).__name__}: {exc}')
+            self.scoring = 'v1'
+            return self._tick_v1()
+        keep = [r for r in ranked
+                if r['unknown'] >= self.min_unknown or r.get('ahead', 0) >= self.min_ahead]
+        self.stats['rejected_size'] += len(ranked) - len(keep)
+        for r_drop in ranked:
+            if r_drop not in keep:
+                self._note_uniq('rejected_size', r_drop['x'], r_drop['y'])
+        if not keep:
+            self.get_logger().warn(
+                f'[v3] 无候选过规模门槛（min_unknown={self.min_unknown}）；统计 {self.stats}')
+            return
+        if self.verbose_rank:
+            self.get_logger().info('[v3] 候选前 3：' + ' | '.join(
+                '(%.2f,%.2f) score=%.1f ahead=%d near=%.2f pen=%.0f'
+                % (r['x'], r['y'], r['score'], r['ahead'], r['near_ratio'], r['penalty'])
+                for r in keep[:3]))
+        fallback = None
+        gated = []
+        for r in keep[:self.max_cand]:
+            gx0, gy0 = self.pull_back(r['x'], r['y'])
+            reason, f = self.candidate_gate(gx0, gy0)
+            if reason:
+                self.stats['gate_reject'] = self.stats.get('gate_reject', 0) + 1
+                self._note_uniq('gate_reject', gx0, gy0)
+                self.blacklist.append((gx0, gy0, now + self.narrow_penalty_sec))
+                self.note_refusal(gx0, gy0)
+                self.get_logger().info(
+                    '候选闸门否决（%s）目标 (%.2f,%.2f)' % (reason, gx0, gy0))
+                continue
+            pen = self.gate_adjusted_penalty(f) + self.tail_penalty(gx0, gy0, f)
+            if pen > 0:
+                self.stats['gate_penalized'] = self.stats.get('gate_penalized', 0) + 1
+                r = dict(r); r['score'] = r.get('score', 0.0) - pen
+            gated.append(r)
+        gated.sort(key=lambda q: q.get('score', 0.0), reverse=True)
+        for r in gated:
+            gx, gy = self.pull_back(r['x'], r['y'])
+            cost_why = self.cost_gate_reject(gx, gy, now)
+            if cost_why:
+                # 先尝试"修复"：就近随机采样到最近的合格点（保留供给，不掐断）
+                rep = self.cost_repair_point(gx, gy, self.unknown_cells(gx, gy), now)
+                if rep is not None:
+                    self.stats['repair_cost'] = self.stats.get('repair_cost', 0) + 1
+                    self._note_uniq('repair_cost', rep[0], rep[1])
+                    self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
+                    self.get_logger().info(
+                        '候选后验修复（%s）(%.2f,%.2f) → (%.2f,%.2f) 距离 %.2f m'
+                        % (cost_why, gx, gy, rep[0], rep[1],
+                           math.hypot(rep[0] - gx, rep[1] - gy)))
+                    gx, gy = rep
+                else:
+                    self.stats['reject_cost'] = self.stats.get('reject_cost', 0) + 1
+                    self._note_uniq('reject_cost', gx, gy)
+                    self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
+                    self.note_refusal(gx, gy)
+                    self.get_logger().info(
+                        '候选后验否决（%s）目标 (%.2f,%.2f)' % (cost_why, gx, gy))
+                    continue
+            ok, narrow, min_w, unk = self.path_and_width(gx, gy)
+            if not ok:
+                self.blacklist.append((gx, gy, now + self.bl_sec))
+                self.stats['rejected_path'] += 1
+                self._note_uniq('rejected_path', gx, gy)
+                self.note_refusal(gx, gy)
+                continue
+            if narrow is not None:
+                if self._last_path_reject == 'noexit':
+                    self.stats['reject_noexit'] = self.stats.get('reject_noexit', 0) + 1
+                    self._note_uniq('reject_noexit', gx, gy)
+                else:
+                    self.stats['rejected_narrow'] += 1
+                    self._note_uniq('rejected_narrow', gx, gy)
+                self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
+                self.note_refusal(gx, gy)
+                # 软回退只允许"确实够宽、而且宽度不是靠未知格撑出来的"候选。
+                # 2026-10-23：原来无条件派发最优窄候选，车开进 0.9 m 门洞后被车端
+                # 前向安全闸（0.45 m）判死、原地静止 40~90 s，就是这条路径造成的。
+                if (min_w is not None and min_w >= self.corridor_hard
+                        and unk <= self.corridor_unknown_max and fallback is None):
+                    fallback = (gx, gy, r, min_w, unk)
+                continue
+            try:
+                r['min_w'] = min_w
+            except Exception:                     # noqa: BLE001
+                pass
+            self.probe_candidate(gx, gy, r, min_w, r.get('unknown'))
+            self.publish_goal(gx, gy, r)
+            return
+        if fallback is not None:
+            self.stats['narrow_fallback'] += 1
+            self.get_logger().warn(
+                '[v3] 候选全部需穿窄缝，回退派发实测最宽者 (%.2f,%.2f) 净宽 %.2f m 未知占比 %.0f%%'
+                % (fallback[0], fallback[1], fallback[3], 100 * fallback[4]))
+            self.publish_goal(fallback[0], fallback[1], fallback[2])
+            return
+        # 全部低于硬下限：宁可原地等新前沿，也不把车塞进过不去的口子
+        self.stats['narrow_blocked_all'] = self.stats.get('narrow_blocked_all', 0) + 1
+        if now - getattr(self, '_last_narrow_warn', 0.0) > 10.0:
+            self._last_narrow_warn = now
+            self.get_logger().warn(
+                '[v3] 本轮候选全部低于走廊硬下限 %.2f m（不做软回退，等新前沿）；统计 %s'
+                % (self.corridor_hard, self.stats))
+
+    def _tick_v2(self):
+        now = time.monotonic()
+        self._update_failfast(now)
+        self._update_stuck(now)
+        if self.map is None or self.pose is None or not self.cands:
+            return
+        if self.mgr_busy and now - self.last_pub < self.repub:
+            return                      # 目标执行中才限速；空闲时立刻补一个新候选（S2）
+        cands = [(x, y) for x, y, t in self.cands if now - t < self.cand_max_age]
+        if not cands:
+            return
+        g = self.grid()
+        if g is None:
+            return
+        try:
+            ranked = rank_candidates(g, cands, self.cfg,
+                                     penalty_fn=self.penalty, pose=self.pose,
+                                     prefilter_n=self.prefilter_n)
+        except Exception as exc:                          # noqa: BLE001
+            self.get_logger().error(f'打分异常，回退旧逻辑：{type(exc).__name__}: {exc}')
+            ranked = []
+        # 规模门槛：未知格太少（碎角/坑）直接不要
+        keep = [r for r in ranked
+                if r['unknown'] >= self.min_unknown or r.get('ahead', 0) >= self.min_ahead]
+        self.stats['rejected_size'] += len(ranked) - len(keep)
+        for r_drop in ranked:
+            if r_drop not in keep:
+                self._note_uniq('rejected_size', r_drop['x'], r_drop['y'])
+        if not keep:
+            self.get_logger().warn(
+                f'无候选过规模门槛（min_unknown={self.min_unknown}）；统计 {self.stats}')
+            return
+        if self.verbose_rank:
+            top = keep[:3]
+            self.get_logger().info('候选打分前 3：' + ' | '.join(
+                '(%.2f,%.2f) score=%.1f u=%d blk=%d w=%d pen=%.0f'
+                % (r['x'], r['y'], r['score'], r['unknown'], r['block'],
+                   r['width'], r['penalty']) for r in top))
+        fallback = None
+        gated = []
+        for r in keep[:self.max_cand]:
+            gx0, gy0 = self.pull_back(r['x'], r['y'])
+            reason, f = self.candidate_gate(gx0, gy0)
+            if reason:
+                self.stats['gate_reject'] = self.stats.get('gate_reject', 0) + 1
+                self._note_uniq('gate_reject', gx0, gy0)
+                self.blacklist.append((gx0, gy0, now + self.narrow_penalty_sec))
+                self.note_refusal(gx0, gy0)
+                self.get_logger().info(
+                    '候选闸门否决（%s）目标 (%.2f,%.2f)' % (reason, gx0, gy0))
+                continue
+            pen = self.gate_adjusted_penalty(f) + self.tail_penalty(gx0, gy0, f)
+            if pen > 0:
+                self.stats['gate_penalized'] = self.stats.get('gate_penalized', 0) + 1
+                r = dict(r); r['score'] = r.get('score', 0.0) - pen
+            gated.append(r)
+        gated.sort(key=lambda q: q.get('score', 0.0), reverse=True)
+        for r in gated:
+            gx, gy = self.pull_back(r['x'], r['y'])
+            cost_why = self.cost_gate_reject(gx, gy, now)
+            if cost_why:
+                # 先尝试"修复"：就近随机采样到最近的合格点（保留供给，不掐断）
+                rep = self.cost_repair_point(gx, gy, self.unknown_cells(gx, gy), now)
+                if rep is not None:
+                    self.stats['repair_cost'] = self.stats.get('repair_cost', 0) + 1
+                    self._note_uniq('repair_cost', rep[0], rep[1])
+                    self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
+                    self.get_logger().info(
+                        '候选后验修复（%s）(%.2f,%.2f) → (%.2f,%.2f) 距离 %.2f m'
+                        % (cost_why, gx, gy, rep[0], rep[1],
+                           math.hypot(rep[0] - gx, rep[1] - gy)))
+                    gx, gy = rep
+                else:
+                    self.stats['reject_cost'] = self.stats.get('reject_cost', 0) + 1
+                    self._note_uniq('reject_cost', gx, gy)
+                    self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
+                    self.note_refusal(gx, gy)
+                    self.get_logger().info(
+                        '候选后验否决（%s）目标 (%.2f,%.2f)' % (cost_why, gx, gy))
+                    continue
+            ok, narrow, min_w, unk = self.path_and_width(gx, gy)
+            if not ok:
+                self.blacklist.append((gx, gy, now + self.bl_sec))
+                self.stats['rejected_path'] += 1
+                self._note_uniq('rejected_path', gx, gy)
+                self.note_refusal(gx, gy)
+                continue
+            if narrow is not None:
+                if self._last_path_reject == 'noexit':
+                    self.stats['reject_noexit'] = self.stats.get('reject_noexit', 0) + 1
+                    self._note_uniq('reject_noexit', gx, gy)
+                else:
+                    self.stats['rejected_narrow'] += 1
+                    self._note_uniq('rejected_narrow', gx, gy)
+                self.blacklist.append((gx, gy, now + self.narrow_penalty_sec))
+                self.note_refusal(gx, gy)
+                if fallback is None:
+                    fallback = (gx, gy, r)
+                self.get_logger().info(
+                    '前向净空预检否决：走廊 < %.2fm @(%.2f,%.2f)，目标 (%.2f,%.2f)'
+                    % (self.corridor_width, narrow[0], narrow[1], gx, gy))
+                continue
+            try:
+                r['min_w'] = min_w
+            except Exception:                     # noqa: BLE001
+                pass
+            self.probe_candidate(gx, gy, r, min_w, r.get('unknown'))
+            self.publish_goal(gx, gy, r)
+            return
+        if fallback is not None:
+            self.stats['narrow_fallback'] += 1
+            self.get_logger().warn(
+                '候选全部需要穿窄缝，回退派发最优点 (%.2f,%.2f)；统计 %s'
+                % (fallback[0], fallback[1], self.stats))
+            self.publish_goal(fallback[0], fallback[1], fallback[2])
+            return
+        self.get_logger().warn(f'本轮候选全部被拒：{self.stats}')
+
+    def publish_goal(self, gx, gy, r, u=None):
+        now = time.monotonic()
+        if (self.last_goal is not None and self.last_pub
+                and now - self.last_pub < 5.0
+                and math.hypot(gx - self.last_goal[0], gy - self.last_goal[1]) < 0.30):
+            return                              # 5 s 内同一目标不重复发（避免目标churn）
+        msg = PoseStamped()
+        msg.header.frame_id = self.frame
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.pose.position.x, msg.pose.position.y = gx, gy
+        msg.pose.orientation.w = 1.0
+        self.pub.publish(msg)
+        self.last_pub = time.monotonic()
+        self.last_goal = (gx, gy)
+        self.pub_history.append((gx, gy, self.last_pub))
+        if self._first_pub_t is None:
+            self._first_pub_t = self.last_pub
+        self.stats['published'] += 1
+        try:
+            self.get_logger().info(
+                '仲裁通过：候选(%s) 未知=%s 块=%s 宽=%s penalty=%s → 目标 (%.2f,%.2f)；统计 %s'
+                % (('%.2f,%.2f' % (r['x'], r['y'])) if r else '?',
+                   (r['unknown'] if r else u) if (r or u is not None) else '?',
+                   r['block'] if r else '?',
+                   ('%.2f' % r['min_w']) if (r and 'min_w' in r) else (r['width'] if r else '?'),
+                   ('%.0f' % r['penalty']) if r else '?',
+                   gx, gy, self.stats))
+        except Exception:
+            pass
+
+    def on_path_result(self, fut, gx, gy, u):
+        self.pending = None
+        now = time.monotonic()
+        ok = False
+        try:
+            res = fut.result()
+            ok = bool(res and res.path and len(res.path.poses) > 0)
+        except Exception:
+            ok = False
+        if not ok:
+            self.blacklist.append((gx, gy, now + self.bl_sec))
+            self.stats['rejected_path'] += 1
+            return
+        msg = PoseStamped()
+        msg.header.frame_id = self.frame
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.pose.position.x, msg.pose.position.y = gx, gy
+        msg.pose.orientation.w = 1.0
+        self.pub.publish(msg)
+        self.last_pub = now
+        self.last_goal = (gx, gy)
+        self.stats['published'] += 1
+        self.get_logger().info(f'仲裁通过：未知格 {u}，目标 ({gx:.2f},{gy:.2f})；统计 {self.stats}')
+
+
+def main():
+    rclpy.init()
+    node = Arbiter()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()

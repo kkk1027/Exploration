@@ -150,6 +150,16 @@ def generate_launch_description():
                                 # V1 闸门（落点级）：与 veto 搭配才覆盖全部派发通道
                                 'gate_enabled': LaunchConfiguration('gate'),
                                 # 后置否决改为"迁移"：命中不取消落点，改投合格点
+                                'veto_inplace': LaunchConfiguration('veto_inplace'),
+                                'inplace_radius_m': LaunchConfiguration('inplace_radius_m'),
+                                'inplace_tries': LaunchConfiguration('inplace_tries'),
+                                'inplace_max': LaunchConfiguration('inplace_max'),
+                                'inplace_cooldown_sec': LaunchConfiguration('inplace_cooldown_sec'),
+                                'inplace_min_disp_m': LaunchConfiguration('inplace_min_disp_m'),
+                                'inplace_fallback_cancel':
+                                    LaunchConfiguration('inplace_fallback_cancel'),
+                                'goal_update_topic': '/goal_update',
+                                'goal_correction_topic': '/goal_correction',
                                 'veto_migrate': LaunchConfiguration('veto_migrate'),
                                 'veto_migrate_mode': LaunchConfiguration('veto_migrate_mode'),
                                 'veto_migrate_radius_m': LaunchConfiguration('veto_migrate_r'),
@@ -463,6 +473,16 @@ def generate_launch_description():
         #   基线（无 veto）∶静止超时 28（1.40/轮）、归因率 24%
         #   有 veto（额度 6、冷却 10 s）∶静止超时 19（0.95/轮，−32%）、归因率 11.5%
         #   两组全绿率同为 19/20 —— 也就是说这是三步里唯一"既降卡死又不退化"的改动。
+        DeclareLaunchArgument('veto_inplace', default_value='false',
+                              description='P12：后置判据命中时原地改目标（nav2 GoalUpdater 的 '
+                                          '/goal_update），**不取消**当前 NavigateToPose 动作'),
+        DeclareLaunchArgument('inplace_radius_m', default_value='2.0'),
+        DeclareLaunchArgument('inplace_tries', default_value='24'),
+        DeclareLaunchArgument('inplace_max', default_value='3'),
+        DeclareLaunchArgument('inplace_cooldown_sec', default_value='3.0'),
+        DeclareLaunchArgument('inplace_min_disp_m', default_value='0.30'),
+        DeclareLaunchArgument('inplace_fallback_cancel', default_value='true',
+                              description='找不到合格 G* 时是否回落到"取消+迁移"（保留供给）'),
         DeclareLaunchArgument('veto_migrate', default_value='true',
             description='后置否决命中时改为"迁移到合格点"而不是取消目标'),
         DeclareLaunchArgument('veto_migrate_mode', default_value='random',
