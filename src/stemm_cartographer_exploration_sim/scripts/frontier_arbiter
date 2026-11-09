@@ -735,6 +735,41 @@ class Arbiter(Node):
             'w_dist': self.cfg['w_dist'],
         }
 
+        # ===== P13-1：派发风险评分（依据 docs/P13_基线.md 的实测数据）=====
+        # 基线事实（16 轮 / 297 次派发，幻影成功已剔除）：
+        #   * 派发距离中位 5.32 m（>4 m 占 79.8%、>6 m 占 35.0%）；
+        #   * 取消率随距离**单调**上升：<3 m 19% → 4~6 m 60% → >6 m 81%；
+        #   * 转角 / esc_dirs / comp_r2 在各桶之间**非单调**，有效样本仅 14~55。
+        # 所以只对距离用"收益折现"这种强形式：
+        #     p(d) = 1 / (1 + (d / risk_dist_half_m)^2)
+        #     score = u_eff * p(d) - aux
+        # 远处候选只有"信息量显著更大"时才胜出；其余项只当低权重次序项，
+        # 权重由 A/B 决定，而不是按"看起来合理"直接配大权重。
+        #
+        # half 用 4.5 而不是 6.0：把基线的三个分桶点同时拟合得最好
+        #   2 m→0.84（基线"还能跑完"约 0.81）
+        #   5 m→0.45（基线 4~6 m 取消 60% ⇒ 0.40）
+        #   9 m→0.20（基线 >6 m 取消 81% ⇒ 0.19）
+        # 用 6.0 时 9 m 仍是 0.31，会出现"远处信息量 3 倍就能翻盘"——
+        # 而基线里这类派发 81% 是直接取消的。
+        self.risk_enabled = self._as_bool(p('risk_enabled', True).value)
+        self.risk_dist_half = max(0.5, float(p('risk_dist_half_m', 4.5).value))
+        self.risk_eval_n = max(1, int(p('risk_eval_n', 6).value))
+        self.risk_w_turn = float(p('risk_w_turn', 60.0).value)
+        self.risk_w_egress = float(p('risk_w_egress', 120.0).value)
+        self.risk_w_route = float(p('risk_w_route', 150.0).value)
+        self.risk_w_deadend = float(p('risk_w_deadend', 100.0).value)
+        self.risk_w_occ = float(p('risk_w_occ', 600.0).value)
+        self.risk_esc_target = max(1, int(p('risk_esc_target_dirs', 6).value))
+        # ★ 宽度目标不能取 pass_width(0.90)：path_and_width 是硬门，能通过硬门的候选
+        #   必然 min_w >= 0.90，取 0.90 当目标会让本项**恒为 0**（形同虚设）。
+        #   这里取 1.20 = "舒福宽度"，于是 0.90~1.20 的候选会被区分出来。
+        self.risk_route_target = max(0.1, float(
+            p('risk_route_target_m', 1.20).value))
+        self.risk_min_comp = int(p('risk_min_comp_cells', 800).value)
+        self.risk_occ_soft = float(p('risk_occ_soft', 0.30).value)
+        self._last_risk_info = None
+
         self.map = None
         self.pose = None
         self.yaw = 0.0
@@ -755,7 +790,9 @@ class Arbiter(Node):
                       'reject_noexit': 0, 'noexit_passed': 0, 'noexit_checked': 0,
                       'gate_reject': 0, 'gate_penalized': 0,
                       'reject_cost': 0, 'cost_checked': 0, 'repair_cost': 0,
-                      'escape_zones': 0}
+                      'escape_zones': 0,
+                      # P13-1 风险评分观测口径（只用于 A/B 归因）
+                      'risk_penalized': 0, 'risk_eval': 0, 'risk_selected': 0}
 
         qmap = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                           durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -1121,6 +1158,83 @@ class Arbiter(Node):
                 # 之前这里没返回该键，导致 gate_adjusted_penalty 里
                 # f.get('occ_frac_r2',0.0) 永远取默认 0 → 软惩罚形同虚设。
                 'occ_frac_r2': (1.0 - free / float(win.size)) if win.size else 0.0}
+
+    # ================= P13-1：派发风险评分 =================
+    def risk_discount(self, dist):
+        """距离折现因子 p(d) = 1/(1+(d/half)^2)。
+
+        half=4.5 m 时：2 m→0.84、4 m→0.56、6 m→0.36、9 m→0.20、12 m→0.12。
+        直接对应基线里的取消率曲线（剔除幻影后 <3 m 19% / 4~6 m 60% / >6 m 81%）
+        —— 而不是为了把“不要派远的”拍成一个小罚分了事。
+        """
+        if not self.risk_enabled:
+            return 1.0
+        d = max(0.0, float(dist))
+        return 1.0 / (1.0 + (d / self.risk_dist_half) ** 2)
+
+    def risk_aux(self, gx, gy, dist=None):
+        """落点侧风险（转角 / 可脱困 / 死口袋 / 拥挤）—— 附加罚分，权重刻意小。
+
+        与 candidate_gate 的区别：gate 是硬拒（默认关，一开就 churn）；
+        这里是连续罚分，只参与排序，**永不拒绝候选**。
+        返回 (aux, info)；info 里带各分项，供 candidate_probe 落盘做 A/B 归因。
+        """
+        if not self.risk_enabled or self.pose is None:
+            return 0.0, {}
+        if dist is None:
+            dist = math.hypot(gx - self.pose[0], gy - self.pose[1])
+        aux = 0.0
+        info = {'risk_dist': round(dist, 2)}
+        turn = self._turn_to(gx, gy)
+        aux += self.risk_w_turn * (turn / math.pi)
+        info['risk_turn_deg'] = round(math.degrees(turn), 1)
+        field = self.clearance_field()
+        if field is None:
+            info['risk_aux'] = round(aux, 1)
+            return aux, info
+        try:
+            f = self.region_complexity(field, gx, gy)
+        except Exception:                       # noqa: BLE001
+            f = {}
+        if f:
+            esc = int(f.get('esc_dirs', 8))
+            aux += (self.risk_w_egress
+                    * max(0, self.risk_esc_target - esc)
+                    / float(self.risk_esc_target))
+            occ = float(f.get('occ_frac_r2', 0.0))
+            aux += self.risk_w_occ * max(0.0, occ - self.risk_occ_soft)
+            comp = int(f.get('comp_r2', 0))
+            if self.risk_min_comp > 0 and comp < self.risk_min_comp:
+                aux += (self.risk_w_deadend
+                        * (1.0 - comp / float(self.risk_min_comp)))
+            info.update({'risk_esc_dirs': esc, 'risk_comp_r2': comp,
+                         'risk_occ_frac': round(occ, 3)})
+        ts = self.turn_space_near(gx, gy)
+        if ts is not None:
+            info['risk_turn_space'] = round(ts, 3)
+        info['risk_aux'] = round(aux, 1)
+        return aux, info
+
+    def risk_route(self, min_w, unk):
+        """沿实际 BFS 路径的风险（窄段 / 未知占比）。
+
+        path_and_width 目前是硬门（不过就拒），但硬门会掉供给（实测单轮
+        rejected_narrow 256、rejected_path 122）。同一条路径的连续量进排序，
+        可以让"略窄但确实能走"的候选排到"看起来很宽但停在最后"的前面。
+        """
+        if not self.risk_enabled:
+            return 0.0, {}
+        aux = 0.0
+        info = {}
+        if min_w is not None:
+            short = max(0.0, self.risk_route_target - float(min_w))
+            aux += self.risk_w_route * short / self.risk_route_target
+            info['risk_min_w_path'] = round(float(min_w), 3)
+        if unk is not None:
+            aux += (self.risk_w_route * 0.5
+                    * max(0.0, min(1.0, float(unk))))
+            info['risk_unknown_share'] = round(float(unk), 3)
+        return aux, info
 
     def pick_safe_observation(self, cands):
         """V2-②：从候选里挑一个"开阔、连通、离车不远"的观察点（作为保底目标）。
@@ -1952,6 +2066,10 @@ class Arbiter(Node):
                 'reject_cost': self.stats.get('reject_cost', 0),
                 'cost_checked': self.stats.get('cost_checked', 0),
                 'repair_cost': self.stats.get('repair_cost', 0),
+                # P13-1：风险评分可观测性
+                'risk_penalized': self.stats.get('risk_penalized', 0),
+                'risk_eval': self.stats.get('risk_eval', 0),
+                'risk_selected': self.stats.get('risk_selected', 0),
             }
             if extra:
                 row.update(extra)
@@ -1993,6 +2111,12 @@ class Arbiter(Node):
                'ahead': (r or {}).get('ahead'), 'near_ratio': (r or {}).get('near_ratio'),
                'block': (r or {}).get('block'), 'penalty': (r or {}).get('penalty'),
                'score': (r or {}).get('score')}
+        # P13-1：把本次派发的风险分项一并落盘，供 harness/analyze_dispatch_risk.py 做 A/B
+        ri = getattr(self, '_last_risk_info', None) or {}
+        self._last_risk_info = None
+        for _k, _v in ri.items():
+            if _k not in row:
+                row[_k] = _v
         row.update(cx or {})
         try:
             os.makedirs(os.path.dirname(self.probe_log) or '.', exist_ok=True)
@@ -2823,6 +2947,7 @@ class Arbiter(Node):
 
     def tick(self):
         self._tick_uniq = set()
+        self._last_risk_info = None      # P13-1：避免上一拍的风险分项误贴到本拍
         self.write_timeline()
         if self.scoring == 'v3':
             return self._tick_v3()
@@ -2843,6 +2968,7 @@ class Arbiter(Node):
         if not cands:
             return
         scored = []
+        raw_of, risk_of = {}, {}     # P13-1：(x,y) → 折现前得分 / 落点风险分项
         for x, y, _ in cands:
             if self.failfast_blocked(x, y, now):
                 self.stats['failfast_reject'] = self.stats.get('failfast_reject', 0) + 1
@@ -2867,7 +2993,12 @@ class Arbiter(Node):
                 if _ff2 is not None and self.repeat_pen > 0.0 and _ff2 >= self.repeat_ff:
                     u_eff -= self.repeat_pen
                     self.stats['repeat_pen'] = self.stats.get('repeat_pen', 0) + 1
-            scored.append((u_eff, -math.hypot(x - self.pose[0], y - self.pose[1]), x, y))
+            # P13-1：距离折现（这里只算 O(1) 的一项；开销大的落点特征放到
+            # 下面已缩到 max_cand 个候选之后再算，不拖慢 1 Hz 主循环）
+            _dist = math.hypot(x - self.pose[0], y - self.pose[1])
+            _p = self.risk_discount(_dist)
+            raw_of[(round(x, 2), round(y, 2))] = u_eff
+            scored.append((u_eff * _p, -_dist, x, y))
         scored.sort(reverse=True)
         # V1：对前 max_cand 个候选先算区域特征 → 闸门硬拒 + occ/esc 罚分重排
         top, feats = [], {}
@@ -2885,11 +3016,17 @@ class Arbiter(Node):
             pen = self.gate_adjusted_penalty(f) + self.tail_penalty(gx0, gy0, f)
             if pen > 0:
                 self.stats['gate_penalized'] = self.stats.get('gate_penalized', 0) + 1
-            top.append((u - pen, negd, x, y))
+            # P13-1：落点侧风险（转角/可脱困/死口袋/拥挤）—— 只降分，不拒绝候选
+            risk_pen, risk_info = self.risk_aux(gx0, gy0, dist=-negd)
+            if risk_pen > 0.0:
+                self.stats['risk_penalized'] = self.stats.get('risk_penalized', 0) + 1
+            top.append((u - pen - risk_pen, negd, x, y))
             feats[(round(x, 2), round(y, 2))] = f
+            risk_of[(round(x, 2), round(y, 2))] = risk_info
         top.sort(reverse=True)
         top = self.near_first_reorder(top)
         fallback = None
+        passing = []
         for u, negd, x, y in top:
             gx, gy = self.pull_back(x, y)
             cost_why = self.cost_gate_reject(gx, gy, now)
@@ -2947,6 +3084,30 @@ class Arbiter(Node):
                     '可达但不可返回否决：目标 (%.2f,%.2f) 附近掉头空间仅 %.2f m < %.2f m'
                     % (gx, gy, turn, self.return_turn_width))
                 continue
+            # P13-1：不再"第一个通过硬门就派发" —— 硬门的通过顺序与风险无关，
+            # 那样加风险项等于没加。这里收集前 risk_eval_n 个合格者，
+            # 叠加沿路风险（窄段/未知占比）后取最优。
+            route_pen, route_info = self.risk_route(min_w, unk)
+            info = dict(risk_of.get((round(x, 2), round(y, 2))) or {})
+            info.update(route_info)
+            info['risk_dist'] = round(-negd, 2)
+            info['risk_route'] = round(route_pen, 1)
+            _raw = raw_of.get((round(x, 2), round(y, 2)), u)
+            info['risk_discount_loss'] = round(
+                _raw * (1.0 - self.risk_discount(-negd)), 1)
+            info['risk_total'] = round(
+                float(info.get('risk_aux', 0.0)) + route_pen
+                + float(info['risk_discount_loss']), 1)
+            info['risk_source'] = 'frontier'
+            passing.append((u - route_pen, gx, gy, u, min_w, info))
+            self.stats['risk_eval'] = self.stats.get('risk_eval', 0) + 1
+            if len(passing) >= self.risk_eval_n:
+                break
+        if passing:
+            passing.sort(key=lambda q: q[0], reverse=True)
+            _sc, gx, gy, u, min_w, info = passing[0]
+            self.stats['risk_selected'] = self.stats.get('risk_selected', 0) + 1
+            self._last_risk_info = info
             self.probe_candidate(gx, gy, None, min_w, u)
             self.publish_goal(gx, gy, None, u)
             return
