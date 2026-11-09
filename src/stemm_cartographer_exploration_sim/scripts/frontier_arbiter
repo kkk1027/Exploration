@@ -770,6 +770,20 @@ class Arbiter(Node):
         self.risk_occ_soft = float(p('risk_occ_soft', 0.30).value)
         self._last_risk_info = None
 
+        # ===== P13-2A：把原始 RRT 目标也纳入同一套风险评分 =====
+        # 基线事实：`merge.jsonl` 里 raw 转发 39~59 条/轮 ≥ validated 29~40 条/轮，
+        # 即约六成候选供给**完全不经过本节点**（也完全不看距离/可脱困/净宽）。
+        # 根源在车端 C++ assigner：revenue = info_gain(1 m) * 3.0 - 欧氏距离。
+        # 方案 A（本实现，无需重编 C++）：订阅 /assigned_frontier_goal，
+        # 在"前沿候选全部派不出去"时，用同一套风险模型从最近的 raw 样本里选最优。
+        # 它只接管原有的"保底观察点/脱困目标"位置，不会覆盖正常的前沿派发。
+        self.raw_score_enabled = self._as_bool(p('raw_score_enabled', True).value)
+        self.raw_max_age = float(p('raw_max_age_sec', 4.0).value)
+        self.raw_max_dist = float(p('raw_max_dist_m', 8.0).value)
+        self.raw_starve_sec = float(p('raw_starve_sec', 6.0).value)
+        self.raw_score_n = max(1, int(p('raw_score_n', 3).value))
+        self.raw_goals = []          # [(ts, x, y)]
+
         self.map = None
         self.pose = None
         self.yaw = 0.0
@@ -792,12 +806,18 @@ class Arbiter(Node):
                       'reject_cost': 0, 'cost_checked': 0, 'repair_cost': 0,
                       'escape_zones': 0,
                       # P13-1 风险评分观测口径（只用于 A/B 归因）
-                      'risk_penalized': 0, 'risk_eval': 0, 'risk_selected': 0}
+                      'risk_penalized': 0, 'risk_eval': 0, 'risk_selected': 0,
+                      # P13-2A 原始 RRT 候选
+                      'raw_seen': 0, 'raw_publish': 0, 'raw_overdist': 0,
+                      'raw_unreachable': 0}
 
         qmap = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                           durability=DurabilityPolicy.TRANSIENT_LOCAL)
         self.create_subscription(OccupancyGrid, '/map', self.on_map, qmap)
         self.create_subscription(PointArray, '/filtered_goal_points', self.on_cands, 10)
+        # P13-2A：车端 assigner 的原始目标（此前不在本节点视野内）
+        self.create_subscription(PoseStamped, '/assigned_frontier_goal',
+                                 self.on_raw_goal, 10)
         self.create_subscription(Odometry, '/odom_combined', self.on_odom, 20)
         self.create_subscription(Twist, '/cmd_vel', self.on_cmd, 20)
         # S2：当前是否有 Nav2 活动目标（无目标时立刻给下一个候选）
@@ -1235,6 +1255,82 @@ class Arbiter(Node):
                     * max(0.0, min(1.0, float(unk))))
             info['risk_unknown_share'] = round(float(unk), 3)
         return aux, info
+
+    # ================= P13-2A：原始 RRT 候选评分 =================
+    def on_raw_goal(self, m):
+        """收下 assigner 的原始目标（以前完全不经过本节点）。
+
+        同一坐标 0.30 m 内只保留最新一条：assigner 会每隔 ~8 s 重投同一个投影点，
+        不去重的话它会占满整个候选池（历史实测）。
+        """
+        now = time.monotonic()
+        x = float(m.pose.position.x)
+        y = float(m.pose.position.y)
+        self.raw_goals = [g for g in self.raw_goals
+                          if math.hypot(g[1] - x, g[2] - y) > 0.30]
+        self.raw_goals.append((now, x, y))
+        if len(self.raw_goals) > 40:
+            del self.raw_goals[:-40]
+        self.stats['raw_seen'] = self.stats.get('raw_seen', 0) + 1
+
+    def pick_raw_goal(self, now):
+        """在前沿候选全部派不出去时，从最近的 raw 样本里选风险最低的一条。
+
+        评分与前沿候选共用同一模型：u * p(dist) - aux(落点) - route(沿路)。
+        返回 (gx, gy, min_w, unknown, info) 或 None。
+
+        刻意不抢正常派发：只在 `_tick_v1` 的 passing/fallback 都为空之后才调用，
+        所以不会把已经合格的前沿候选挤掉。
+        """
+        if not self.raw_score_enabled or self.pose is None:
+            return None
+        self.raw_goals = [g for g in self.raw_goals
+                          if now - g[0] <= self.raw_max_age]
+        if not self.raw_goals:
+            return None
+        scored = []
+        for _t, rx, ry in self.raw_goals:
+            gx, gy = self.pull_back(rx, ry)
+            if self.failfast_blocked(gx, gy, now):
+                continue
+            d = math.hypot(gx - self.pose[0], gy - self.pose[1])
+            u = self.unknown_cells(gx, gy)
+            if self.blacklisted(gx, gy, now):
+                u -= 250
+            p = self.risk_discount(d)
+            aux, info = self.risk_aux(gx, gy, dist=d)
+            scored.append((u * p - aux, gx, gy, d, u, p, aux, info))
+        if not scored:
+            return None
+        scored.sort(key=lambda q: q[0], reverse=True)
+        best = None
+        for sc, gx, gy, d, u, p, aux, info in scored[:self.raw_score_n]:
+            ok, _narrow, min_w, unk = self.path_and_width(gx, gy)
+            if not ok:
+                self.stats['raw_unreachable'] = self.stats.get('raw_unreachable', 0) + 1
+                continue
+            route, rinfo = self.risk_route(min_w, unk)
+            row = dict(info)
+            row.update(rinfo)
+            row['risk_dist'] = round(d, 2)
+            row['risk_route'] = round(route, 1)
+            row['risk_discount_loss'] = round(u * (1.0 - p), 1)
+            row['risk_total'] = round(
+                aux + route + float(row['risk_discount_loss']), 1)
+            row['risk_source'] = 'raw_rrt'
+            row['risk_reachable'] = True
+            row['unknown'] = u
+            if best is None or (sc - route) > best[0]:
+                best = (sc - route, gx, gy, min_w, u, row, d)
+        if best is None:
+            return None
+        _f, gx, gy, min_w, u, row, d = best
+        # 超距保护：超过 raw_max_dist 只在"最近 raw_starve_sec 内没派过任何目标"时放行，
+        # 避免把车一下子送到 12~16 m 外的前沿（基线里 >6 m 的取消率 81%）。
+        if d > self.raw_max_dist and (now - self.last_pub) < self.raw_starve_sec:
+            self.stats['raw_overdist'] = self.stats.get('raw_overdist', 0) + 1
+            return None
+        return gx, gy, min_w, u, row
 
     def pick_safe_observation(self, cands):
         """V2-②：从候选里挑一个"开阔、连通、离车不远"的观察点（作为保底目标）。
@@ -2070,6 +2166,11 @@ class Arbiter(Node):
                 'risk_penalized': self.stats.get('risk_penalized', 0),
                 'risk_eval': self.stats.get('risk_eval', 0),
                 'risk_selected': self.stats.get('risk_selected', 0),
+                # P13-2A：原始 RRT 候选评分
+                'raw_seen': self.stats.get('raw_seen', 0),
+                'raw_publish': self.stats.get('raw_publish', 0),
+                'raw_overdist': self.stats.get('raw_overdist', 0),
+                'raw_unreachable': self.stats.get('raw_unreachable', 0),
             }
             if extra:
                 row.update(extra)
@@ -3117,6 +3218,24 @@ class Arbiter(Node):
                 '候选全部需要穿窄缝，回退派发最优点 (%.2f,%.2f)；统计 %s'
                 % (fallback[0], fallback[1], self.stats))
             self.publish_goal(fallback[0], fallback[1], None, 0)
+            return
+        # P13-2A：原始 RRT 候选也走同一套风险评分。
+        # 它排在保底观察点之前：raw 是真正的前沿收益点，观察点只是"站得住"。
+        raw = self.pick_raw_goal(now)
+        if raw is not None:
+            gx, gy, min_w, u, info = raw
+            self.stats['raw_publish'] = self.stats.get('raw_publish', 0) + 1
+            self._last_risk_info = info
+            self.get_logger().warn(
+                '原始 RRT 候选经风险评分派发：(%.2f,%.2f) 风险=%.1f '
+                '（距离 %.2f m、可脱困=%d 方向、路径宽=%s、块=%s）；raw_seen=%d'
+                % (gx, gy, float(info.get('risk_total', 0.0)),
+                   float(info.get('risk_dist', 0.0)),
+                   int(info.get('risk_esc_dirs', -1)),
+                   info.get('risk_min_w_path'), info.get('risk_comp_r2'),
+                   self.stats.get('raw_seen', 0)))
+            self.probe_candidate(gx, gy, None, min_w, u)
+            self.publish_goal(gx, gy, None, u)
             return
         obs = self.pick_safe_observation([(x, y) for _, _, x, y in scored])
         if obs is not None:
