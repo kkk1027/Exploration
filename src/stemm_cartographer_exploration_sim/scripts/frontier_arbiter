@@ -810,6 +810,17 @@ class Arbiter(Node):
         self.raw_max_dist = float(p('raw_max_dist_m', 8.0).value)
         self.raw_starve_sec = float(p('raw_starve_sec', 6.0).value)
         self.raw_score_n = max(1, int(p('raw_score_n', 3).value))
+        # ★ 2026-11-09 P13-2A 修正（A/B 实测发现）：
+        #   raw 分支必须与前沿候选走**同一套硬门**，否则会把车送到更差的地方。
+        #   实测（p13ab_b*，360 probe）分来源中位数：
+        #     frontier: esc_dirs 8,  min_w 1.30, risk_dist 4.00
+        #     raw_rrt : esc_dirs 0,  min_w 0.00, risk_dist 5.50（258 次尝试派发）
+        #   根因：原实现只检查 `ok`，丢掉了 `narrow`（窄段）信号。
+        #   另：raw 候选 esc_dirs 中位 0（落在死角），而加性罚分 120 压不住
+        #   u*p 上千的正收益，所以另加一道“可脱困方向数”下限。
+        self.raw_require_narrow_free = self._as_bool(
+            p('raw_require_narrow_free', True).value)
+        self.raw_min_esc = int(p('raw_min_esc_dirs', 3).value)
         self.raw_goals = []          # [(ts, x, y)]
 
         self.map = None
@@ -837,7 +848,7 @@ class Arbiter(Node):
                       'risk_penalized': 0, 'risk_eval': 0, 'risk_selected': 0,
                       # P13-2A 原始 RRT 候选
                       'raw_seen': 0, 'raw_publish': 0, 'raw_overdist': 0,
-                      'raw_unreachable': 0,
+                      'raw_unreachable': 0, 'raw_narrow': 0, 'raw_deadend': 0,
                       # P13-4a 脱困目标放宽轮触发次数
                       'escape_relaxed': 0}
 
@@ -1335,9 +1346,18 @@ class Arbiter(Node):
         scored.sort(key=lambda q: q[0], reverse=True)
         best = None
         for sc, gx, gy, d, u, p, aux, info in scored[:self.raw_score_n]:
-            ok, _narrow, min_w, unk = self.path_and_width(gx, gy)
+            # 可脱困下限：esc_dirs 太少 = 死口袋，任何收益都不值得（与 gate 同口径）
+            esc = int(info.get('risk_esc_dirs', 8))
+            if esc < self.raw_min_esc:
+                self.stats['raw_deadend'] = self.stats.get('raw_deadend', 0) + 1
+                continue
+            ok, narrow, min_w, unk = self.path_and_width(gx, gy)
             if not ok:
                 self.stats['raw_unreachable'] = self.stats.get('raw_unreachable', 0) + 1
+                continue
+            # ★ 与前沿候选同一套硬门：需要穿窄缝才能到 → 不派
+            if narrow is not None and self.raw_require_narrow_free:
+                self.stats['raw_narrow'] = self.stats.get('raw_narrow', 0) + 1
                 continue
             route, rinfo = self.risk_route(min_w, unk)
             row = dict(info)
@@ -2251,6 +2271,8 @@ class Arbiter(Node):
                 'raw_publish': self.stats.get('raw_publish', 0),
                 'raw_overdist': self.stats.get('raw_overdist', 0),
                 'raw_unreachable': self.stats.get('raw_unreachable', 0),
+                'raw_narrow': self.stats.get('raw_narrow', 0),
+                'raw_deadend': self.stats.get('raw_deadend', 0),
                 # P13-4a 脱困目标放宽轮
                 'escape_relaxed': self.stats.get('escape_relaxed', 0),
             }
