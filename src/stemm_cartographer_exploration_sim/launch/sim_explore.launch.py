@@ -157,6 +157,10 @@ def generate_launch_description():
                                 'inplace_min_robot_m': LaunchConfiguration('inplace_min_robot_m'),
                                 'inplace_only_beyond_m':
                                     LaunchConfiguration('inplace_only_beyond_m'),
+                                'inplace_max_occ_frac':
+                                    LaunchConfiguration('inplace_max_occ_frac'),
+                                'inplace_min_esc_dirs':
+                                    LaunchConfiguration('inplace_min_esc_dirs'),
                                 'inplace_max': LaunchConfiguration('inplace_max'),
                                 'inplace_cooldown_sec': LaunchConfiguration('inplace_cooldown_sec'),
                                 'inplace_min_disp_m': LaunchConfiguration('inplace_min_disp_m'),
@@ -484,6 +488,10 @@ def generate_launch_description():
         DeclareLaunchArgument('inplace_tries', default_value='48'),
         DeclareLaunchArgument('inplace_min_width_m', default_value='0.70'),
         DeclareLaunchArgument('inplace_min_robot_m', default_value='0.50'),
+        DeclareLaunchArgument('inplace_max_occ_frac', default_value='0.15',
+                              description='v2：G* 的 2 m 邻域占用率必须低于该值（显著优于触发阈值 0.30）'),
+        DeclareLaunchArgument('inplace_min_esc_dirs', default_value='4',
+                              description='v2：G* 的逃逸方向数必须 ≥ 该值（触发阈值是 3）'),
         DeclareLaunchArgument('inplace_only_beyond_m', default_value='0.0',
                               description='仅在离目标仍远(>该值)的早期阶段纠偏；接近目标后不再改向'),
         DeclareLaunchArgument('inplace_max', default_value='3'),

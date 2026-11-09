@@ -503,9 +503,13 @@ class Arbiter(Node):
         #   故只允许在**离目标仍远**的早期阶段纠偏（默认 >2.5 m），一旦接近就放手让
         #   当前目标跑完（此时若仍不合格，交由既有 cancel 兜底或下一轮候选处理）。
         self.inplace_only_beyond = float(p('inplace_only_beyond_m', 0.0).value)
-        self.inplace_max = int(p('inplace_max', 3).value)
+        # ★ v2：G* 必须"显著优于"原目标才值得纠偏——原判据只要求可达+代价门，
+        #   结果 58% 的纠偏位移 ≤0.5 m、把目标挪到同样拥挤的地方（停滞 +35%）。
+        self.inplace_max_occ = float(p('inplace_max_occ_frac', 0.15).value)
+        self.inplace_min_esc = int(p('inplace_min_esc_dirs', 4).value)
+        self.inplace_max = int(p('inplace_max', 1).value)
         self.inplace_cooldown = float(p('inplace_cooldown_sec', 3.0).value)
-        self.inplace_min_disp = float(p('inplace_min_disp_m', 0.30).value)
+        self.inplace_min_disp = float(p('inplace_min_disp_m', 1.00).value)
         self.inplace_fallback_cancel = self._as_bool(
             p('inplace_fallback_cancel', True).value)
         self._inplace_last = 0.0
@@ -1513,11 +1517,20 @@ class Arbiter(Node):
             return False
         if self.costmap is not None and self.cost_gate_reject(x, y, None, count=False):
             return False
-        # ★ 2026-11-04 实测修正：后置判据触发的前提就是"目标邻域拥挤"
-        #   （occ_frac_r2 ≥ 0.30 或 esc_dirs < 3），若再要求 G* 通过**同一套**
-        #   区域复杂度，几乎找不到点（实测 5 轮只纠偏 4 次）。G* 的定位是"就近的
-        #   合法临时落点"，判据只需：代价门（已在上面）+ 可达 + 净宽（外层校验）。
-        #   仍保留一条硬底线：G* 自身不能落在致命/内切格上（cost_gate_reject 已覆盖）。
+        # ★ v2：要求 G* 的区域质量**显著优于**触发阈值（触发是 occ≥0.30 / esc<3），
+        #   否则纠偏只是把目标挪到同样拥挤处（实测 58% 位移≤0.5 m ⇒ 停滞 +35%）。
+        field = self.clearance_field()
+        if field is not None:
+            try:
+                f = self.region_complexity(field, x, y)
+            except Exception:                               # noqa: BLE001
+                return False
+            if not f:
+                return False
+            if f['occ_frac_r2'] >= self.inplace_max_occ:
+                return False
+            if f['esc_dirs'] < self.inplace_min_esc:
+                return False
         return True
 
     def _nearest_valid_point(self, gx, gy, radius):
