@@ -99,6 +99,18 @@ def generate_launch_description():
                                 # 历史约 140 轮日志里 "[v3]" 出现 0 次 —— 一直是 v1 在跑。
                                 # 默认保持 v1（= 历史实测口径），要试 v3 必须显式 scoring:=v3。
                                 'scoring': LaunchConfiguration('scoring'),
+                                # ===== P13 派发风险评分（2026-11-09）=====
+                                # 依据 docs/P13_基线.md：距离是唯一统计显著的物理特征；
+                                # 默认开启，risk:=0 即完全回到改动前行为，便于 A/B。
+                                'risk_enabled': LaunchConfiguration('risk'),
+                                'risk_dist_half_m': LaunchConfiguration('risk_dist_half'),
+                                'risk_eval_n': LaunchConfiguration('risk_eval_n'),
+                                # P13-2A：原始 RRT 候选也过评分
+                                'raw_score_enabled': LaunchConfiguration('raw_score'),
+                                'raw_max_dist_m': LaunchConfiguration('raw_max_dist'),
+                                # P13-4a：脱困目标两轮搜索
+                                'escape_allow_narrow': LaunchConfiguration('escape_allow_narrow'),
+                                'escape_relax_turn': LaunchConfiguration('escape_relax_turn'),
                                 # 注意：这个 launch 参数以前**根本没接到仲裁器**
                                 # （声明了 corridor_width，但节点参数里没有映射），
                                 # 所以 CORRIDOR_W=0.85 一直是空操作（实测日志仍打 1.05）。
@@ -548,6 +560,21 @@ def generate_launch_description():
         DeclareLaunchArgument('scoring', default_value='v1',
             description='前沿收益函数版本：v1=未知格数/就近（历史实测口径），v2=邻域未知占比，'
                         'v3=朝前未知+贴已知边界（此前从未真正生效，需单独 A/B）'),
+        # ===== P13 派发风险评分（2026-11-09）=====
+        DeclareLaunchArgument('risk', default_value='true',
+            description='P13-1 派发风险评分总开关（false = 完全退回改动前行为）'),
+        DeclareLaunchArgument('risk_dist_half', default_value='4.5',
+            description='P13-1 距离折现半距（m）：2/5/9 m → 0.84/0.45/0.20，三点拟合基线'),
+        DeclareLaunchArgument('risk_eval_n', default_value='6',
+            description='P13-1 每拍收集多少个合格候选再按风险取优（1 = 退回"首个通过即派发"）'),
+        DeclareLaunchArgument('raw_score', default_value='true',
+            description='P13-2A 把 /assigned_frontier_goal 的原始候选也纳入风险评分'),
+        DeclareLaunchArgument('raw_max_dist', default_value='8.0',
+            description='P13-2A 原始候选距离上限（m），超出只在供给断流时放行'),
+        DeclareLaunchArgument('escape_allow_narrow', default_value='true',
+            description='P13-4a 脱困目标严格轮全空时，允许放宽轮（仍守 corridor_hard）'),
+        DeclareLaunchArgument('escape_relax_turn', default_value='true',
+            description='P13-4a 放宽轮的掉头余量是否降到 escape_turn_relax_m'),
         DeclareLaunchArgument('supervisor_unit_max_sec', default_value='8.0',
             description='脱困单元硬顶秒数（单元测试时调小以快速触发降级）'),
         DeclareLaunchArgument('supervisor_rotate_min_range', default_value='0.34',
