@@ -608,11 +608,23 @@ class Arbiter(Node):
         self.return_scan_radius = float(p('return_scan_radius_m', 0.60).value)
         self.escape_goal_enabled = self._as_bool(p('escape_goal_enabled', True).value)
         self.escape_min_clearance = float(p('escape_min_clearance_m', 0.55).value)
-        self.escape_max_dist = float(p('escape_max_dist_m', 1.60).value)
+        self.escape_max_dist = float(p('escape_max_dist_m', 2.00).value)
         self.escape_cooldown = float(p('escape_cooldown_sec', 8.0).value)
         self.escape_max_total = int(p('escape_max_total', 20).value)
         # P9-⑤(b)：脱困落点是否必须留出掉头空间（默认开）
-        self.escape_need_turn = bool(p('escape_need_turn', True).value)
+        # 注意：launch 传 ``escape_need_turn:=false`` 会被归一化成 bool，
+        # 用 bool(...) 读会把字符串 'false' 当成 True（历史踩过）。
+        self.escape_need_turn = self._as_bool(p('escape_need_turn', True).value)
+        # ===== P13-4a：脱困目标两轮搜索（2026-11-09）=====
+        # 机制（docs/P13_基线.md §5）：v2 五轮 giveup_40s 共 8 次、unit_start 共 0 次；
+        # 同批日志里 148/149/146 s 的长卡死都伴随"前沿全灭 → 脱困目标"反复失败。
+        # 原因：原判据要求"掉头空间 >=0.85 m 且 路径完全无窄段"，真橼死处几乎必然
+        # 一个都不满足 → 直接返回 None → 车继续原地待着。
+        # 所以改为：严格轮优先；全空时才跑放宽轮（仍守住几何硬下限）。
+        self.escape_allow_narrow = self._as_bool(p('escape_allow_narrow', True).value)
+        self.escape_relax_turn = self._as_bool(p('escape_relax_turn', True).value)
+        self.escape_turn_relax = float(p('escape_turn_relax_m', 0.70).value)
+        self.escape_min_comp = int(p('escape_min_comp_cells', 500).value)
         self._esc_last = 0.0
         self._esc_count = 0
         self.corridor_stride = max(1, int(p('corridor_stride_cells', 2).value))
@@ -809,7 +821,9 @@ class Arbiter(Node):
                       'risk_penalized': 0, 'risk_eval': 0, 'risk_selected': 0,
                       # P13-2A 原始 RRT 候选
                       'raw_seen': 0, 'raw_publish': 0, 'raw_overdist': 0,
-                      'raw_unreachable': 0}
+                      'raw_unreachable': 0,
+                      # P13-4a 脱困目标放宽轮触发次数
+                      'escape_relaxed': 0}
 
         qmap = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
                           durability=DurabilityPolicy.TRANSIENT_LOCAL)
@@ -1988,11 +2002,21 @@ class Arbiter(Node):
     def pick_escape_goal(self):
         """所有前沿候选都派不出去时，挑一个"先把车挪出去"的本地目标。
 
-        只在**车周围 escape_max_dist 内的自由格**里找，要求：
+        只在**车周围 escape_max_dist 内的自由格**里找。分两轮（P13-4a）：
+
+        严格轮（跟历史行为一致）：
           * 当前能到（costmap BFS，与前沿用同一套通行规则，但路径短得多）；
-          * 落点附近掉头空间 >= return_turn_width（挪过去之后能转过身）；
-          * 按"净空大、距离近"打分。
-        宁可不派也不乱派：找不到就返回 None。
+          * 路径完全无窄段；
+          * 落点附近掉头空间 >= return_turn_width；
+          * 连通自由格数 >= escape_min_comp。
+        放宽轮（仅严格轮全空时，escape_allow_narrow 控制）：
+          * 允许路径存在窄段，但最小净宽仍须 >= corridor_hard_m、未知占比 <= corridor_unknown_max；
+          * 掉头空间门槛降到 escape_turn_relax_m（默认 0.70，仍 > 车体对角线的一半）；
+          * 连通区不再硬过滤，只参与打分。
+
+        依据：v2 五轮 giveup_40s 8 次、unit_start 0 次，长卡死（148/149/146 s）
+        均伴随“前沿全灭 → 脱困目标”反复返回 None。
+        宁可不派也不乱派：两轮都找不到才返回 None。
         """
         if not self.escape_goal_enabled or self.pose is None:
             return None
@@ -2005,41 +2029,81 @@ class Arbiter(Node):
         if field is None:
             return None
         dist_m, ox, oy, res, w, h, _unknown = field
-        best, best_score = None, -1e9
-        r = 0.5
-        while r <= self.escape_max_dist + 1e-6:
-            for k in range(16):
-                ang = 2.0 * math.pi * k / 16.0
-                gx = self.pose[0] + math.cos(ang) * r
-                gy = self.pose[1] + math.sin(ang) * r
-                ci = int((gx - ox) / res); cj = int((gy - oy) / res)
-                if not (0 <= ci < w and 0 <= cj < h):
-                    continue
-                d_here = float(dist_m[cj, ci])
-                if 2.0 * d_here < self.escape_min_clearance:
-                    continue
-                # P9-⑤(b)：脱困目标是"挪出去"用的，落点必须**转得动身**
-                # （差速车对角线 0.81 m，掉头空间 < return_turn_width 就是换个地方继续卡）。
-                # 原来只查了净空 escape_min_clearance(0.55) < 0.85，等于没管掉头。
-                if self.escape_need_turn:
-                    turn = self.turn_space_near(gx, gy)
-                    if turn is not None and turn < self.return_turn_width:
+
+        def scan(relaxed):
+            """在车周环上采样合格落点。relaxed=False 为严格轮。"""
+            turn_need = self.return_turn_width
+            if relaxed and self.escape_relax_turn:
+                turn_need = min(self.return_turn_width, self.escape_turn_relax)
+            best, best_score = None, -1e9
+            r = 0.5
+            while r <= self.escape_max_dist + 1e-6:
+                for k in range(16):
+                    ang = 2.0 * math.pi * k / 16.0
+                    gx = self.pose[0] + math.cos(ang) * r
+                    gy = self.pose[1] + math.sin(ang) * r
+                    ci = int((gx - ox) / res); cj = int((gy - oy) / res)
+                    if not (0 <= ci < w and 0 <= cj < h):
                         continue
-                ok, narrow, _min_w, _unk = self.path_and_width(gx, gy)
-                if not ok or narrow is not None:
-                    continue
-                sc = 2.0 * d_here - 0.6 * r
-                if sc > best_score:
-                    best_score, best = sc, (gx, gy, d_here, r)
-            r += 0.25
+                    d_here = float(dist_m[cj, ci])
+                    if 2.0 * d_here < self.escape_min_clearance:
+                        continue
+                    # P9-⑤(b)：脱困目标必须**转得动身**（差速车对角线 0.81 m）。
+                    if self.escape_need_turn:
+                        turn = self.turn_space_near(gx, gy)
+                        if turn is not None and turn < turn_need:
+                            continue
+                    ok, narrow, min_w, unk = self.path_and_width(gx, gy)
+                    if not ok:
+                        continue
+                    if narrow is not None:
+                        # 严格轮：窄段一律不派；
+                        # 放宽轮：只放行"真的够宽、而且宽度不是靠未知格撑出来"的。
+                        if not (relaxed and self.escape_allow_narrow):
+                            continue
+                        if min_w is None or min_w < self.corridor_hard:
+                            continue
+                        if unk is not None and unk > self.corridor_unknown_max:
+                            continue
+                    # 连通区：严格轮当硬判据（历史行为），放宽轮只参与打分 ——
+                    # 橼死处本来就常常是一个小连通区，再拿它硬筛等于没放宽。
+                    comp = 9999
+                    if self.escape_min_comp > 0 or relaxed:
+                        try:
+                            f = self.region_complexity(field, gx, gy)
+                        except Exception:               # noqa: BLE001
+                            f = {}
+                        comp = int((f or {}).get('comp_r2', 0))
+                    if (not relaxed and self.escape_min_comp > 0
+                            and comp < self.escape_min_comp):
+                        continue
+                    # 净空大 + 连通区大 + 距离近
+                    sc = (2.0 * d_here - 0.6 * r
+                          + 0.5 * min(comp, 2000) / 1000.0)
+                    if sc > best_score:
+                        best_score, best = sc, (gx, gy, d_here, r, relaxed)
+                r += 0.25
+            return best
+
+        best = scan(False)
+        if best is None and self.escape_allow_narrow:
+            self.stats['escape_relaxed'] = self.stats.get('escape_relaxed', 0) + 1
+            best = scan(True)
+            if best is not None:
+                self.get_logger().warn(
+                    '脱困目标严格轮全空 → 启用放宽轮（允许窄段，净宽>=%.2f、未知<=%.0f%%、'
+                    '掉头>=%.2f m）' % (self.corridor_hard,
+                                      100 * self.corridor_unknown_max,
+                                      self.escape_turn_relax))
         if best is None:
             return None
         self._esc_last = now
         self._esc_count += 1
         self.stats['escape_goal'] = self.stats.get('escape_goal', 0) + 1
         self.get_logger().warn(
-            '前沿全部派不出去 → 派脱困目标 (%.2f,%.2f)（净空 %.2f m、距车 %.2f m）；第 %d 次'
-            % (best[0], best[1], best[2], best[3], self._esc_count))
+            '前沿全部派不出去 → 派脱困目标 (%.2f,%.2f)（净空 %.2f m、距车 %.2f m%s）；第 %d 次'
+            % (best[0], best[1], best[2], best[3],
+               '、放宽轮' if best[4] else '', self._esc_count))
         return (best[0], best[1])
 
     def candidate_gate(self, gx, gy):
@@ -2171,6 +2235,8 @@ class Arbiter(Node):
                 'raw_publish': self.stats.get('raw_publish', 0),
                 'raw_overdist': self.stats.get('raw_overdist', 0),
                 'raw_unreachable': self.stats.get('raw_unreachable', 0),
+                # P13-4a 脱困目标放宽轮
+                'escape_relaxed': self.stats.get('escape_relaxed', 0),
             }
             if extra:
                 row.update(extra)
