@@ -3255,20 +3255,23 @@ class Arbiter(Node):
             # 那样加风险项等于没加。这里收集前 risk_eval_n 个合格者，
             # 叠加沿路风险（窄段/未知占比）后取最优。
             route_pen, route_info = self.risk_route(min_w, unk)
-            info = dict(risk_of.get((round(x, 2), round(y, 2))) or {})
+            _key = (round(x, 2), round(y, 2))
+            _raw = raw_of.get(_key, u)      # 折现前的收益，保持日志口径不变
+            info = dict(risk_of.get(_key) or {})
             info.update(route_info)
             info['risk_dist'] = round(-negd, 2)
             info['risk_route'] = round(route_pen, 1)
-            _raw = raw_of.get((round(x, 2), round(y, 2)), u)
             info['risk_discount_loss'] = round(
                 _raw * (1.0 - self.risk_discount(-negd)), 1)
             info['risk_total'] = round(
                 float(info.get('risk_aux', 0.0)) + route_pen
                 + float(info['risk_discount_loss']), 1)
             info['risk_source'] = 'frontier'
-            passing.append((u - route_pen, gx, gy, u, min_w, info))
+            passing.append((u - route_pen, gx, gy, _raw, min_w, info))
             self.stats['risk_eval'] = self.stats.get('risk_eval', 0) + 1
-            if len(passing) >= self.risk_eval_n:
+            # risk 关闭时只收 1 个：必须*逐位*等价旧行为（旧逻辑是"near_first
+            # 排序后第一个通过硬门的候选"，而不是"前 6 个里未知格最多的"）。
+            if len(passing) >= (self.risk_eval_n if self.risk_enabled else 1):
                 break
         if passing:
             passing.sort(key=lambda q: q[0], reverse=True)
