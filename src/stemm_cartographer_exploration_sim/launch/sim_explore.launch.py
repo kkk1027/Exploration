@@ -155,6 +155,8 @@ def generate_launch_description():
                                 'inplace_tries': LaunchConfiguration('inplace_tries'),
                                 'inplace_min_width_m': LaunchConfiguration('inplace_min_width_m'),
                                 'inplace_min_robot_m': LaunchConfiguration('inplace_min_robot_m'),
+                                'inplace_only_beyond_m':
+                                    LaunchConfiguration('inplace_only_beyond_m'),
                                 'inplace_max': LaunchConfiguration('inplace_max'),
                                 'inplace_cooldown_sec': LaunchConfiguration('inplace_cooldown_sec'),
                                 'inplace_min_disp_m': LaunchConfiguration('inplace_min_disp_m'),
@@ -482,6 +484,8 @@ def generate_launch_description():
         DeclareLaunchArgument('inplace_tries', default_value='48'),
         DeclareLaunchArgument('inplace_min_width_m', default_value='0.70'),
         DeclareLaunchArgument('inplace_min_robot_m', default_value='0.50'),
+        DeclareLaunchArgument('inplace_only_beyond_m', default_value='0.0',
+                              description='仅在离目标仍远(>该值)的早期阶段纠偏；接近目标后不再改向'),
         DeclareLaunchArgument('inplace_max', default_value='3'),
         DeclareLaunchArgument('inplace_cooldown_sec', default_value='3.0'),
         DeclareLaunchArgument('inplace_min_disp_m', default_value='0.30'),

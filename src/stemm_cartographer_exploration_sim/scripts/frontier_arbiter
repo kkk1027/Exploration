@@ -497,6 +497,12 @@ class Arbiter(Node):
         self.inplace_min_width = float(p('inplace_min_width_m', 0.70).value)
         self.inplace_min_robot = float(p('inplace_min_robot_m', 0.50).value)
         self.inplace_min_goal = float(p('inplace_min_goal_m', 0.20).value)
+        # ★ 2026-11-04 实测修正：对"已在正常推进"的目标中途改向会显著抬高停滞
+        #   （ab4 组 r3/r4/r5 停滞 109/81/87 s，而 A 组 23~54 s）。原始数据里
+        #   被取消的目标多数是"已跑 8~14 s、剩余仅 5 m"的正常推进。
+        #   故只允许在**离目标仍远**的早期阶段纠偏（默认 >2.5 m），一旦接近就放手让
+        #   当前目标跑完（此时若仍不合格，交由既有 cancel 兜底或下一轮候选处理）。
+        self.inplace_only_beyond = float(p('inplace_only_beyond_m', 0.0).value)
         self.inplace_max = int(p('inplace_max', 3).value)
         self.inplace_cooldown = float(p('inplace_cooldown_sec', 3.0).value)
         self.inplace_min_disp = float(p('inplace_min_disp_m', 0.30).value)
@@ -1627,7 +1633,12 @@ class Arbiter(Node):
             return None
         reason = ','.join(why)
         # ---- P12：原地纠偏（不取消目标）优先 ----
-        if self.veto_inplace:
+        if self.veto_inplace and self.pose is not None and \
+                math.hypot(gx - self.pose[0], gy - self.pose[1]) < self.inplace_only_beyond:
+            # 已接近目标：不再中途改向（实测会显著抬高停滞），沿用既有兜底
+            if not self.inplace_fallback_cancel:
+                return reason
+        elif self.veto_inplace:
             rep0 = self._nearest_valid_point(gx, gy, self.inplace_radius)
             if rep0 is not None and self._publish_goal_update(
                     rep0[0], rep0[1], reason, gx, gy, now):
