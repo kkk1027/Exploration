@@ -281,6 +281,22 @@ def _merge_ratio(round_dir):
     return out
 
 
+def count_escape_goals(round_dir):
+    """改轮内"前沿全灭 → 派脱困目标"的次数（arbiter 日志）。
+
+    这是 P13-4a 的直接观测值：基线多轮为 0（严格轮全空直接返回 None），
+    改造后应 >=1/轮。
+    """
+    lp = os.path.join(round_dir, 'launch.log')
+    if not os.path.exists(lp):
+        return 0
+    n = 0
+    for line in open(lp, encoding='utf-8', errors='replace'):
+        if '派脱困目标' in line:
+            n += 1
+    return n
+
+
 def _bucket_report(rows, key, buckets, title):
     """按 key 分桶统计取消率。rows 需含 label 与非 None 的 key。
 

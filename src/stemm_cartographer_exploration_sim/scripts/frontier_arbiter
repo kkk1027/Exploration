@@ -488,7 +488,23 @@ class Arbiter(Node):
         #   外层 NavigateToPose 动作继续（到 G* 由 controller 判成功：
         #   controller_server.cpp:439 用 path.poses.back() 做目标校验）。
         #   默认 False（行为与现状完全一致），灰度验证后由用户切 True。
+        #
+        # ⚠ 2026-11-09 P13-5：**该模式已被强制停用**。原因：nav2_behavior_tree 的
+        #   GoalUpdater 用实例成员 last_goal_received_ 缓存 /goal_update，且不随新的
+        #   NavigateToPose 目标复位（见 goal_updater_node.cpp:53-56）。一旦发过一次
+        #   goal_update，之后每个新目标都可能被替换成那次旧纠偏点 → controller 首次
+        #   isGoalReached() 就命中 → 30 ms "Reached the goal!"（幻影成功）。
+        #   实测 v2 五轮 79.2% 的 reached 属于这一类，而 offv2 五轮（未触发 inplace）
+        #   幻影数 = 0。配套改动：BT 里已移除 GoalUpdater 装饰器。
+        #   因此即使这里被设为 true，也不得不降级为 migrate（cancel）模式 ——
+        #   否则 /goal_update 发出去也无人消费，等于静默失效。
         self.veto_inplace = self._as_bool(p('veto_inplace', False).value)
+        if self.veto_inplace:
+            self.get_logger().error(
+                'veto_inplace 已停用（P13-5）：nav2 GoalUpdater 会跨导航目标污染 '
+                '{goal}，导致 79% 的目标 30 ms 内假成功、整车冻住。'
+                '本节点已自动降级为 veto_migrate 模式；如需恢复请先修 BT/GoalUpdater。')
+            self.veto_inplace = False
         self.inplace_radius = float(p('inplace_radius_m', 3.5).value)
         self.inplace_tries = int(p('inplace_tries', 48).value)
         # ★ inplace 专用判据：migrate 的 veto_migrate_min_move(1.0 m) 是为了"把目标挪开"，
