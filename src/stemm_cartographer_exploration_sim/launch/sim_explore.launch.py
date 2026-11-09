@@ -111,6 +111,9 @@ def generate_launch_description():
                                 # P13-4a：脱困目标两轮搜索
                                 'escape_allow_narrow': LaunchConfiguration('escape_allow_narrow'),
                                 'escape_relax_turn': LaunchConfiguration('escape_relax_turn'),
+                                # P13-3：三处硬门降级为软约束（只留 corridor_hard 硬下限）
+                                'route_gate_soft': LaunchConfiguration('route_gate_soft'),
+                                'risk_w_soft': LaunchConfiguration('risk_w_soft'),
                                 # 注意：这个 launch 参数以前**根本没接到仲裁器**
                                 # （声明了 corridor_width，但节点参数里没有映射），
                                 # 所以 CORRIDOR_W=0.85 一直是空操作（实测日志仍打 1.05）。
@@ -575,6 +578,11 @@ def generate_launch_description():
             description='P13-4a 脱困目标严格轮全空时，允许放宽轮（仍守 corridor_hard）'),
         DeclareLaunchArgument('escape_relax_turn', default_value='true',
             description='P13-4a 放宽轮的掉头余量是否降到 escape_turn_relax_m'),
+        DeclareLaunchArgument('route_gate_soft', default_value='true',
+            description='P13-3 pass_width/narrow_len_max/unknown_span_max 降为软约束'
+                        '（仅 corridor_hard_m 保持硬下限）；false=历史硬门行为'),
+        DeclareLaunchArgument('risk_w_soft', default_value='900.0',
+            description='P13-3 软门罚分权重（窄/未知/长窄段折算后的最大扣分）'),
         DeclareLaunchArgument('supervisor_unit_max_sec', default_value='8.0',
             description='脱困单元硬顶秒数（单元测试时调小以快速触发降级）'),
         DeclareLaunchArgument('supervisor_rotate_min_range', default_value='0.34',

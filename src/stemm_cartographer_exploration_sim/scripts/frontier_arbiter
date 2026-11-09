@@ -782,6 +782,13 @@ class Arbiter(Node):
         # 而基线里这类派发 81% 是直接取消的。
         self.risk_enabled = self._as_bool(p('risk_enabled', True).value)
         self.risk_dist_half = max(0.5, float(p('risk_dist_half_m', 4.5).value))
+        # P13-3：把 pass_width / narrow_len_max / unknown_span_max 三处硬门
+        # 降级为软约束（只保留 corridor_hard_m 作为几何硬下限）。
+        # 依据：p13c A/B 实测 rejected_narrow 812~936 次/轮 vs published 29~33 次/轮，
+        # 供给被砍到只剩 10%，merge 因此回落到未评分的 raw（47~103 条/轮）。
+        self.route_gate_soft = self._as_bool(p('route_gate_soft', True).value)
+        self.risk_w_soft = float(p('risk_w_soft', 900.0).value)
+        self._last_path_soft = 0.0
         self.risk_eval_n = max(1, int(p('risk_eval_n', 6).value))
         self.risk_w_turn = float(p('risk_w_turn', 60.0).value)
         self.risk_w_egress = float(p('risk_w_egress', 120.0).value)
@@ -843,7 +850,8 @@ class Arbiter(Node):
                       'reject_noexit': 0, 'noexit_passed': 0, 'noexit_checked': 0,
                       'gate_reject': 0, 'gate_penalized': 0,
                       'reject_cost': 0, 'cost_checked': 0, 'repair_cost': 0,
-                      'escape_zones': 0,
+                      'escape_zones': 0, 'reject_narrow_hard': 0,
+                      'route_soft_pass': 0,
                       # P13-1 风险评分观测口径（只用于 A/B 归因）
                       'risk_penalized': 0, 'risk_eval': 0, 'risk_selected': 0,
                       # P13-2A 原始 RRT 候选
@@ -1295,6 +1303,12 @@ class Arbiter(Node):
             aux += (self.risk_w_route * 0.5
                     * max(0.0, min(1.0, float(unk))))
             info['risk_unknown_share'] = round(float(unk), 3)
+        # P13-3：硬门降级后的软门罚分（幅度足以把窄路排到宽路之后，
+        # 但不会像硬门那样直接掐断供给出去）
+        soft = float(getattr(self, '_last_path_soft', 0.0) or 0.0)
+        if soft > 0.0:
+            aux += self.risk_w_soft * min(1.0, soft)
+            info['risk_soft_gate'] = round(soft, 3)
         return aux, info
 
     # ================= P13-2A：原始 RRT 候选评分 =================
@@ -2256,6 +2270,8 @@ class Arbiter(Node):
                 'reject_corridor': self.stats.get('reject_corridor', 0),
                 'corridors_active': len(self.corridors),
                 'reject_noexit': self.stats.get('reject_noexit', 0),
+                'reject_narrow_hard': self.stats.get('reject_narrow_hard', 0),
+                'route_soft_pass': self.stats.get('route_soft_pass', 0),
                 'noexit_passed': self.stats.get('noexit_passed', 0),
                 'noexit_checked': self.stats.get('noexit_checked', 0),
                 'pinch_len_max': self.stats.get('pinch_len_max', 0.0),
@@ -2429,6 +2445,8 @@ class Arbiter(Node):
         判据：路径上任一点，垂直方向上连续自由格（<90 且已知）的总长必须 >= corridor_width，
         以免把目标派到"必须挤过窄缝"的地方 —— 这正是反复楔死的来源。
         """
+        # P13-3：每次调用先清零，防止上一次路径的软门罚分泄漏到本次
+        self._last_path_soft = 0.0
         cm = self.costmap
         if cm is None or self.pose is None:
             return True, None, None, 0.0
@@ -2566,6 +2584,42 @@ class Arbiter(Node):
             if min_at is None:
                 self._last_path_reject = None
                 return True, None, None, 0.0
+            # ===== P13-3：硬门降级为软约束（2026-11-09）=====
+            # 实测依据（p13c A/B，各 5 轮）：
+            #   rejected_narrow 812~936 次/轮，而 published 只有 29~33 次/轮；
+            #   仲裁器供不起货 → frontier_merge 在 validated TTL(5 s) 过期后
+            #   直接转发**未评分**的 raw（47~103 条/轮）→ 实际派发由 raw 主导
+            #   → 距离/转角无法改善（B 组 5.26 m / 83° 反而略差）。
+            # 所以三处"一刀切否决"改为：只在几何上真过不去时硬拒（corridor_hard），
+            # 其余换成大额罚分进 risk_route，让排序决定而不是直接没得选。
+            if self.route_gate_soft:
+                if min_w < self.corridor_hard:
+                    self._last_path_reject = 'narrow_hard'
+                    self.stats['reject_narrow_hard'] = self.stats.get(
+                        'reject_narrow_hard', 0) + 1
+                    return True, min_at, min_w, min_unk   # 真过不去：几何硬门
+                # 通过，但把"窄 / 未知 / 长窄段"折算成额外风险交给排序
+                soft = 0.0
+                if min_w < self.risk_route_target:
+                    # ★ 归一化基准必须用 corridor_hard → risk_route_target，
+                    #   不能用 pass_width：默认 corridor_hard(0.92) > pass_width(0.90)，
+                    #   而 min_w < corridor_hard 已被上面硬拒，于是
+                    #   `min_w < pass_width` 恒为 false，宽度项会变成死代码
+                    #   （首版实现的实际缺陷）。
+                    span = max(1e-6, self.risk_route_target - self.corridor_hard)
+                    soft += min(1.0, (self.risk_route_target - min_w) / span)
+                if narrow_len_max_run > self.narrow_len_max:
+                    soft += min(1.0, (narrow_len_max_run - self.narrow_len_max)
+                                / max(1e-6, self.narrow_len_max))
+                if unknown_run_max > self.unknown_span_max:
+                    soft += min(1.0, (unknown_run_max - self.unknown_span_max)
+                                / max(1e-6, self.unknown_span_max))
+                self._last_path_soft = round(soft, 3)
+                self.stats['route_soft_pass'] = self.stats.get(
+                    'route_soft_pass', 0) + 1
+                self._last_path_reject = None
+                return True, None, min_w, min_unk
+            self._last_path_soft = 0.0
             if narrow_len_max_run > self.narrow_len_max and not self.noexit_enabled:
                 self._last_path_reject = 'narrow'
                 return True, min_at, min_w, min_unk      # 窄段太长 → 否决
