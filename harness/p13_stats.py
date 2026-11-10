@@ -36,17 +36,35 @@ import analyze_efficiency as aef
 
 
 def _dirs(pats):
-    out = []
-    seen = set()
+    """展开 glob 并按**轮次标签**去重。
+
+    ★ 为什么按标签去重而不是按路径：
+      `p13_rerun.sh` 补跑会产生**同名标签的新目录**（如两个 `..._p13e1_a1`，
+      时间戳不同）。若都保留，`{tag: metrics}` 字典会让后者的指标覆盖前者，
+      而这个覆盖顺序取决于 glob 的字典序 —— 不可靠，且会让"轮数"显示成 11。
+      正确做法：同一标签只留**数据最全**的那一份（timeline 行数最多）。
+    """
+    best = {}
     for p in pats:
         got = sorted(glob.glob(p)) or ([p] if os.path.isdir(p) else [])
         for d in got:
-            rp = os.path.realpath(d)
-            if rp in seen:
-                continue
-            seen.add(rp)
-            out.append(d)
-    return out
+            tag = _tag(d)
+            n = _timeline_lines(d)
+            prev = best.get(tag)
+            if prev is None or n > prev[0]:
+                best[tag] = (n, d)
+    return [v[1] for v in best.values()]
+
+
+def _timeline_lines(d):
+    p = os.path.join(d, 'timeline.jsonl')
+    if not os.path.exists(p):
+        return 0
+    try:
+        with open(p, encoding='utf-8', errors='ignore') as f:
+            return sum(1 for _ in f)
+    except Exception:                              # noqa: BLE001
+        return 0
 
 
 def _tag(d):
@@ -55,6 +73,23 @@ def _tag(d):
     if '_' in n:
         return n.rsplit('_', 1)[-1]
     return n
+
+
+def _idx(tag):
+    """从标签取末尾轮号：'a12' → 12。取不到返回 None。
+
+    ★ 必须按轮号配对，不能按列表顺序 zip。
+      反例（真实发生过）：A 组缺 a1、B 组完整时，
+      zip([a2..a10], [b1..b10]) 会把 a2 和 b1 配成一对，
+      之后全部错位 —— 而且**不会报错**，只是把所有差值算错。
+    """
+    s = ''
+    for ch in reversed(tag):
+        if ch.isdigit():
+            s = ch + s
+        else:
+            break
+    return int(s) if s else None
 
 
 def collect(dirs):
@@ -161,9 +196,45 @@ def main():
 
     A = collect(adirs)
     B = collect(bdirs)
-    # 按轮号配对：a1↔b1，a2↔b2
-    ka = list(A.keys())
-    kb = list(B.keys())
+    # 按**轮号**配对：a1↔b1、a2↔b2（不是按列表顺序 zip）
+    a_by_idx = {}
+    for k in A:
+        i = _idx(k)
+        if i is not None:
+            a_by_idx[i] = k
+    b_by_idx = {}
+    for k in B:
+        i = _idx(k)
+        if i is not None:
+            b_by_idx[i] = k
+    common = sorted(set(a_by_idx) & set(b_by_idx))
+    only_a = sorted(set(a_by_idx) - set(b_by_idx))
+    only_b = sorted(set(b_by_idx) - set(a_by_idx))
+    if only_a or only_b:
+        print('⚠ 配对不完整：仅 A 有轮号 %s；仅 B 有轮号 %s\n'
+              '   → 这些轮次被丢弃（缺少对手轮，无法配对），'
+              '建议用 p13_rerun.sh 补齐。'
+              % (only_a or '无', only_b or '无'))
+    if not common:
+        print('没有任何可配对的轮号（A 与 B 的标签轮号无交集）', file=sys.stderr)
+        return 2
+    # ★ 轮号相同不等于"有数据"：某轮可能因 sensor preflight 超时只留下空目录。
+    #   这里把"该轮到底有没有指标"也算进去，否则会显示 10 对而实际只用 9 对，
+    #   让读者以为是满样本。
+    def _has_data(tbl, i):
+        return bool(tbl.get(i))
+    usable = [i for i in common
+              if _has_data({k: A[a_by_idx[k]] for k in common}, i)
+              or _has_data({k: B[b_by_idx[k]] for k in common}, i)]
+    empty = [i for i in common if i not in usable]
+    if empty:
+        print('⚠ 轮号 %s 的目录存在但**没有指标数据**（多为 preflight 超时/'
+              '提前退出），已从配对中剔除。' % empty)
+    if not usable:
+        print('所有配对轮次都没有数据', file=sys.stderr)
+        return 2
+    print('可配对轮号 %d/%d 对（有数据）：%s'
+          % (len(usable), len(common), usable))
     metrics = a.metric or ['dist_med', 'cancel_rate', 'turn_med',
                            'dist_gt6_pct', 'score_cover', 'vbr',
                            'path_m', 'move_pct', 'known_cells']
@@ -172,8 +243,8 @@ def main():
     print('-' * 88)
     out = {}
     for m in metrics:
-        av = [A[k].get(m) for k in ka]
-        bv = [B[k].get(m) for k in kb]
+        av = [A[a_by_idx[i]].get(m) for i in common]
+        bv = [B[b_by_idx[i]].get(m) for i in common]
         if all(v is None for v in av + bv):
             continue
         s = pair_stats(av, bv, n_boot=a.boot)

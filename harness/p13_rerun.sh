@@ -32,15 +32,21 @@ MIN_LINES="${MIN_LINES:-100}"
 
 cd "$BASE" || exit 1
 
-ok_count () {          # $1=tag
-  local f
-  f=$(ls -d "logs/round_*_${PREFIX}_$1" 2>/dev/null | head -1)
-  [ -z "$f" ] && { echo 0; return; }
-  if [ -f "$f/timeline.jsonl" ]; then
-    wc -l < "$f/timeline.jsonl"
-  else
-    echo 0
-  fi
+ok_count () {          # $1=tag → 该标签下**所有**同名目录里的最大 timeline 行数
+  # ★ 曾经的 bug（2026-11-10 实测踩到）：
+  #     f=$(ls -d "logs/round_*_${PREFIX}_$1" | head -1)
+  #   `head -1` 取的是字典序第一个 = 时间戳最早 = 上一次失败的**空目录**，
+  #   于是永远返回 0，判定"全部 20 轮都要补跑"，白白要跑 3 小时。
+  #   补跑必然产生同名目录，所以必须遍历全部候选、取数据最全的一份。
+  local max=0 f n
+  for f in logs/round_*_${PREFIX}_$1; do
+    [ -d "$f" ] || continue
+    if [ -f "$f/timeline.jsonl" ]; then
+      n=$(wc -l < "$f/timeline.jsonl")
+      [ "$n" -gt "$max" ] && max=$n
+    fi
+  done
+  echo "$max"
 }
 
 run_round () {         # $1=组名  $2=轮号
