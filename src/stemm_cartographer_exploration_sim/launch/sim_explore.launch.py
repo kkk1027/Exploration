@@ -117,6 +117,10 @@ def generate_launch_description():
                                 # P13-6：判决发布开关与时效
                                 'verdict_enabled': LaunchConfiguration('verdict'),
                                 'verdict_ttl_sec': LaunchConfiguration('verdict_ttl'),
+                                # E6：raw 判决判据标定（默认值 = 历史行为）
+                                'raw_min_esc_dirs': LaunchConfiguration('raw_min_esc_dirs'),
+                                'raw_require_narrow_free':
+                                    LaunchConfiguration('raw_require_narrow_free'),
                                 # 注意：这个 launch 参数以前**根本没接到仲裁器**
                                 # （声明了 corridor_width，但节点参数里没有映射），
                                 # 所以 CORRIDOR_W=0.85 一直是空操作（实测日志仍打 1.05）。
@@ -605,6 +609,13 @@ def generate_launch_description():
         DeclareLaunchArgument('verdict_force_after', default_value='15.0',
             description='P13-6 饿死保护：连续这么久没有任何目标输出给 manager 时，'
                         '无视负判决放行一条（防止上游全判死后 manager 空等）'),
+        DeclareLaunchArgument('raw_min_esc_dirs', default_value='3',
+            description='E6 标定：raw 候选被判 dead_end 的可脱困方向数下限。'
+                        '实测取 3 时 100% 的 RRT raw 都被判死（feasible 恒为 0），'
+                        '导致判决契约退化为纯黑名单。扫 {0,1,2,3} 找分界点'),
+        DeclareLaunchArgument('raw_require_narrow_free', default_value='true',
+            description='E6 标定：raw 候选是否必须“不用穿窄缝”。'
+                        'true 时窄道判据也会否决一大批候选'),
         DeclareLaunchArgument('supervisor_unit_max_sec', default_value='8.0',
             description='脱困单元硬顶秒数（单元测试时调小以快速触发降级）'),
         DeclareLaunchArgument('supervisor_rotate_min_range', default_value='0.34',
