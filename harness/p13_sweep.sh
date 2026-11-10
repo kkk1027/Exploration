@@ -90,7 +90,14 @@ for arm in "${ARMS[@]}"; do
   label="${arm%%:*}"
   bad=0
   for i in $(seq 1 "$N"); do
-    f=$(ls -d "logs/round_*_${PREFIX}_${label}${i}" 2>/dev/null | head -1)
+    # ★ glob 不能放双引号里 —— 引号内 bash 不展开通配符，
+    #   `ls -d "logs/round_*_p13e6_e01"` 会因字面路径不存在而失败，
+    #   于是每一轮都被误报成"缺失"（E6 收尾时实测踩到：
+    #   20 轮全部有 450+ 行数据，却报 0/5 可用）。
+    f=""
+    for cand in logs/round_*_${PREFIX}_${label}${i}; do
+      [ -d "$cand" ] && f="$cand"
+    done
     if [ -z "$f" ] || [ ! -f "$f/timeline.jsonl" ]; then
       bad=$((bad+1))
     fi
