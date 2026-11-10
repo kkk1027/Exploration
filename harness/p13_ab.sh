@@ -28,8 +28,8 @@ BASE=/home/kbf/stemm_exploration_sim_ws
 
 echo "=============================================="
 echo " P13 A/B 跑批：每组 ${N} 轮，交错执行"
-echo "   基线组 A: RISK=0 RAW_SCORE=0 ESC_ALLOW_NARROW=0 ROUTE_GATE_SOFT=0"
-echo "   实验组 B: RISK=1 RAW_SCORE=1 ESC_ALLOW_NARROW=1 ROUTE_GATE_SOFT=1"
+echo "   基线组 A: RISK=0 RAW_SCORE=0 ESC_ALLOW_NARROW=0 ROUTE_GATE_SOFT=0 VERDICT=0"
+echo "   实验组 B: RISK=1 RAW_SCORE=1 ESC_ALLOW_NARROW=1 ROUTE_GATE_SOFT=1 VERDICT=1"
 echo "   两组都: VETO_INPLACE=0（避免幻影成功污染）"
 echo "=============================================="
 
@@ -39,10 +39,12 @@ run_one () {           # $1=组名(a/b)  $2=轮号
   echo
   echo "-------- [${tag}] $(date '+%H:%M:%S') --------"
   if [ "$grp" = "a" ]; then
-    RISK=0 RAW_SCORE=0 ESC_ALLOW_NARROW=0 ROUTE_GATE_SOFT=0 VETO_INPLACE=0 \
+    RISK=0 RAW_SCORE=0 ESC_ALLOW_NARROW=0 ROUTE_GATE_SOFT=0 VERDICT=0 \
+      VETO_INPLACE=0 \
       bash "$BASE/harness/round.sh" "$tag" "$EXPLORE"
   else
-    RISK=1 RAW_SCORE=1 ESC_ALLOW_NARROW=1 ROUTE_GATE_SOFT=1 VETO_INPLACE=0 \
+    RISK=1 RAW_SCORE=1 ESC_ALLOW_NARROW=1 ROUTE_GATE_SOFT=1 VERDICT=1 \
+      VETO_INPLACE=0 \
       bash "$BASE/harness/round.sh" "$tag" "$EXPLORE"
   fi
   local rc=$?

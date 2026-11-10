@@ -35,6 +35,73 @@ import rclpy
 from geometry_msgs.msg import PoseStamped
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
+from std_msgs.msg import String
+
+
+# =====================================================================
+# 纯函数（不依赖 ROS）——供 harness/test_verdict_propagation.py 离线秒级验证
+# =====================================================================
+NEGATIVE_VERDICTS = ('dead_end', 'unreachable', 'too_narrow', 'over_dist')
+
+
+def parse_verdict(data):
+    """把 /frontier_verdict 的 JSON 文本解成 (key, x, y, verdict, score)。
+
+    容错优先：任何字段缺失/格式错都返回 None，绝不让一条坏消息打死节点。
+    """
+    try:
+        o = json.loads(data)
+    except Exception:                          # noqa: BLE001
+        return None
+    v = o.get('v')
+    if not isinstance(v, str) or not v:
+        return None
+    k = o.get('k')
+    if isinstance(k, (list, tuple)) and len(k) == 2:
+        try:
+            key = (int(k[0]), int(k[1]))
+        except Exception:                      # noqa: BLE001
+            return None
+    else:
+        # 没有 k 字段时退回自己量化（与仲裁器同一 0.30 m 网格）
+        try:
+            key = (int(math.floor(float(o['x']) / 0.30)),
+                   int(math.floor(float(o['y']) / 0.30)))
+        except Exception:                      # noqa: BLE001
+            return None
+    try:
+        score = float(o.get('s', 0.0))
+    except Exception:                          # noqa: BLE001
+        score = 0.0
+    return key, float(o.get('x', 0.0)), float(o.get('y', 0.0)), v, score
+
+
+def lookup_verdict(verdicts, x, y, radius, ttl, now):
+    """在半径 radius 内找**最新的未过期**判决。返回 (verdict, age) 或 (None, None)。
+
+    为什么按半径搜而不是精确查格：仲裁器打在 assigner 原始坐标上，
+    而这里收到的是同一坐标；但 8 s 重投的"同一目标"会有 0.3~0.5 m 级抖动，
+    精确查格会漏。半径取 verdict_radius（默认 0.45 m）。
+    多条命中时取最新的一条：判决会翻转（先 dead_end、车靠近后可修），
+    以最新为准才能"改过自新"。
+    """
+    best = None
+    best_age = None
+    r2 = radius * radius
+    for (_qx, _qy), rec in verdicts.items():
+        try:
+            t, v = rec[0], rec[1]
+            vx, vy = rec[3], rec[4]
+        except (IndexError, TypeError):
+            continue
+        age = now - t
+        if age > ttl:
+            continue
+        if (vx - x) ** 2 + (vy - y) ** 2 > r2:
+            continue
+        if best_age is None or age < best_age:
+            best, best_age = v, age
+    return best, best_age
 
 
 class FrontierMerge(Node):
@@ -59,6 +126,21 @@ class FrontierMerge(Node):
         d('raw_dedupe_sec', 0.0)
         d('report_period', 10.0)
         d('log_path', '')
+        # ===== P13-6：判决传递的消费侧（2026-11-10）=====
+        # 背景（p13d A/B 实测，各 5 轮）：
+        #   仲裁器每轮把 raw 判为 dead_end 189.8 次、too_narrow 31 次、
+        #   unreachable 21.8 次，最终只放行 1.6 条；而本节点仍转发 raw 35~93 条/轮。
+        #   即**判决从未离开仲裁器**，raw 兜底等于"绕过否决再送进 nav2"。
+        # 策略：
+        #   * 对"新鲜负判决"的目标不转发（verdict_block）；
+        #   * 但保留饿死保护 force_after_sec —— 若连续这么久没有任何目标
+        #     输出给 manager，就无视负判决放行一条（宁可派坏目标也不能空等，
+        #     历史实测单源化会导致 manager 停 92 s）。
+        d('verdict_topic', '/frontier_verdict')
+        d('verdict_enabled', True)
+        d('verdict_ttl', 6.0)          # 判决有效期（s）
+        d('verdict_radius', 0.45)      # 判决匹配半径（m）
+        d('force_after_sec', 15.0)     # 饿死保护：超过此时长无输出则无视负判决
         g = self.get_parameter
         self.v_topic = str(g('validated_topic').value)
         self.r_topic = str(g('raw_topic').value)
@@ -69,15 +151,29 @@ class FrontierMerge(Node):
         self.dedupe_sec = float(g('raw_dedupe_sec').value)
         self.report_period = float(g('report_period').value)
         self.log_path = str(g('log_path').value)
+        self.vtopic = str(g('verdict_topic').value)
+        self.verdict_enabled = bool(g('verdict_enabled').value)
+        self.verdict_ttl = float(g('verdict_ttl').value)
+        self.verdict_r = float(g('verdict_radius').value)
+        self.force_after = float(g('force_after_sec').value)
+        # {(qx, qy): (arrival_s, verdict, score)}；键由发送方的 k 字段给出，
+        # 不在这里重新量化 —— 保证与仲裁器 0.30 m 网格完全一致。
+        self.verdicts = {}
+        self._last_verdict_gc = 0.0
 
         self.pub = self.create_publisher(PoseStamped, self.o_topic, 10)
         q = QoSProfile(depth=10, reliability=ReliabilityPolicy.RELIABLE,
                        durability=DurabilityPolicy.VOLATILE)
         self.create_subscription(PoseStamped, self.v_topic, self.on_validated, q)
         self.create_subscription(PoseStamped, self.r_topic, self.on_raw, q)
+        self.create_subscription(String, self.vtopic, self.on_verdict, q)
 
         self.stats = {'merge_validated': 0, 'merge_raw': 0, 'merge_suppressed': 0,
-                      'merge_dup': 0, 'gap_max_s': 0.0}
+                      'merge_dup': 0, 'gap_max_s': 0.0,
+                      # P13-6
+                      'merge_verdict_block': 0, 'merge_verdict_ok': 0,
+                      'merge_verdict_none': 0, 'merge_force_pass': 0,
+                      'verdict_recv': 0}
         self._recent_raw = []            # [(t, x, y)] 最近转发过的原始样本坐标
         self._last_validated = None      # 秒（ros 时间）
         self._last_raw = None
@@ -88,6 +184,10 @@ class FrontierMerge(Node):
             '候选合并器：%s(ttl=%.1fs 优先) + %s(限速 %.1fs, 去重 %.2fm/%.0fs) → %s'
             % (self.v_topic, self.ttl, self.r_topic, self.raw_period,
                self.dedupe_r, self.dedupe_sec, self.o_topic))
+        self.get_logger().info(
+            'P13-6 判决传递：%s enabled=%s ttl=%.1fs r=%.2fm 饿死保护=%.0fs'
+            % (self.vtopic, self.verdict_enabled, self.verdict_ttl,
+               self.verdict_r, self.force_after))
 
     # ---- 时间：优先用仿真时间（/clock），取不到退回单调时钟 ----
     def now_s(self):
@@ -110,6 +210,46 @@ class FrontierMerge(Node):
         self._last_validated = self.now_s()
         self._emit(m, 'validated')
 
+    def on_verdict(self, m):
+        """收下一条判决。键由发送方给出（0.30 m 网格），并额外保留坐标
+        以便 lookup_verdict 按半径匹配。"""
+        got = parse_verdict(m.data)
+        if got is None:
+            self.stats['verdict_bad'] = self.stats.get('verdict_bad', 0) + 1
+            return
+        key, x, y, v, s = got
+        self.verdicts[key] = (self.now_s(), v, s, x, y)
+        self.stats['verdict_recv'] += 1
+        # 周期性清理，避免长跑时无限增长
+        now = self.now_s()
+        if now - self._last_verdict_gc > 10.0:
+            self._last_verdict_gc = now
+            self.verdicts = {k: r for k, r in self.verdicts.items()
+                             if now - r[0] <= self.verdict_ttl}
+
+    def _verdict_gate(self, px, py, now):
+        """返回 True 表示"该目标被判决拦截，不应转发"。
+
+        饿死保护：若距上次成功输出已超过 force_after_sec，则无视负判决放行。
+        否则一旦上游把全部 raw 判死（实测 dead_end 占 98.6%），
+        manager 会永远等不到目标 —— 这正是历史单源化导致 92 s 空等的成因。
+        """
+        if not self.verdict_enabled:
+            return False
+        if self._last_out is not None and (now - self._last_out) >= self.force_after:
+            self.stats['merge_force_pass'] += 1
+            return False
+        v, _age = lookup_verdict(self.verdicts, px, py, self.verdict_r,
+                                 self.verdict_ttl, now)
+        if v is None:
+            self.stats['merge_verdict_none'] += 1
+            return False
+        if v in NEGATIVE_VERDICTS:
+            self.stats['merge_verdict_block'] += 1
+            return True
+        self.stats['merge_verdict_ok'] += 1
+        return False
+
     def on_raw(self, m):
         now = self.now_s()
         if self._last_validated is not None and (now - self._last_validated) < self.ttl:
@@ -129,6 +269,14 @@ class FrontierMerge(Node):
         self._recent_raw.append((now, px, py))
         if len(self._recent_raw) > 60:
             self._recent_raw = self._recent_raw[-60:]
+        # P13-6：判决拦截放在"限速/去重"之后、真正输出之前。
+        # 放在之后的原因：限速与去重是廉价的一次性筛，而判决查询要遍历判决表；
+        # 放在这里可以让每条被拦下来的消息都是"本来真的会发出去"的那一条，
+        # 使 merge_verdict_block 与 merge_raw 在同一口径上可比。
+        if self._verdict_gate(px, py, now):
+            # 不更新 _last_raw：让下一条不同目标能立刻尝试，
+            # 否则会被 raw_period 白等 0.5 s（实测会让判决拦截的效果打折）。
+            return
         self._last_raw = now
         self._emit(m, 'raw')
 
@@ -139,9 +287,13 @@ class FrontierMerge(Node):
         row = dict(self.stats)
         row['sim'] = round(self.now_s(), 1)
         self.get_logger().info(
-            'merge: validated=%d raw=%d dup=%d suppressed=%d gap_max=%.1fs'
+            'merge: validated=%d raw=%d dup=%d suppressed=%d gap_max=%.1fs '
+            '| 判决 block=%d ok=%d none=%d force=%d recv=%d'
             % (row['merge_validated'], row['merge_raw'], row['merge_dup'],
-               row['merge_suppressed'], row['gap_max_s']))
+               row['merge_suppressed'], row['gap_max_s'],
+               row.get('merge_verdict_block', 0), row.get('merge_verdict_ok', 0),
+               row.get('merge_verdict_none', 0), row.get('merge_force_pass', 0),
+               row.get('verdict_recv', 0)))
         if self._fh:
             self._fh.write(json.dumps(row) + '\n')
             self._fh.flush()

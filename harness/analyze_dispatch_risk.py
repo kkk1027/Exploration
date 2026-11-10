@@ -297,6 +297,39 @@ def count_escape_goals(round_dir):
     return n
 
 
+def _verdict_report(round_dir):
+    """P13-6 判决传递指标（VBR）。
+
+    从 merge.jsonl 末行取 frontier_merge 的判决拦截计数：
+      merge_verdict_block = 被告知"判死了"、本该兜底转发、被拦下的条数
+      merge_raw           = 真正转发出去的未评分条数
+      merge_force_pass    = 饿死保护触发（无视负判决放行）的条数
+      merge_verdict_none  = 没有任何判决、按历史行为照转的条数
+
+    Verdict Bypass Rate（判决绕过率）：
+      把"判决拦截成功"当作分母里的另一半来算 —— 即如果没有判决传递，
+      这些目标本来都会被送去 nav2。所以
+          VBR = block / (block + raw)
+      越低说明判决越没起作用（VBR=0 ⇒ 判决通道形同不存在）；
+      但 VBR=1.0 也危险（说明全靠拦截，没有放行，下游会饿死），
+      因此同时报 force_pass 计数。
+    """
+    out = {}
+    rows = _jl(os.path.join(round_dir, 'merge.jsonl'))
+    if rows:
+        last = rows[-1]
+        blk = int(last.get('merge_verdict_block') or 0)
+        raw = int(last.get('merge_raw') or 0)
+        frc = int(last.get('merge_force_pass') or 0)
+        non = int(last.get('merge_verdict_none') or 0)
+        ok = int(last.get('merge_verdict_ok') or 0)
+        rcv = int(last.get('verdict_recv') or 0)
+        out = {'v_block': blk, 'v_raw': raw, 'v_force': frc,
+               'v_none': non, 'v_ok': ok, 'v_recv': rcv,
+               'vbr': round(_pct(blk, blk + raw), 1)}
+    return out
+
+
 def _bucket_report(rows, key, buckets, title):
     """按 key 分桶统计取消率。rows 需含 label 与非 None 的 key。
 
@@ -374,6 +407,7 @@ def main():
         tm, _tp90, _tmax = _stat(turns)
         n_known = cnt['reached'] + cnt['canceled'] + cnt['failed']
         merge = _merge_ratio(d)
+        verdict = _verdict_report(d)
         rec = {'round': _round_name(d), 'disp': cnt['disp'],
                'reached': cnt['reached'], 'real_reach': cnt['real_reach'],
                'phantom': cnt['phantom'],
@@ -385,7 +419,7 @@ def main():
                'no_feature': n_none,
                'probe_rate': round(_pct(n_probe, cnt['disp']), 1),
                'cancel_rate': round(_pct(cnt['canceled'], n_known), 1),
-               'merge': merge,
+               'merge': merge, 'verdict': verdict,
                'reach_errors': [round(x, 3) for x in reach_err]}
         summary['rounds'].append(rec)
         print('%-34s %5d %5d %5d %5d %6d %6.2f %6.0f %5.0f%% %6.0f%%'
@@ -453,6 +487,28 @@ def main():
     print('  特征来源：%s（probe=派发时刻口径，final=最终地图回退）'
           % ', '.join('%s=%d' % kv for kv in sorted(feat_count.items())))
 
+    # P13-6：判决传递。只在确实跑了判决通道的轮次上输出，
+    # 否则老轮次全为零会被误读成“判决失效”。
+    v_blk = sum(int(r.get('verdict', {}).get('v_block', 0))
+                for r in summary['rounds'])
+    v_raw = sum(int(r.get('verdict', {}).get('v_raw', 0))
+                for r in summary['rounds'])
+    v_frc = sum(int(r.get('verdict', {}).get('v_force', 0))
+                for r in summary['rounds'])
+    v_none = sum(int(r.get('verdict', {}).get('v_none', 0))
+                 for r in summary['rounds'])
+    v_ok = sum(int(r.get('verdict', {}).get('v_ok', 0))
+               for r in summary['rounds'])
+    v_rcv = sum(int(r.get('verdict', {}).get('v_recv', 0))
+                for r in summary['rounds'])
+    if v_rcv or v_blk:
+        print('  【P13-6 判决传递】收到判决 %d 条；拦截 %d / 放行(正判决) %d / '
+              '无判决照转 %d / 饿死放行 %d'
+              % (v_rcv, v_blk, v_ok, v_none, v_frc))
+        print('      VBR（判决绕过率）= %.1f%%   '
+              '（= 拦截 /(拦截+转发)，0%%=通道形同不存在）'
+              % _pct(v_blk, v_blk + v_raw))
+
     summary['total'] = {
         'rounds': len(dirs), 'disp': n, 'paired': n_known,
         'canceled': n_cancel, 'failed': n_fail,
@@ -469,6 +525,9 @@ def main():
         'turn_gt90_pct': round(_pct(sum(1 for x in turns if x > 90), n), 1),
         'turn_gt150_pct': round(_pct(sum(1 for x in turns if x > 150), n), 1),
         'sources': src_count, 'feature_sources': feat_count,
+        'verdict': {'block': v_blk, 'raw': v_raw, 'force': v_frc,
+                    'none': v_none, 'ok': v_ok, 'recv': v_rcv,
+                    'vbr': round(_pct(v_blk, v_blk + v_raw), 2)},
     }
 
     # ---------------- 分桶（物理特征，跨版本可比） ----------------

@@ -114,6 +114,9 @@ def generate_launch_description():
                                 # P13-3：三处硬门降级为软约束（只留 corridor_hard 硬下限）
                                 'route_gate_soft': LaunchConfiguration('route_gate_soft'),
                                 'risk_w_soft': LaunchConfiguration('risk_w_soft'),
+                                # P13-6：判决发布开关与时效
+                                'verdict_enabled': LaunchConfiguration('verdict'),
+                                'verdict_ttl_sec': LaunchConfiguration('verdict_ttl'),
                                 # 注意：这个 launch 参数以前**根本没接到仲裁器**
                                 # （声明了 corridor_width，但节点参数里没有映射），
                                 # 所以 CORRIDOR_W=0.85 一直是空操作（实测日志仍打 1.05）。
@@ -244,6 +247,14 @@ def generate_launch_description():
                               'raw_min_period': LaunchConfiguration('merge_raw_period'),
                               'raw_dedupe_radius': LaunchConfiguration('merge_dedupe_r'),
                               'raw_dedupe_sec': LaunchConfiguration('merge_dedupe_sec'),
+                              # P13-6：判决传递的消费侧
+                              #   实测（p13d B 组）：仲裁器每轮判死 raw 189.8 次，
+                              #   本节点却仍转发 raw 35~93 条/轮 ⇒ 判决从未生效。
+                              'verdict_topic': '/frontier_verdict',
+                              'verdict_enabled': LaunchConfiguration('verdict'),
+                              'verdict_ttl': LaunchConfiguration('verdict_ttl'),
+                              'verdict_radius': LaunchConfiguration('verdict_radius'),
+                              'force_after_sec': LaunchConfiguration('verdict_force_after'),
                               'log_path': LaunchConfiguration('merge_log')}])
 
     # 方案A：深度相机 → 视觉障碍（补 2D 雷达的结构性盲区，见 P0_验收记录 §3b）
@@ -583,6 +594,17 @@ def generate_launch_description():
                         '（仅 corridor_hard_m 保持硬下限）；false=历史硬门行为'),
         DeclareLaunchArgument('risk_w_soft', default_value='900.0',
             description='P13-3 软门罚分权重（窄/未知/长窄段折算后的最大扣分）'),
+        DeclareLaunchArgument('verdict', default_value='true',
+            description='P13-6 判决传递：仲裁器把死胡同/窄缝/不可达/超距判死结果'
+                        '发到 /frontier_verdict，frontier_merge 据此拦截 raw 兜底'
+                        '（保留 force_after 饿死保护）；false=历史行为（无条件兜底）'),
+        DeclareLaunchArgument('verdict_ttl', default_value='6.0',
+            description='P13-6 判决有效期（s），两端共用'),
+        DeclareLaunchArgument('verdict_radius', default_value='0.45',
+            description='P13-6 merge 侧按坐标匹配判决的半径（m）'),
+        DeclareLaunchArgument('verdict_force_after', default_value='15.0',
+            description='P13-6 饿死保护：连续这么久没有任何目标输出给 manager 时，'
+                        '无视负判决放行一条（防止上游全判死后 manager 空等）'),
         DeclareLaunchArgument('supervisor_unit_max_sec', default_value='8.0',
             description='脱困单元硬顶秒数（单元测试时调小以快速触发降级）'),
         DeclareLaunchArgument('supervisor_rotate_min_range', default_value='0.34',

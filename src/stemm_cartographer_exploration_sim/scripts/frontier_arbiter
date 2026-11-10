@@ -830,6 +830,30 @@ class Arbiter(Node):
         self.raw_min_esc = int(p('raw_min_esc_dirs', 3).value)
         self.raw_goals = []          # [(ts, x, y)]
 
+        # ===== P13-6：判决传递（verdict propagation）=====
+        # 实测事实（p13d B 组 5 轮均值）：
+        #   raw_seen=165.6/轮、raw_deadend=189.8/轮、raw_publish=仅 1.6/轮，
+        #   而 frontier_merge 仍把 raw 转发 35~93 条/轮。
+        #   ⇒ 98.6% 的 raw 被判死胡同/窄缝/不可达，判决却从未离开本节点。
+        # 机制：把每条判决发到 /frontier_verdict，由 frontier_merge 消费；
+        #   merge 对"新鲜负判决"的目标不再无条件兜底（另设饿死保护）。
+        self.verdict_enabled = self._as_bool(p('verdict_enabled', True).value)
+        self.verdict_topic = str(p('verdict_topic', '/frontier_verdict').value)
+        self.verdict_period = float(p('verdict_period_sec', 2.0).value)
+        self.verdict_ttl = float(p('verdict_ttl_sec', 6.0).value)
+        self.verdicts = {}           # {(qx, qy): (t, verdict, score)}
+        self._t_verdict = 0.0
+        # ★ 判决只在 pick_raw_goal() 里产生，而该函数在 raw_score_enabled=False
+        #   时直接返回。所以 verdict_enabled=True + raw_score_enabled=False
+        #   会让判决通道**静默失效**（merge 永远查不到判决 ⇒ 照旧全量兜底）。
+        #   这里显式告警，避免把它误当成"判决传递无效"的结论。
+        if self.verdict_enabled and not self.raw_score_enabled:
+            self.get_logger().warn(
+                'P13-6：verdict_enabled=True 但 raw_score_enabled=False —— '
+                '判决只在 raw 评分分支里产生，此时通道不会发出任何判决，'
+                'frontier_merge 将退回无条件兜底。若要单独测判决传递，'
+                '请同时打开 raw_score。')
+
         self.map = None
         self.pose = None
         self.yaw = 0.0
@@ -857,6 +881,10 @@ class Arbiter(Node):
                       # P13-2A 原始 RRT 候选
                       'raw_seen': 0, 'raw_publish': 0, 'raw_overdist': 0,
                       'raw_unreachable': 0, 'raw_narrow': 0, 'raw_deadend': 0,
+                      # P13-6 判决传递（每条判决只在其"首次"或"翻转"时计数）
+                      'verdict_pub': 0, 'verdict_dead_end': 0,
+                      'verdict_too_narrow': 0, 'verdict_unreachable': 0,
+                      'verdict_over_dist': 0, 'verdict_feasible': 0,
                       # P13-4a 脱困目标放宽轮触发次数
                       'escape_relaxed': 0}
 
@@ -878,6 +906,8 @@ class Arbiter(Node):
         # V2-③：planner_server 的 /plan 末位点 = 正在执行的目标
         self.create_subscription(Path, '/plan', self.on_plan, 5)
         self.pub = self.create_publisher(PoseStamped, '/validated_frontier_goal', 10)
+        # P13-6：判决通道（std_msgs/String + JSON，避免新增 msg 包需重编）
+        self.verdict_pub = self.create_publisher(String, self.verdict_topic, 10)
         self.costmap = None
         self.create_subscription(OccupancyGrid, '/global_costmap/costmap', self.on_costmap, qmap)
         # P0-3 的脱困监督会把"这里脱困失败"发过来，作为受阻区降权
@@ -1311,6 +1341,75 @@ class Arbiter(Node):
             info['risk_soft_gate'] = round(soft, 3)
         return aux, info
 
+    # ================= P13-6：判决传递 =================
+    # 判决取值：
+    #   dead_end    落点可脱困方向数 < raw_min_esc_dirs（死口袋，g 型）
+    #   unreachable 落点不可达 / 落点在未知或占据格
+    #   too_narrow  必须穿窄缝才能到达（min_w 记录实际净宽）
+    #   over_dist   超过 raw_max_dist_m 且近期无人饿死（距离保护）
+    #   feasible    通过全部判据（score = risk_total）
+    # 约定：merge 侧只对**负判决**做拦截，feasible 仅用于观测与归因。
+    VERDICT_NEGATIVE = ('dead_end', 'unreachable', 'too_narrow', 'over_dist')
+
+    def _verdict_key(self, x, y):
+        """0.30 m 网格量化。与 on_raw_goal 的去重半径一致，
+        使\"同一条 raw 重复投递\"落在同一格，判决可直接复用。"""
+        return (int(math.floor(x / 0.30)), int(math.floor(y / 0.30)))
+
+    def _pub_verdict(self, key, x, y, verdict, score):
+        """发布一条判决。
+
+        刻意不携带时间戳：由接收方按**到达时刻**计时。
+        原因：本节点用 time.monotonic()，merge 用 /clock（仿真时间），
+        两者混用在 pause/reset 后会产生负年龄，导致 TTL 判定永远成立或永远失效。
+        """
+        try:
+            m = String()
+            m.data = json.dumps({'k': [key[0], key[1]],
+                                 'x': round(float(x), 2),
+                                 'y': round(float(y), 2),
+                                 'v': verdict,
+                                 's': round(float(score), 1)})
+            self.verdict_pub.publish(m)
+            self.stats['verdict_pub'] = self.stats.get('verdict_pub', 0) + 1
+        except Exception:                      # noqa: BLE001
+            pass
+
+    def _record_verdict(self, x, y, verdict, score=0.0):
+        """记录判决；同一格判决未翻转时不重复发布（避免刷屏）。"""
+        if not self.verdict_enabled:
+            return
+        now = time.monotonic()
+        key = self._verdict_key(x, y)
+        prev = self.verdicts.get(key)
+        self.verdicts[key] = (now, verdict, round(float(score), 1))
+        self.stats['verdict_' + verdict] = self.stats.get(
+            'verdict_' + verdict, 0) + 1
+        if prev is not None and prev[1] == verdict:
+            return                             # 判决未翻转：只在快照里重发
+        self._pub_verdict(key, x, y, verdict, score)
+        if len(self.verdicts) > 400:           # 容量保护
+            dead = [k for k, v in self.verdicts.items()
+                    if now - v[0] > self.verdict_ttl]
+            for k in dead:
+                self.verdicts.pop(k, None)
+
+    def publish_verdict_snapshot(self):
+        """周期性重发全表：丢包或 merge 后启动时能自愈。"""
+        if not self.verdict_enabled:
+            return
+        now = time.monotonic()
+        if now - self._t_verdict < self.verdict_period:
+            return
+        self._t_verdict = now
+        for key, (t, v, s) in list(self.verdicts.items()):
+            if now - t > self.verdict_ttl:
+                self.verdicts.pop(key, None)
+                continue
+            # 还原到格中心，避免下游按坐标再量化时落到相邻格
+            self._pub_verdict(key, key[0] * 0.30 + 0.15,
+                              key[1] * 0.30 + 0.15, v, s)
+
     # ================= P13-2A：原始 RRT 候选评分 =================
     def on_raw_goal(self, m):
         """收下 assigner 的原始目标（以前完全不经过本节点）。
@@ -1354,24 +1453,30 @@ class Arbiter(Node):
                 u -= 250
             p = self.risk_discount(d)
             aux, info = self.risk_aux(gx, gy, dist=d)
-            scored.append((u * p - aux, gx, gy, d, u, p, aux, info))
+            # P13-6：判决必须打在**原始坐标** (rx,ry) 上，不能打在回拉后的
+            # (gx,gy) 上 —— merge 看到的是 assigner 原始点，用回拉点做键永远匹配不上。
+            scored.append((u * p - aux, gx, gy, d, u, p, aux, info, rx, ry))
         if not scored:
             return None
         scored.sort(key=lambda q: q[0], reverse=True)
         best = None
-        for sc, gx, gy, d, u, p, aux, info in scored[:self.raw_score_n]:
+        for sc, gx, gy, d, u, p, aux, info, rx, ry in scored[:self.raw_score_n]:
             # 可脱困下限：esc_dirs 太少 = 死口袋，任何收益都不值得（与 gate 同口径）
             esc = int(info.get('risk_esc_dirs', 8))
             if esc < self.raw_min_esc:
                 self.stats['raw_deadend'] = self.stats.get('raw_deadend', 0) + 1
+                self._record_verdict(rx, ry, 'dead_end', esc)
                 continue
             ok, narrow, min_w, unk = self.path_and_width(gx, gy)
             if not ok:
                 self.stats['raw_unreachable'] = self.stats.get('raw_unreachable', 0) + 1
+                self._record_verdict(rx, ry, 'unreachable', d)
                 continue
             # ★ 与前沿候选同一套硬门：需要穿窄缝才能到 → 不派
             if narrow is not None and self.raw_require_narrow_free:
                 self.stats['raw_narrow'] = self.stats.get('raw_narrow', 0) + 1
+                self._record_verdict(rx, ry, 'too_narrow',
+                                     min_w if min_w is not None else 0.0)
                 continue
             route, rinfo = self.risk_route(min_w, unk)
             row = dict(info)
@@ -1385,15 +1490,17 @@ class Arbiter(Node):
             row['risk_reachable'] = True
             row['unknown'] = u
             if best is None or (sc - route) > best[0]:
-                best = (sc - route, gx, gy, min_w, u, row, d)
+                best = (sc - route, gx, gy, min_w, u, row, d, rx, ry)
         if best is None:
             return None
-        _f, gx, gy, min_w, u, row, d = best
+        _f, gx, gy, min_w, u, row, d, rx, ry = best
         # 超距保护：超过 raw_max_dist 只在"最近 raw_starve_sec 内没派过任何目标"时放行，
         # 避免把车一下子送到 12~16 m 外的前沿（基线里 >6 m 的取消率 81%）。
         if d > self.raw_max_dist and (now - self.last_pub) < self.raw_starve_sec:
             self.stats['raw_overdist'] = self.stats.get('raw_overdist', 0) + 1
+            self._record_verdict(rx, ry, 'over_dist', d)
             return None
+        self._record_verdict(rx, ry, 'feasible', row.get('risk_total', 0.0))
         return gx, gy, min_w, u, row
 
     def pick_safe_observation(self, cands):
@@ -2289,6 +2396,13 @@ class Arbiter(Node):
                 'raw_unreachable': self.stats.get('raw_unreachable', 0),
                 'raw_narrow': self.stats.get('raw_narrow', 0),
                 'raw_deadend': self.stats.get('raw_deadend', 0),
+                # P13-6 判决传递
+                'verdict_pub': self.stats.get('verdict_pub', 0),
+                'verdict_dead_end': self.stats.get('verdict_dead_end', 0),
+                'verdict_too_narrow': self.stats.get('verdict_too_narrow', 0),
+                'verdict_unreachable': self.stats.get('verdict_unreachable', 0),
+                'verdict_over_dist': self.stats.get('verdict_over_dist', 0),
+                'verdict_feasible': self.stats.get('verdict_feasible', 0),
                 # P13-4a 脱困目标放宽轮
                 'escape_relaxed': self.stats.get('escape_relaxed', 0),
             }
@@ -3208,6 +3322,9 @@ class Arbiter(Node):
         self._tick_uniq = set()
         self._last_risk_info = None      # P13-1：避免上一拍的风险分项误贴到本拍
         self.write_timeline()
+        # P13-6：判决表周期重发（丢包/merge 后启动自愈），放在早退之前，
+        # 保证"候选全空 => _tick_v1 提前 return"时判决仍能持续下发。
+        self.publish_verdict_snapshot()
         if self.scoring == 'v3':
             return self._tick_v3()
         if self.scoring == 'v2':
