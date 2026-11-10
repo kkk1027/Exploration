@@ -330,6 +330,34 @@ def _verdict_report(round_dir):
     return out
 
 
+def round_is_valid(round_dir, min_disp=1):
+    """判断一轮是否有**可用于统计**的数据。
+
+    ★ 为什么必须有这个函数（实测踩到的坑）：
+      `p13e2_f8` 的第 2 轮因 sensor preflight 超时，`published=0`、
+      `merge_validated=0`、`merge_raw=0` —— 一个目标都没派出去。
+      此时 `取消率 = canceled/(reached+canceled+failed) = 0/0 = 0.0%`，
+      在"取消率越低越好"的口径下看起来是**全场最佳**，
+      直接把 f8 臂的中位取消率从 ~80% 拉到 37.5%，结论完全反了。
+      更隐蔽的是：它的 timeline 有 123 行（启动阶段的心跳），
+      所以"按 timeline 行数判有效"也拦不住。
+
+    判据（同时满足才算有效）：
+      1) 至少发生过 1 次派发（`disp >= min_disp`）；
+      2) merge 侧至少放出过 1 条候选（validated+raw > 0），
+         否则说明探索层压根没供给，这一轮不能代表算法差异。
+    返回 (ok, reason)。
+    """
+    disp, _errs, cnt = parse_ledger(round_dir)
+    if cnt.get('disp', 0) < min_disp:
+        return False, 'disp=%d<%d' % (cnt.get('disp', 0), min_disp)
+    mg = _merge_ratio(round_dir)
+    sup = (mg.get('validated') or 0) + (mg.get('raw') or 0)
+    if sup <= 0:
+        return False, 'supply=0'
+    return True, 'disp=%d supply=%d' % (cnt['disp'], sup)
+
+
 def _bucket_report(rows, key, buckets, title):
     """按 key 分桶统计取消率。rows 需含 label 与非 None 的 key。
 

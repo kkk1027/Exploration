@@ -117,7 +117,25 @@ def _best_dirs(pattern):
         key = (arm, rnd)
         if key not in best or n > best[key][0]:
             best[key] = (n, d)
-    return [(k[0], d) for k, (n, d) in sorted(best.items()) if n >= 100]
+    out = []
+    skipped = []
+    for k, (n, d) in sorted(best.items()):
+        if n < 100:
+            skipped.append((k, 'timeline=%d' % n))
+            continue
+        # ★ 剔除"零派发/零供给"的无效轮：这类轮的取消率是 0/0=0%，
+        #   在"越低越好"的口径下会被误读成最佳，实测把 f8 的
+        #   中位取消率从 ~80% 拉到 37.5%，结论完全反了。
+        ok, why = adr.round_is_valid(d)
+        if not ok:
+            skipped.append((k, why))
+            continue
+        out.append((k[0], d))
+    if skipped:
+        print('⚠ 剔除 %d 个无效轮（零派发/零供给/时长不足）：' % len(skipped))
+        for k, why in skipped:
+            print('    %-6s 轮%s  %s' % (k[0], k[1], why))
+    return out
 
 
 def metrics_of(d):

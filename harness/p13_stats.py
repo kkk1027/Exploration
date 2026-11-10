@@ -28,6 +28,7 @@ import json
 import math
 import os
 import random
+import re
 import statistics as st
 import sys
 
@@ -76,20 +77,23 @@ def _tag(d):
 
 
 def _idx(tag):
-    """从标签取末尾轮号：'a12' → 12。取不到返回 None。
+    """从标签取轮号与臂名：'a12' → (a,12)... 实际返回 (arm, round)。
 
     ★ 必须按轮号配对，不能按列表顺序 zip。
       反例（真实发生过）：A 组缺 a1、B 组完整时，
       zip([a2..a10], [b1..b10]) 会把 a2 和 b1 配成一对，
       之后全部错位 —— 而且**不会报错**，只是把所有差值算错。
+
+    ★ 另一起实测事故：多臂扫描的标签是 `inf1` / `f51` / `f151`。
+      旧实现取"末尾全部数字"当轮号，于是 `f51` 被当成轮号 51、
+      `inf1` 当成轮号 1，两组轮号无交集 → 报"没有可配对的轮号"。
+      现改为：**末尾一位数字**是轮号（要求 N <= 9），其余为臂名。
+      这与 p13_pareto.py 的解析保持一致，否则两个脚本会得出不同配对。
     """
-    s = ''
-    for ch in reversed(tag):
-        if ch.isdigit():
-            s = ch + s
-        else:
-            break
-    return int(s) if s else None
+    m = re.match(r'^(.*?)(\d)$', tag)
+    if m:
+        return m.group(1), int(m.group(2))
+    return tag, None
 
 
 def collect(dirs):
@@ -196,17 +200,32 @@ def main():
 
     A = collect(adirs)
     B = collect(bdirs)
+    # ★ round_is_valid 需要**目录路径**，而 A/B 的键是 tag（如 'inf1'）。
+    #   首版直接把 tag 传进去，导致 os.path.exists('inf1') 恒 False、
+    #   parse_ledger 返回 disp=0，于是每一轮都被判"无效"并全部剔除。
+    addr_of_a = {_tag(d): d for d in adirs}
+    addr_of_b = {_tag(d): d for d in bdirs}
     # 按**轮号**配对：a1↔b1、a2↔b2（不是按列表顺序 zip）
     a_by_idx = {}
+    a_arms = set()
     for k in A:
-        i = _idx(k)
+        arm, i = _idx(k)
         if i is not None:
             a_by_idx[i] = k
+            a_arms.add(arm)
     b_by_idx = {}
+    b_arms = set()
     for k in B:
-        i = _idx(k)
+        arm, i = _idx(k)
         if i is not None:
             b_by_idx[i] = k
+            b_arms.add(arm)
+    # 臂名重合说明两组标签无法区分（比如两边都叫 'inf'），配对会变成自比
+    if a_arms & b_arms:
+        print('⚠ 两组的臂名有重叠 %s —— 无法区分 A/B，配对结果无意义。\n'
+              '  请给两组不同前缀（如 p13e2_inf* vs p13e2_f5*）。'
+              % sorted(a_arms & b_arms), file=sys.stderr)
+        return 2
     common = sorted(set(a_by_idx) & set(b_by_idx))
     only_a = sorted(set(a_by_idx) - set(b_by_idx))
     only_b = sorted(set(b_by_idx) - set(a_by_idx))
@@ -230,8 +249,31 @@ def main():
     if empty:
         print('⚠ 轮号 %s 的目录存在但**没有指标数据**（多为 preflight 超时/'
               '提前退出），已从配对中剔除。' % empty)
+    # ★ 还要剔除"有指标但零派发"的轮：那种轮的 cancel_rate = 0/0 = 0%，
+    #   在配对差值里会凭空造出一个巨大的"改善"。
+    zero = []
+    keep = []
+    for i in usable:
+        ta = a_by_idx.get(i)
+        tb = b_by_idx.get(i)
+        bad = False
+        for d in (addr_of_a.get(ta) if ta else None,
+                  addr_of_b.get(tb) if tb else None):
+            if not d:
+                continue
+            ok, _why = adr.round_is_valid(d)
+            if not ok:
+                bad = True
+        if bad:
+            zero.append(i)
+        else:
+            keep.append(i)
+    if zero:
+        print('⚠ 轮号 %s 存在"零派发/零供给"的无效轮（取消率为 0/0=0%% 的假象），'
+              '已剔除。' % zero)
+    usable = keep
     if not usable:
-        print('所有配对轮次都没有数据', file=sys.stderr)
+        print('所有配对轮次都无效', file=sys.stderr)
         return 2
     print('可配对轮号 %d/%d 对（有数据）：%s'
           % (len(usable), len(common), usable))
