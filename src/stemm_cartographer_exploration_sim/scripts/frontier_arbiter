@@ -1460,7 +1460,23 @@ class Arbiter(Node):
             return None
         scored.sort(key=lambda q: q[0], reverse=True)
         best = None
-        for sc, gx, gy, d, u, p, aux, info, rx, ry in scored[:self.raw_score_n]:
+        over_best = None     # 超距候选（只在饿死时允许派发）
+        # ===== E1 实测修正（2026-11-10）=====
+        # 原实现只给**唯一的胜者**发 feasible，其余候选全被判负。
+        # 实测后果（p13e1_b3）：dead_end 186 + too_narrow 50 = 236 条负判决，
+        # 而 verdict_feasible 仅 3 条 ⇒ merge 拿不到任何被批准的兜底目标，
+        # 契约退化成"纯黑名单"，merge_raw 51→22（-57%），
+        # manager 候选池 84→54，覆盖面反而变小（E1 见 docs §12）。
+        #
+        # 正确语义：判决描述的是**该候选自身可不可信**，不是"它是不是本拍胜者"。
+        # 所以每个通过全部硬门的候选都发 feasible（带自己的 risk_total），
+        # 让 merge 有一个"已被批准"的池子可回退，而不是只剩否决。
+        #
+        # 评估范围也从 top-`raw_score_n`(默认 3) 放开到全部候选：
+        # 只评 3 个时，一旦这 3 个都落在死角，整拍就没有任何 feasible 产出，
+        # 而 merge 侧却可能持有 20+ 条 raw 待判。硬门本身（esc/可达/窄缝）
+        # 已由下面的分支把关，放开范围不会放过坏目标。
+        for sc, gx, gy, d, u, p, aux, info, rx, ry in scored:
             # 可脱困下限：esc_dirs 太少 = 死口袋，任何收益都不值得（与 gate 同口径）
             esc = int(info.get('risk_esc_dirs', 8))
             if esc < self.raw_min_esc:
@@ -1489,18 +1505,34 @@ class Arbiter(Node):
             row['risk_source'] = 'raw_rrt'
             row['risk_reachable'] = True
             row['unknown'] = u
+            cand = (sc - route, gx, gy, min_w, u, row, d, rx, ry)
+            if d > self.raw_max_dist:
+                # 超距候选：不进 feasible 池（merge 不该随手转发 12~16 m 外的目标），
+                # 但**保留**为 over_best —— 饿死时才允许用它（见下面的超距保护）。
+                # ★ 不能在这里 `continue` 掉：那样 best 永远为 None，
+                #   超距保护与饿死绕过两段逻辑都成了死代码。
+                if over_best is None or cand[0] > over_best[0]:
+                    over_best = cand
+                continue
+            # ★ 通过全部硬门且不超距 → 立刻发 feasible，让 merge 有这个兜底选项。
+            #   这是 E1 修正的核心：feasible 描述"该候选可信"，不是"它是胜者"。
+            self._record_verdict(rx, ry, 'feasible', row['risk_total'])
             if best is None or (sc - route) > best[0]:
-                best = (sc - route, gx, gy, min_w, u, row, d, rx, ry)
+                best = cand
+        # 没有合规候选但有超距候选：交给超距保护决定
+        if best is None and over_best is not None:
+            _s, gx, gy, min_w, u, row, d, rx, ry = over_best
+            if (now - self.last_pub) < self.raw_starve_sec:
+                self.stats['raw_overdist'] = self.stats.get('raw_overdist', 0) + 1
+                self._record_verdict(rx, ry, 'over_dist', d)
+                return None
+            # 饿死中：放行超距目标，并补发 feasible 让 merge 也认可它
+            self._record_verdict(rx, ry, 'feasible', row['risk_total'])
+            return gx, gy, min_w, u, row
         if best is None:
             return None
         _f, gx, gy, min_w, u, row, d, rx, ry = best
-        # 超距保护：超过 raw_max_dist 只在"最近 raw_starve_sec 内没派过任何目标"时放行，
-        # 避免把车一下子送到 12~16 m 外的前沿（基线里 >6 m 的取消率 81%）。
-        if d > self.raw_max_dist and (now - self.last_pub) < self.raw_starve_sec:
-            self.stats['raw_overdist'] = self.stats.get('raw_overdist', 0) + 1
-            self._record_verdict(rx, ry, 'over_dist', d)
-            return None
-        self._record_verdict(rx, ry, 'feasible', row.get('risk_total', 0.0))
+        # feasible 已在候选循环里逐个发过，这里不再重发。
         return gx, gy, min_w, u, row
 
     def pick_safe_observation(self, cands):

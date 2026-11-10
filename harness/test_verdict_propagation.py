@@ -334,6 +334,26 @@ def main():
                 if ("'%s'" % v) not in pick]) or 'all present')
 
     # ============================================================
+    print('\n[9] E1 修正不变量：feasible 不能只发给胜者')
+    # E1 实测（p13e1_b3）：dead_end 186 + too_narrow 50 = 236 条负判决，
+    # 而 verdict_feasible 仅 3 条 ⇒ merge 拿不到任何被批准的兜底目标，
+    # 契约退化成纯黑名单，merge_raw 51→22，覆盖面反而变小。
+    check('候选循环遍历**全部** scored，不再只取 top-N',
+          'for sc, gx, gy, d, u, p, aux, info, rx, ry in scored:' in pick,
+          '仍见到 scored[:self.raw_score_n]' if
+          'scored[:self.raw_score_n]' in pick else '')
+    check('feasible 在候选循环内部逐个发出（不在循环外只发一次）',
+          pick.count("_record_verdict(rx, ry, 'feasible'") >= 2,
+          'found=%d（应有循环内 1 处 + 饿死绕过 1 处）'
+          % pick.count("_record_verdict(rx, ry, 'feasible'"))
+    check('超距候选保留为 over_best（不能 continue 掉整段逻辑）',
+          'over_best' in pick and 'over_best = cand' in pick)
+    check('超距保护仍会记 over_dist',
+          "'over_dist'" in pick)
+    check('饿死时放行超距候选并补发 feasible',
+          '饿死中：放行超距目标' in pick)
+
+    # ============================================================
     print('\n' + '=' * 60)
     if FAILS:
         print('FAIL —— %d 项未通过：' % len(FAILS))
