@@ -1,0 +1,67 @@
+--- a/plugins/decorator/goal_updater_node.cpp
++++ b/plugins/decorator/goal_updater_node.cpp
+@@ -13,6 +13,7 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
++#include <cmath>
+ #include <string>
+ #include <memory>
+ 
+@@ -59,9 +60,36 @@
+ 
+   callback_group_executor_.spin_some();
+ 
+-  if (rclcpp::Time(last_goal_received_.header.stamp) > rclcpp::Time(goal.header.stamp)) {
++  // ★ 2026-11-11 修复跨目标污染（上游缺陷）。
++  //   原实现：
++  //     if (Time(last_goal_received_.header.stamp) > Time(goal.header.stamp))
++  //       goal = last_goal_received_;
++  //   last_goal_received_ 永不清理，且判断完全押在时间戳上。BT 里
++  //   input_goal.header.stamp 常常是 0，于是 `T > 0` 恒真 ⇒ 每个新目标都被
++  //   替换成历史上那一次的纠偏点 ⇒ 车已在该点 ⇒ controller 首次
++  //   isGoalReached() 命中 ⇒ 30 ms 假到达（实测 79.2%），整轮冻住。
++  //
++  //   修复：先看 input_goal 是否换了新目标（位置变化 > 5 cm）。换目标就丢弃
++  //   上一轮缓存，这样跨目标的污染不可能发生；同一目标内仍然正常接受纠偏。
++  const double gx = goal.pose.position.x;
++  const double gy = goal.pose.position.y;
++  if (!goal_cache_valid_ ||
++      std::hypot(gx - prev_goal_x_, gy - prev_goal_y_) > 0.05)
++  {
++    last_goal_received_ = geometry_msgs::msg::PoseStamped{};
++    goal_cache_valid_ = true;
++  } else if (rclcpp::Time(last_goal_received_.header.stamp) >
++           rclcpp::Time(goal.header.stamp))
++  {
+     goal = last_goal_received_;
+   }
++  // ★ prev 记录的是**本拍最终输出**，不是输入。
++  //   BT 里 output_goal 会写回 {goal} 本身（这样下游 GlobalUpdatedGoal 才能
++  //   察觉目标变了并重规划），于是下一拍的 input 恰好等于上一拍的 output。
++  //   若 prev 记录输入，每两拍就会误判一次「换了新目标」而清空缓存，
++  //   纠偏点会在"应用 → 清空"之间来回抖动。
++  prev_goal_x_ = goal.pose.position.x;
++  prev_goal_y_ = goal.pose.position.y;
+ 
+   setOutput("output_goal", goal);
+   return child_node_->executeTick();
+--- a/include/nav2_behavior_tree/plugins/decorator/goal_updater_node.hpp
++++ b/include/nav2_behavior_tree/plugins/decorator/goal_updater_node.hpp
+@@ -75,6 +75,16 @@
+ 
+   geometry_msgs::msg::PoseStamped last_goal_received_;
+ 
++  // ★ 2026-11-11 修复跨目标污染：last_goal_received_ 是实例成员且永不清空，
++  //   上游只靠 header.stamp 比较决定是否用它替换当前目标。当 input_goal 的
++  //   stamp 为 0（BT 里很常见）时 `T > 0` 恒真，于是**每个新目标**都会被替换成
++  //   历史上那一次纠偏点 —— 车本就在该点附近，controller 首次 isGoalReached()
++  //   即通过 → 30 ms「假到达」（实测 v2 五轮 79.2%）。
++  //   下面三个成员用来识别「input_goal 换了一个新目标」，换目标即丢弃缓存。
++  bool goal_cache_valid_{false};
++  double prev_goal_x_{0.0};
++  double prev_goal_y_{0.0};
++
+   rclcpp::Node::SharedPtr node_;
+   rclcpp::CallbackGroup::SharedPtr callback_group_;
+   rclcpp::executors::SingleThreadedExecutor callback_group_executor_;
