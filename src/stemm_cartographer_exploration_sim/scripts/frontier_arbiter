@@ -351,6 +351,16 @@ class Arbiter(Node):
         # 硬下限：低于这个净宽一律不派（车宽 0.40 + 车端前向安全闸 0.45 的几何下界 0.90，
         # 取 0.92 留 2 cm 余地）；未知占比过高说明"这块还没探"，同样不派。
         self.corridor_hard = float(p('corridor_hard_m', 0.92).value)
+        # ===== S3（2026-11-11）：把"物理过不去"与"能过但窄"彻底拆开 =====
+        # 旧实现只有 corridor_hard 一道门，0.92 以下一律硬拒。实测后果：
+        #   每轮 reject_narrow_hard 中位 2942 次，而 published 仅 30 次
+        #   → 候选池被卡几乎归零 → 车 34% 的探索时间在原地等目标。
+        # 物理上真正过不去的是"车宽 0.40，两侧各连 0.09 m 余量都没有"，
+        # 即净宽 < 0.58 m。介于 0.58~0.92 的车**能过**，只是风险高 —— 这类
+        # 不该被否决，应该被"大额罚分排到后面"，让排序决定而不是直接没得选。
+        # 注意：宽度测量同时改了 S2（沿法向两侧求和），实测值只会比旧值大或相等，
+        # 因此本项放开不会把"旧尺度下就过不去"的点放进来。
+        self.narrow_floor = float(p('narrow_floor_m', 0.58).value)
         self.corridor_unknown_max = float(p('corridor_unknown_max', 0.35).value)
         # D1：末端也查（原来 skip=1.2 m 会整段跳过目标点附近）；保留参数名做兼容，
         # 但语义改为"末端额外加密采样距离"，不再"跳过"。
@@ -500,11 +510,18 @@ class Arbiter(Node):
         #   否则 /goal_update 发出去也无人消费，等于静默失效。
         self.veto_inplace = self._as_bool(p('veto_inplace', False).value)
         if self.veto_inplace:
-            self.get_logger().error(
-                'veto_inplace 已停用（P13-5）：nav2 GoalUpdater 会跨导航目标污染 '
-                '{goal}，导致 79% 的目标 30 ms 内假成功、整车冻住。'
-                '本节点已自动降级为 veto_migrate 模式；如需恢复请先修 BT/GoalUpdater。')
-            self.veto_inplace = False
+            # ★ 2026-11-11 S4：nav2 GoalUpdater 的上游 bug 已修（见
+            #   navigation2-humble/nav2_behavior_tree/.../goal_updater_node.cpp：
+            #   换新目标时丢弃 last_goal_received_ 缓存），所以本模式可以重新启用。
+            #   但上线前必须确认两件事，否则会回到 79.2% 假到达：
+            #     ① nav2_behavior_tree 已重新编译并安装；
+            #     ② BT XML 已挂回 GoalUpdater 装饰器（2026-11-09 曾为了止损把它删了）。
+            #   若②没做，_publish_goal_update 会因为 /goal_update 无订阅者而
+            #   返回 False，自动退回 migrate（取消重派），不会静默失效。
+            self.get_logger().warn(
+                'veto_inplace=True：启用「原地改向」（不取消目标）。'
+                '前置条件：nav2_behavior_tree 已含 2026-11-11 修复补丁、'
+                '且 BT XML 已挂回 GoalUpdater；请先用 5 轮验证 reached 误差 < 0.3 m。')
         self.inplace_radius = float(p('inplace_radius_m', 3.5).value)
         self.inplace_tries = int(p('inplace_tries', 48).value)
         # ★ inplace 专用判据：migrate 的 veto_migrate_min_move(1.0 m) 是为了"把目标挪开"，
@@ -619,6 +636,10 @@ class Arbiter(Node):
         self._corr_last = 0.0
         self._corr_veto_min_gap = float(p('corridor_veto_min_gap', 2.0).value)
         self._last_path_reject = None
+        # S1（2026-11-11）：本拍路径实测最小净宽，写进 timeline 供离线看分布
+        # （旧日志只打了门限，导致"被否的点到底是 0.91 还是 0.30"无从判断）
+        self._last_path_min_w = None
+        self._gu_warned = False        # S4：/goal_update 无订阅者只警告一次
         # 半径取 0.6 m："这一脚到那儿能不能转过身"，而不是"附近某处有片空地"。
         # 取 1.2 m 时实测 3 轮里一次都没触发（房间尺度上总能找到空地），等于没生效。
         self.return_scan_radius = float(p('return_scan_radius_m', 0.60).value)
@@ -1988,6 +2009,19 @@ class Arbiter(Node):
         """把 G* 推给 nav2 BT（/goal_update）；成功返回 True（调用方因此**不取消**目标）。"""
         if self.pub_goal_update is None:
             return False
+        # S4（2026-11-11）：/goal_update 没有订阅者时返回 False，让调用方退回
+        # migrate（取消重派）。否则一旦 BT 没挂回 GoalUpdater，本模式会"看起来
+        # 成功但不改向" —— 目标继续跑向旧点，比取消还糟（静默失效）。
+        try:
+            if self.pub_goal_update.get_subscription_count() == 0:
+                if not self._gu_warned:
+                    self._gu_warned = True
+                    self.get_logger().warn(
+                        '/goal_update 无订阅者（BT 未挂 GoalUpdater）→ veto_inplace '
+                        '自动退回 veto_migrate（取消重派）')
+                return False
+        except Exception:                     # noqa: BLE001 - 旧版 rclpy 无此方法
+            pass
         if self.stats.get('veto_inplace', 0) >= self.inplace_max:
             return False
         if now - self._inplace_last < self.inplace_cooldown:
@@ -2248,9 +2282,12 @@ class Arbiter(Node):
                     if narrow is not None:
                         # 严格轮：窄段一律不派；
                         # 放宽轮：只放行"真的够宽、而且宽度不是靠未知格撑出来"的。
+                        # S3（2026-11-11）：门槛改 narrow_floor（物理过不去），
+                        # 而不是 corridor_hard（"够宽裕"）—— 脱困本来就是应急，
+                        # 用宽裕门槛会把自己的脱困出口也堵死。
                         if not (relaxed and self.escape_allow_narrow):
                             continue
-                        if min_w is None or min_w < self.corridor_hard:
+                        if min_w is None or min_w < self.narrow_floor:
                             continue
                         if unk is not None and unk > self.corridor_unknown_max:
                             continue
@@ -2399,6 +2436,11 @@ class Arbiter(Node):
                 'last_goal': None if self.last_goal is None else [round(self.last_goal[0], 3), round(self.last_goal[1], 3)],
                 'published': self.stats.get('published', 0),
                 'veto': self.stats.get('veto', 0),
+                # S4（2026-11-11）：区分「原地改向（不取消）」与「取消重派」。
+                # inplace_ok 走 /goal_update + GoalUpdater，不打断 NavigateToPose；
+                # migrate 走 cancel + 重派。两者此消彼长才是 S4 生效的直接证据。
+                'veto_inplace': self.stats.get('veto_inplace_ok', 0),
+                'veto_migrate': self.stats.get('veto_migrate', 0),
                 'escape_goal': self.stats.get('escape_goal', 0),
                 'fallback_obs': self.stats.get('fallback_obs', 0),
                 'rejected_narrow': self.stats.get('rejected_narrow', 0),
@@ -2410,6 +2452,8 @@ class Arbiter(Node):
                 'corridors_active': len(self.corridors),
                 'reject_noexit': self.stats.get('reject_noexit', 0),
                 'reject_narrow_hard': self.stats.get('reject_narrow_hard', 0),
+                'pass_narrow_soft': self.stats.get('pass_narrow_soft', 0),
+                'path_min_w': getattr(self, '_last_path_min_w', None),
                 'route_soft_pass': self.stats.get('route_soft_pass', 0),
                 'noexit_passed': self.stats.get('noexit_passed', 0),
                 'noexit_checked': self.stats.get('noexit_checked', 0),
@@ -2582,6 +2626,87 @@ class Arbiter(Node):
             return (wlist[m][1], wlist[m][2])
         return None
 
+    def _path_lateral_widths(self, field, path, idxs, res, ox, oy, w, h):
+        """S2：沿路径每点取"垂直于路径方向、两侧到障碍距离之和"。
+
+        旧实现用 `width = 2×到最近障碍距离`，只在"两侧对称"时成立。而**前沿点
+        永远站在已知/未知的交界线上**，典型形状是
+            [已知墙] ←0.45 m→ [候选] ←开阔未知 4 m→
+        此时最近障碍距离 d=0.45 ⇒ width=0.90 ⇒ 被 corridor_hard(0.92) 判死，
+        而物理上另一侧有 4 m。代码注释里原本写着"未知格按半宽计"，但距离场
+        分支实际上把未知当自由（不算障碍），于是只剩单侧测距。
+
+        关键性质：2d 是总宽的**下界**（最近障碍必然只出现在某一侧），所以
+        改为两侧实测求和后，宽度只会**变大或相等**，不会变小 —— 不引入新的
+        不安全，只去掉对前沿点的系统性低估。最后仍与 2d 取 max 作为保险。
+
+        返回 (widths, unknowns, wxs, wys) 四个与 idxs 等长的 list；
+        缺少 numpy/scipy 或场分辨率不匹配时返回 None（调用方退回旧行为）。
+        """
+        try:
+            import numpy as np
+            from scipy import ndimage
+        except Exception:                     # noqa: BLE001 - 没装就退回标量实现
+            return None
+        dist_m, fox, foy, fres, fw, fh, unknown = field
+        P = len(idxs)
+        if P == 0:
+            return None
+        if abs(fres - res) > 1e-9 or abs(fox - ox) > 1e-6 or abs(foy - oy) > 1e-6:
+            return None                       # 索引会错位，不做
+        wxs = np.empty(P, dtype=np.float64)
+        wys = np.empty(P, dtype=np.float64)
+        for t, i in enumerate(idxs):
+            idx = path[i]
+            wxs[t] = (idx % w) * res + ox
+            wys[t] = (idx // w) * res + oy
+        # 切向 = 相邻点差分；末点沿前一段方向
+        if P >= 2:
+            tx = np.empty(P)
+            ty = np.empty(P)
+            tx[:-1] = np.diff(wxs)
+            ty[:-1] = np.diff(wys)
+            tx[-1] = tx[-2]
+            ty[-1] = ty[-2]
+        else:
+            tx = np.ones(P)
+            ty = np.zeros(P)
+        nrm = np.hypot(tx, ty)
+        nrm[nrm < 1e-9] = 1.0
+        npx = -ty / nrm                        # 单位法向
+        npy = tx / nrm
+        # 侧向采样范围：只需覆盖到 corridor_hard 的对侧就够判断；上限 2 m 防病态
+        span = float(min(max(self.corridor_hard, 0.30), 2.0))
+        K = max(1, int(round(span / res)))
+        ks = np.arange(1, K + 1, dtype=np.float64)[:, None]      # (K,1)
+        ci0 = (wxs - fox) / fres
+        cj0 = (wys - foy) / fres
+        thr = 0.5 * fres                       # 到障碍 < 半格 ⇒ 视为已撞
+
+        def reach(sign):
+            ci = ci0[None, :] + sign * ks * npx[None, :]
+            cj = cj0[None, :] + sign * ks * npy[None, :]
+            ii = np.clip(np.rint(ci).astype(np.int32), 0, fw - 1)
+            jj = np.clip(np.rint(cj).astype(np.int32), 0, fh - 1)
+            hit = dist_m[jj, ii] < thr                    # (K,P)
+            any_hit = hit.any(axis=0)
+            first = np.argmax(hit, axis=0).astype(np.float64)
+            first = np.where(any_hit, first, float(K))    # 未撞到 = 截断（保守）
+            return first * res
+
+        d_plus = reach(+1.0)
+        d_minus = reach(-1.0)
+        ii0 = np.clip(np.rint(ci0).astype(np.int32), 0, fw - 1)
+        jj0 = np.clip(np.rint(cj0).astype(np.int32), 0, fh - 1)
+        lower = 2.0 * dist_m[jj0, ii0]            # 旧实现值 = 理论下界
+        widths = np.maximum(d_plus + d_minus, lower)
+        # 未知占比：整张未知图做一次窗口均值再查表（与 clearance_at 同口径，0.5 m 窗）
+        r = max(1, int(0.5 / fres))
+        unk_frac = ndimage.uniform_filter(
+            unknown.astype(np.float64), size=2 * r + 1, mode='nearest')
+        unks = unk_frac[jj0, ii0]
+        return (widths.tolist(), unks.tolist(), wxs.tolist(), wys.tolist())
+
     def path_and_width(self, x, y):
         """BFS 出整条路径，再沿路径查"垂直于路径的连续自由宽度"。
 
@@ -2702,13 +2827,34 @@ class Arbiter(Node):
             unknown_run_max = 0.0
             step_m = res
             wlist = []          # A 层用：与路径同序的 (宽度, 世界x, 世界y)
-            for i in idxs:
-                idx = path[i]
-                cx_, cy_ = idx % w, idx // w
-                wxp_ = cx_ * res + ox
-                wyp_ = cy_ * res + oy
-                d, unk_ = self.clearance_at(field, wxp_, wyp_)
-                width_ = 2.0 * d                    # 自由带宽 ≈ 2×到最近障碍的距离
+            # ===== S2（2026-11-11）：宽度改为"沿法向两侧实测求和" =====
+            # 旧值 width = 2×到最近障碍距离，只在两侧对称时成立；前沿点永远站在
+            # 已知/未知交界上，典型形状是 [已知墙]←0.45m→[候选]←开阔未知→
+            # 此时旧值 0.90 < corridor_hard 0.92 就被判死，而右侧实际有 4 m。
+            # 新值 = d_左 + d_右，且与旧值取 max（旧值是理论下界）⇒ 宽度只增不减。
+            lat = self._path_lateral_widths(field, path, idxs, res, ox, oy, w, h)
+            if lat is not None:
+                widths_l, unks_l, wxs_l, wys_l = lat
+            else:
+                # 降级：无 numpy/scipy 或分辨率不匹配 → 退回旧的 2×最近距离
+                widths_l = []
+                unks_l = []
+                wxs_l = []
+                wys_l = []
+                for i in idxs:
+                    idx = path[i]
+                    wxp_ = (idx % w) * res + ox
+                    wyp_ = (idx // w) * res + oy
+                    d_, unk_ = self.clearance_at(field, wxp_, wyp_)
+                    widths_l.append(2.0 * d_)
+                    unks_l.append(unk_)
+                    wxs_l.append(wxp_)
+                    wys_l.append(wyp_)
+            for _k, i in enumerate(idxs):
+                width_ = widths_l[_k]
+                unk_ = unks_l[_k]
+                wxp_ = wxs_l[_k]
+                wyp_ = wys_l[_k]
                 wlist.append((width_, wxp_, wyp_))
                 if width_ < min_w:
                     min_w, min_unk, min_at = width_, unk_, (wxp_, wyp_)
@@ -2727,6 +2873,7 @@ class Arbiter(Node):
                 max(self.stats.get('pass_narrow_len_max', 0.0), narrow_len_max_run), 2)
             self.stats['pass_unknown_max'] = round(
                 max(self.stats.get('pass_unknown_max', 0.0), unknown_run_max), 2)
+            self._last_path_min_w = None if min_w == float('inf') else round(min_w, 3)
             if min_at is None:
                 self._last_path_reject = None
                 return True, None, None, 0.0
@@ -2739,21 +2886,30 @@ class Arbiter(Node):
             # 所以三处"一刀切否决"改为：只在几何上真过不去时硬拒（corridor_hard），
             # 其余换成大额罚分进 risk_route，让排序决定而不是直接没得选。
             if self.route_gate_soft:
-                if min_w < self.corridor_hard:
+                # ===== S3（2026-11-11）：硬门只留"物理过不去" =====
+                # 旧实现 `min_w < corridor_hard(0.92)` 一刀切硬拒，实测每轮
+                # reject_narrow_hard 中位 2942 次、published 仅 30 次 ⇒ 候选池
+                # 被卡到几乎归零 ⇒ 车 34% 的探索时间在原地等目标。
+                # 真实几何下限是"车宽 0.40 + 两侧各留 0.09"= 0.58 m：
+                #   净宽 < narrow_floor  ⇒ 物理过不去，硬拒（保留防楔死能力）
+                #   净宽 >= narrow_floor ⇒ 能过，只是风险高 ⇒ 大额罚分放行
+                if min_w < self.narrow_floor:
                     self._last_path_reject = 'narrow_hard'
                     self.stats['reject_narrow_hard'] = self.stats.get(
                         'reject_narrow_hard', 0) + 1
                     return True, min_at, min_w, min_unk   # 真过不去：几何硬门
                 # 通过，但把"窄 / 未知 / 长窄段"折算成额外风险交给排序
                 soft = 0.0
-                if min_w < self.risk_route_target:
-                    # ★ 归一化基准必须用 corridor_hard → risk_route_target，
-                    #   不能用 pass_width：默认 corridor_hard(0.92) > pass_width(0.90)，
-                    #   而 min_w < corridor_hard 已被上面硬拒，于是
-                    #   `min_w < pass_width` 恒为 false，宽度项会变成死代码
-                    #   （首版实现的实际缺陷）。
-                    span = max(1e-6, self.risk_route_target - self.corridor_hard)
-                    soft += min(1.0, (self.risk_route_target - min_w) / span)
+                span_narrow = max(1e-6, self.corridor_hard - self.narrow_floor)
+                span_wide = max(1e-6, self.risk_route_target - self.corridor_hard)
+                if min_w < self.corridor_hard:
+                    # 能过但窄：罚分从 2.0（贴着呢）连续降到 1.0（刚好 corridor_hard）
+                    soft += 1.0 + min(1.0, (self.corridor_hard - min_w) / span_narrow)
+                    self.stats['pass_narrow_soft'] = self.stats.get(
+                        'pass_narrow_soft', 0) + 1
+                elif min_w < self.risk_route_target:
+                    # 够宽但没到"从容"：0~1.0 的轻度罚分
+                    soft += min(1.0, (self.risk_route_target - min_w) / span_wide)
                 if narrow_len_max_run > self.narrow_len_max:
                     soft += min(1.0, (narrow_len_max_run - self.narrow_len_max)
                                 / max(1e-6, self.narrow_len_max))
@@ -2843,6 +2999,9 @@ class Arbiter(Node):
                 min_w = width
                 min_unk = n_unk / max(1.0, n_cells)
                 min_at = (wxp, wyp)
+        # S1（2026-11-11）：本分支同样记录实测最小净宽（clearance_mode != distance）
+        self._last_path_min_w = (None if min_w == float('inf')
+                                 else round(min_w, 3))
         if min_at is None:
             return True, None, None, 0.0
         if min_w < need:
@@ -3478,8 +3637,9 @@ class Arbiter(Node):
                         and unk <= self.corridor_unknown_max and fallback is None):
                     fallback = (gx, gy)
                 self.get_logger().info(
-                    '前向净空预检否决：走廊 < %.2fm @(%.2f,%.2f)，目标 (%.2f,%.2f)'
-                    % (self.corridor_width, narrow[0], narrow[1], gx, gy))
+                    '前向净空预检否决：实测 %.2fm < 下限 %.2fm @(%.2f,%.2f)，目标 (%.2f,%.2f)'
+                    % (min_w if min_w is not None else -1.0, self.narrow_floor,
+                       narrow[0], narrow[1], gx, gy))
                 continue
             # 可达但不可返回：目标附近没有掉头空间 → 派过去就出不来
             oneway, turn = self.return_infeasible(gx, gy)
@@ -3713,8 +3873,8 @@ class Arbiter(Node):
         if now - getattr(self, '_last_narrow_warn', 0.0) > 10.0:
             self._last_narrow_warn = now
             self.get_logger().warn(
-                '[v3] 本轮候选全部低于走廊硬下限 %.2f m（不做软回退，等新前沿）；统计 %s'
-                % (self.corridor_hard, self.stats))
+                '[v3] 本轮候选全部低于物理下限 %.2f m（不做软回退，等新前沿）；统计 %s'
+                % (self.narrow_floor, self.stats))
 
     def _tick_v2(self):
         now = time.monotonic()
@@ -3815,8 +3975,9 @@ class Arbiter(Node):
                 if fallback is None:
                     fallback = (gx, gy, r)
                 self.get_logger().info(
-                    '前向净空预检否决：走廊 < %.2fm @(%.2f,%.2f)，目标 (%.2f,%.2f)'
-                    % (self.corridor_width, narrow[0], narrow[1], gx, gy))
+                    '前向净空预检否决：实测 %.2fm < 下限 %.2fm @(%.2f,%.2f)，目标 (%.2f,%.2f)'
+                    % (min_w if min_w is not None else -1.0, self.narrow_floor,
+                       narrow[0], narrow[1], gx, gy))
                 continue
             try:
                 r['min_w'] = min_w

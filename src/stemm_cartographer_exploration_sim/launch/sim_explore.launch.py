@@ -66,6 +66,12 @@ def generate_launch_description():
         launch_arguments=[('auto_explore', auto_explore),
                           ('frontier_source', frontier_source),
                           ('use_sim_time', use_sim_time),
+                          # S4（2026-11-11）：探索行为树路径。空字符串 = 用
+                          # auto_mapping.launch.py 自己的默认值（车端无 GoalUpdater 版）。
+                          # 要启用「原地改向」时由 round.sh 传
+                          # exploration_behavior_tree:=<goalupdater 版本绝对路径>。
+                          ('exploration_behavior_tree',
+                           LaunchConfiguration('exploration_behavior_tree')),
                           # 车端 escape_controller 的 enabled 参数在 __init__ 缓存，
                           # 运行期 ros2 param set 不生效（实测仍在转 0.40 rad/s 抢 /cmd_vel），
                           # 必须用启动开关关掉；P0 里由 escape_supervisor（旋转+前进）取代它。
@@ -127,6 +133,8 @@ def generate_launch_description():
                                 'corridor_width_m': LaunchConfiguration('corridor_width'),
                                 # 通行保证式判据（与场景无关；A/B 用）
                                 'pass_width_m': LaunchConfiguration('pass_width'),
+                                # S3（2026-11-11）：硬拒下限（只拒物理过不去的）
+                                'narrow_floor_m': LaunchConfiguration('narrow_floor'),
                                 'narrow_len_max_m': LaunchConfiguration('narrow_len_max'),
                                 'unknown_span_max_m': LaunchConfiguration('unknown_span_max'),
                                 # P9-⑦：与 nav2 allow_unknown:false 对齐
@@ -397,6 +405,16 @@ def generate_launch_description():
             description='探索期受控倒车最小间隔秒数（原 8 s 太慢）'),
         DeclareLaunchArgument('pass_width', default_value='0.90',
             description='通行保证带宽下限（车宽 0.47 + 2×0.215 ≈ 0.90，与场景无关）'),
+        DeclareLaunchArgument('narrow_floor', default_value='0.58',
+            description='S3：净宽低于此值才硬拒（车宽 0.40 + 两侧各 0.09 余量；'
+                        'corridor_hard 之上改为软罚分，不再否决候选）'),
+        DeclareLaunchArgument('exploration_behavior_tree',
+            # ★ 必须给**真实路径**，不能给 ''：DeclareLaunchArgument 一旦声明，
+            #   下游 LaunchConfiguration 的 code-level default 就失效，空串会把
+            #   探索行为树路径戳成空字符串，nav2 直接加载失败。
+            default_value=os.path.join(
+                explore, 'config', 'stemm_cartographer_nav_to_pose.xml'),
+            description='S4：探索行为树绝对路径（默认车端无 GoalUpdater 版）'),
         DeclareLaunchArgument('narrow_len_max', default_value='1.00',
             description='窄段累计长度上限（超过即否决：不允许"勉强能过"）'),
         DeclareLaunchArgument('unknown_span_max', default_value='0.35',

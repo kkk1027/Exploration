@@ -135,6 +135,12 @@ def patch_text(txt, a):
             out.append(f'{ind}reverse_penalty: {a.reverse_penalty}    # sim_patch：倒车更贵\n')
             done.append('reverse_penalty')
             continue
+        # S4（2026-11-11）：切换 BT —— 挂上 GoalUpdater 后，后置否决可以「原地改向」
+        # 而不是「取消重派」。必须配合已重编的 nav2_behavior_tree（跨目标污染已修）。
+        if st.startswith('default_nav_to_pose_bt_xml:') and a.bt_xml is not None:
+            out.append(f'{ind}default_nav_to_pose_bt_xml: "{a.bt_xml}"    # sim_patch(S4)：挂 GoalUpdater\n')
+            done.append('bt_xml')
+            continue
         out.append(ln)
         # footprint_padding：插在 costmap 的 ros__parameters: 之后（两段各一次）
     return SENT + ''.join(out), done
@@ -159,6 +165,8 @@ def main():
     ap.add_argument('--motion', default=None,
                     choices=['DUBIN', 'REEDS_SHEPP', 'GRID_A_STAR', 'STATE_LATTICE'])
     ap.add_argument('--reverse-penalty', type=float, default=None)
+    ap.add_argument('--bt-xml', default=None,
+                    help='S4：覆盖 default_nav_to_pose_bt_xml（用于挂 GoalUpdater）')
     ap.add_argument('--cost-penalty', type=float, default=None,
                     help='Smac 的 cost_penalty：代价地图的代价按"每米 × 系数"累加，'
                          '系数调大就会宁可绕远也不穿高代价的窄缝')
