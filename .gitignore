@@ -14,3 +14,6 @@ patches/*.journal.json
 patches/*.pristine.*
 patches/*.pristine.yaml
 patches/*.pristine.xml
+
+# 每轮运行摘要产物（2026-11-11）：单轮一份 jsonl，属运行记录，不入库
+runs/
