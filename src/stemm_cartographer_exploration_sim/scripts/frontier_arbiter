@@ -322,7 +322,10 @@ class Arbiter(Node):
         self.pullback = float(p('pullback_m', 0.6).value)
         self.bl_sec = float(p('blacklist_sec', 60.0).value)
         self.bl_r = float(p('blacklist_radius', 0.8).value)
-        self.max_cand = int(p('max_candidates', 5).value)
+        # P3（2026-11-11，用户批准 5→12）：实测每派发消耗 4.9 个候选、整轮仅 28 个唯一候选，
+        # 而"先远后近"排序会把更多候选排到前面。5 个的校验窗口太窄：一旦前 4 个被净空/
+        # 后验门否决，只剩 1 个备选，退化为"必须派最不坏的那个"。
+        self.max_cand = int(p('max_candidates', 12).value)
         # D8：候选 30 s 太陈旧（地图早变了）、池 400 且同片多点重复竞争
         self.cand_max_age = float(p('candidate_max_age_sec', 15.0).value)
         self.cand_pool = int(p('cand_pool_size', 800).value)
@@ -710,6 +713,48 @@ class Arbiter(Node):
         self.repeat_ff = _f('repeat_free_frac', 0.90)
         self.repeat_pen = _f('repeat_penalty', 0.0)
         self.near_first_band = _f('near_first_band', 0.10)
+        # ===== P1/P2（2026-11-11）候选落点倾向：未知区特征 + 候选池探针 =====
+        # 设计前提（用户 2026-11-11 明确）：**只做候选序列内的排序**，
+        # 不改候选生成策略（RRT / 前沿提取一律不动）。
+        # P1 负责回答"这个候选打开的未知区有多大、在哪个方向、离车多远"；
+        # P2 负责把"排序依据"逐拍落盘，否则改造退化时只能看到"停滞变长"这种粗信号。
+        self.ureg_enabled = self._as_bool(p('ureg_enabled', True).value)
+        # 候选周边多大半径内的未知格用来判定"候选属于哪个未知连通分量"
+        self.ureg_radius = _f('ureg_radius_m', 0.50)
+        # 小于此格数的分量视为地图噪声/缝隙，不参与归属（1 m² = 400 格 @5cm）
+        self.ureg_min_cells = int(p('ureg_min_cells', 40).value)
+        # 候选池快照：每拍记录排序后前 N 名的完整依据（0 = 关闭）
+        self.pool_probe_n = int(p('pool_probe_n', 12).value)
+        self.pool_probe_log = str(p('pool_probe_log', '').value)
+        # ===== P4/P5（2026-11-11）候选落点倾向：先远后近两阶段 =====
+        # 用户方案（2026-11-11 批准）：候选序列内先去"当前位姿下最远的未知格内候选"，
+        # 再去剩下未探索的未知区 —— 先探出室内大致框架、再逐步补齐。
+        # **仅排序**：不改候选生成（RRT/前沿提取一律不动），只在可用候选内重排。
+        # frame_far_first 是总开关：默认 0 = 逐位等价当前行为（便于 A/B 干净对照）。
+        self.frame_far_first = self._as_bool(p('frame_far_first', False).value)
+        # 框架阶段的准入门槛：未知厚度（距最近已知格）不小于此值的候选才允许
+        # 作主目标，避免把"远处但只是墙角缝隙"的候选当成框架推进点。
+        self.frame_depth_min = _f('frame_depth_min_m', 0.0)
+        # 阶段判据 (a)：已探明面积增长停滞 —— 用**格数**而非距离（见 _update_strategy_phase）
+        self.frame_stall_ticks = int(p('frame_stall_ticks', 8).value)
+        self.frame_growth_cells = int(p('frame_growth_cells', 400).value)
+        # 阶段判据 (b)：剩余未知连通分量数 <= 此值
+        self.frame_regions_max = int(p('frame_regions_max', 6).value)
+        # 滞回（用户 D1：可回退，但切换后至少保持这么久）
+        self.frame_hysteresis = _f('frame_hysteresis_sec', 20.0)
+        # 回切阈值：已探明面积一次性跳增这么多格 ⇒ 发现新房间，切回框架
+        self.frame_regrow_cells = int(p('frame_regrow_cells', 2500).value)
+        # P5(ii)：远目标准入 —— 超过此距离的目标必须凑够净宽门槛
+        self.far_admit_on = self._as_bool(p('far_admit', True).value)
+        self.far_admit_dist = _f('far_admit_dist_m', 5.0)
+        # 净宽门槛：0 = 用 pass_width(0.90，车宽+2×余量的通行下限)，
+        # 而不是 corridor_hard(0.92)。实测 0.90 vs 0.92 这 2 cm 差会把整片
+        # 0.90 m 宽的走廊里的远目标全部否决（单轮 35 次），属于测量噪声。
+        self.far_admit_width = _f('far_admit_width_m', 0.0)
+        # P5(iii)：中继降级 —— 远目标被否决时，沿已算出的路径取这个弧长处的点
+        self.far_relay_on = self._as_bool(p('far_relay', True).value)
+        self.far_relay_m = _f('far_relay_m', 4.0)
+        self.far_relay_min_goal = _f('far_relay_min_goal_m', 1.5)
         # 候选后验"修复"（2026-10-27 用户方案）：后验不合格**不再一律否决**，
         # 而是在原候选附近随机采样，改投最近的合格点位。理由：否决会掐断供给
         # （实测单源化后 manager 连续 93 s 无目标），修复则保留仲裁通道的主导地位
@@ -880,6 +925,22 @@ class Arbiter(Node):
         self.yaw = 0.0
         self.cands = []          # [(x, y, ts)]
         self._cand_cells = {}    # 1 m 网格 → (x, y, ts)：同格只留最新，抑制重复竞争
+        # P1：未知连通分量场缓存（按 /map 序号失效，与 clearance_field 同思路）
+        self._ureg_key = None
+        self._ureg_field = None
+        self._ureg_pts = {}      # rid -> (wx, wy) numpy 数组，惰性构建
+        self._pool_tick = 0
+        # P4：阶段状态机（frame=先远后近 / fill=补零散）
+        self.strategy_phase = 'frame' if self.frame_far_first else 'fill'
+        self._phase_t = 0.0
+        self._phase_known_best = None
+        self._phase_switch_known = None
+        self._phase_stall = 0
+        self._known_key = None
+        self._known_n = 0
+        # P5(iii)：path_and_width 最近一次算出的世界坐标路径 + 它对应的目标
+        self._last_path_w = None
+        self._last_path_goal = None
         self.blacklist = []      # [(x, y, expire_ts)]
         self.last_pub = 0.0
         self.last_goal = None
@@ -897,6 +958,12 @@ class Arbiter(Node):
                       'reject_cost': 0, 'cost_checked': 0, 'repair_cost': 0,
                       'escape_zones': 0, 'reject_narrow_hard': 0,
                       'route_soft_pass': 0,
+                      # P1/P2：未知区特征可用次数 / 候选池快照条数
+                      'ureg_ok': 0, 'ureg_miss': 0, 'pool_probe': 0,
+                      # P4/P5：阶段切换 / 框架准入 / 远目标准入 / 中继降级
+                      'phase_to_fill': 0, 'phase_to_frame': 0,
+                      'frame_depth_reject': 0, 'far_admit_reject': 0,
+                      'far_relay_ok': 0, 'far_relay_miss': 0,
                       # P13-1 风险评分观测口径（只用于 A/B 归因）
                       'risk_penalized': 0, 'risk_eval': 0, 'risk_selected': 0,
                       # P13-2A 原始 RRT 候选
@@ -947,6 +1014,13 @@ class Arbiter(Node):
         self.get_logger().info(
             'frontier_arbiter 就绪：可达性预筛/黑名单/最小前沿/回拉｜scoring=%s '
             'candidate_probe=%s' % (getattr(self, 'scoring', '?'), repr(self.probe_log)))
+        # P1/P2（2026-11-11）：未知区特征 + 候选池快照 的启停状态必须回显，
+        # 否则"探针没落盘"会被误当成"候选池分析结果为空"。
+        self.get_logger().info(
+            'P1/P2：ureg_enabled=%s ureg_r=%.2fm ureg_min=%d格 '
+            'max_cand=%d pool_probe_n=%d pool_probe_log=%s'
+            % (self.ureg_enabled, self.ureg_radius, self.ureg_min_cells,
+               self.max_cand, self.pool_probe_n, repr(self.pool_probe_log)))
 
     # ---- 回调 ----
     def on_map(self, m):
@@ -1916,7 +1990,10 @@ class Arbiter(Node):
         return True
 
     def _veto_migrate_point(self, gx, gy, mode):
-        """找一个合格的迁移落点；找不到返回 None。mode: random / rollback。"""
+        """找一个合格的迁移落点；找不到返回 None。mode: relay / random / rollback。"""
+        if mode == 'relay':
+            # P5(iii)：沿原目标已算出的路径取中继点（框架阶段优先）
+            return self.relay_point(gx, gy)
         if mode == 'rollback':
             plan = getattr(self, '_last_plan', None) or []
             for (px, py) in reversed(plan):
@@ -2123,6 +2200,12 @@ class Arbiter(Node):
         if self.veto_migrate:
             modes = [self.veto_migrate_mode] + [m for m in ('random', 'rollback')
                                                 if m != self.veto_migrate_mode]
+            # P5(iii)：框架阶段的远目标优先用"路径中继点"—— 实测 >6 m 目标
+            # 取消率 69% 且失败在途中，把目标缩到 4 m 处再接续比随机挪 2 m 更靠谱。
+            if (self.far_relay_on and self._frame_mode()
+                    and math.hypot(gx - self.pose[0], gy - self.pose[1])
+                    > self.far_admit_dist):
+                modes.insert(0, 'relay')
             for mode in modes:
                 rep = self._veto_migrate_point(gx, gy, mode)
                 if rep is None:
@@ -2786,6 +2869,17 @@ class Arbiter(Node):
             if cur is None:
                 break
         path.reverse()
+        # P5(iii)（2026-11-11）：把这条路径转成世界坐标存一份，供"中继降级"取点。
+        # 必须带上目标坐标：每拍最多会调 max_cand 次 path_and_width，只有与
+        # 被否决目标坐标一致的那条路径才是它对的那条。
+        try:
+            self._last_path_w = [
+                (ox + ((ci % w) + 0.5) * res, oy + ((ci // w) + 0.5) * res)
+                for ci in path]
+            self._last_path_goal = (round(x, 2), round(y, 2))
+        except Exception:                      # noqa: BLE001
+            self._last_path_w = None
+            self._last_path_goal = None
         # 宽度判据换到 /map（占据栅格：>=50 才是障碍，-1 未知按可通行算）。
         # 用 costmap 会踩膨胀层的坑：值 <90 的格已经是"离障碍 >=0.52 m"，
         # 直接按净宽读会把 1.05 m 的通道误判成窄缝。
@@ -3031,6 +3125,401 @@ class Arbiter(Node):
         else:
             self._cand_cells = dict(fresh)
         self.cands = list(self._cand_cells.values())
+
+    # ================= P1（2026-11-11）未知区连通分量 =================
+    def unknown_region_field(self):
+        """未知格连通分量标签场。缺 numpy/scipy 时返回 None（调用方退回旧行为）。
+
+        为什么需要：候选落点倾向要按"这个候选打开的未知区有多大、离车多远"排序，
+        而不是只看候选点自身（候选点永远贴在已知/未知边界上，自身距离没有区域含义）。
+        缓存按 (/map 序号, 尺寸, 分辨率) 失效 —— 与 clearance_field 同一套思路。
+        """
+        if not self.ureg_enabled:
+            return None
+        m = self.map
+        if m is None:
+            return None
+        info = m.info
+        res = info.resolution
+        if res <= 0:
+            return None
+        w, h = info.width, info.height
+        key = (self._map_seq, w, h, round(res, 6))
+        if key == self._ureg_key and self._ureg_field is not None:
+            return self._ureg_field
+        try:
+            import numpy as np
+            from scipy import ndimage
+        except Exception:                      # noqa: BLE001 - 没装 scipy 就关闭本功能
+            self._ureg_key = None
+            self._ureg_field = None
+            return None
+        arr = np.asarray(m.data, dtype=np.int16).reshape(h, w)
+        unknown = arr < 0
+        # 8 邻域：细缝（门框、桌腿之间）不该被切成分量
+        labels, n = ndimage.label(unknown,
+                                 structure=np.ones((3, 3), dtype=np.int8))
+        # 面积用 bincount 统计：各 scipy 版本都有 ndimage.sum，但已被废弃，
+        # bincount 更快且不受版本影响
+        cnt = np.bincount(labels.ravel(), minlength=n + 1)
+        sizes = cnt[1:].astype(np.int64)
+        # P1 增补（2026-11-11 实测驱动）：未知**厚度**场。
+        # 为什么必须补：connected-component 在本世界上是退化的 —— 实测 91% 的未知格
+        # 属于**同一个**分量（27000+ 格），其余 149 个分量加起来才 6 m²。于是
+        # "候选所属区域的最远点距车多远"对几乎所有候选都是同一个数
+        # （实测拍内极差中位 = 0.00 m），排不出任何顺序。
+        # 厚度场（未知格到最近已知格的距离）不受此影响：房间中心厚、门框处薄，
+        # 实测拍内归一化极差 161%，是真正有区分度的区域级特征。
+        depth = ndimage.distance_transform_edt(unknown) * res
+        try:
+            objs = ndimage.find_objects(labels)
+        except Exception:                      # noqa: BLE001
+            objs = None
+        self._ureg_field = {'labels': labels, 'n': int(n), 'sizes': sizes,
+                            'objs': objs, 'res': res, 'w': w, 'h': h,
+                            'ox': info.origin.position.x,
+                            'oy': info.origin.position.y,
+                            'unknown': unknown, 'depth': depth}
+        self._ureg_key = key
+        self._ureg_pts = {}        # 地图变了，惰性缓存的分量点列必须全部作废
+        return self._ureg_field
+
+    def unknown_depth_at(self, x, y, radius=None):
+        """"(x,y) 周边 radius 内未知厚度（米）的最大值；特征不可用返回 None。
+
+        厚度 = 该未知格到最近**已知**格的距离。它回答的是"从这个点往未知里
+        还能推多深"，正是"室内框架还没探到的深处"的代理量。
+        """
+        f = self.unknown_region_field()
+        if f is None or 'depth' not in f:
+            return None
+        r = self.ureg_radius if radius is None else radius
+        res = f['res']
+        ci = int((x - f['ox']) / res)
+        cj = int((y - f['oy']) / res)
+        n = max(1, int(r / res))
+        j0, j1 = max(0, cj - n), min(f['h'], cj + n + 1)
+        i0, i1 = max(0, ci - n), min(f['w'], ci + n + 1)
+        if j0 >= j1 or i0 >= i1:
+            return None
+        win = f['depth'][j0:j1, i0:i1]
+        if not win.size:
+            return None
+        return float(win.max())
+
+    def unknown_region_at(self, x, y, radius=None):
+        """(x,y) 周边 radius 内**面积最大**的未知连通分量 id；没有则 0。
+
+        候选点贴在边界上，单格查询经常落在已知格，所以在半径内扫一遍
+        （默认 0.5 m ≈ 10 格 @5cm）。面积小于 ureg_min_cells 的分量按噪声丢弃。
+        """
+        f = self.unknown_region_field()
+        if f is None:
+            return 0
+        r = self.ureg_radius if radius is None else radius
+        res = f['res']
+        ci = int((x - f['ox']) / res)
+        cj = int((y - f['oy']) / res)
+        n = max(1, int(r / res))
+        labels = f['labels']
+        sizes = f['sizes']
+        best, best_sz = 0, 0
+        for dj in range(-n, n + 1):
+            j = cj + dj
+            if not (0 <= j < f['h']):
+                continue
+            base = j
+            for di in range(-n, n + 1):
+                if di * di + dj * dj > n * n:
+                    continue
+                i = ci + di
+                if not (0 <= i < f['w']):
+                    continue
+                rid = int(labels[base, i])
+                if rid <= 0:
+                    continue
+                sz = int(sizes[rid - 1])
+                if sz > best_sz:
+                    best, best_sz = rid, sz
+        if best_sz < self.ureg_min_cells:
+            return 0
+        return best
+
+    def region_span(self, rid, pose=None):
+        """该未知分量相对车位的 (最近, 质心, 最远) 距离（米）；不可用返回 None。
+
+        reg_far 就是"候选打开的那片未知区的远端有多远"，是落点倾向的主依据；
+        reg_cen 作为更稳的备选（远端对零散凸起敏感）。
+        """
+        f = self.unknown_region_field()
+        if f is None or rid <= 0 or rid > f['n']:
+            return None
+        pose = pose if pose is not None else self.pose
+        if pose is None:
+            return None
+        pts = self._ureg_pts.get(rid)
+        if pts is None:
+            try:
+                import numpy as np
+            except Exception:                  # noqa: BLE001
+                return None
+            objs = f.get('objs')
+            sl = objs[rid - 1] if (objs is not None and rid - 1 < len(objs)) else None
+            if sl is None:
+                return None
+            win = f['labels'][sl] == rid
+            jj, ii = np.nonzero(win)
+            j0 = sl[0].start or 0
+            i0 = sl[1].start or 0
+            pts = (f['ox'] + (ii + i0 + 0.5) * f['res'],
+                   f['oy'] + (jj + j0 + 0.5) * f['res'])
+            self._ureg_pts[rid] = pts
+        try:
+            import numpy as np
+        except Exception:                      # noqa: BLE001
+            return None
+        wx, wy = pts
+        d = np.hypot(wx - pose[0], wy - pose[1])
+        return float(d.min()), float(d.mean()), float(d.max())
+
+    def unknown_edge_far(self):
+        """"前沿最远距离"：紧邻已知空闲的未知格中，离车最远多少米。
+
+        这是"框架是否探完"的判据 (a)（用户 2026-11-11 选定：该值连续若干拍
+        不再增长 ⇒ 边界已推到尽头，可切补齐阶段）。必须限制在"紧邻已知空闲"
+        的未知格上，否则会取到地图角落的未知块，永远显示"还有很远的没探"。
+        """
+        f = self.unknown_region_field()
+        if f is None or self.pose is None:
+            return None
+        cache = f.get('edge_pts')
+        if cache is None:
+            try:
+                import numpy as np
+                from scipy import ndimage
+            except Exception:                  # noqa: BLE001
+                return None
+            m = self.map
+            if m is None:
+                return None
+            info = m.info
+            arr = np.asarray(m.data, dtype=np.int16).reshape(info.height,
+                                                              info.width)
+            unknown = arr < 0
+            known_free = (arr >= 0) & (arr < 50)
+            it = max(1, int(0.30 / f['res']))
+            edge = unknown & ndimage.binary_dilation(known_free, iterations=it)
+            if not edge.any():
+                cache = ()
+            else:
+                jj, ii = np.nonzero(edge)
+                cache = (f['ox'] + (ii + 0.5) * f['res'],
+                         f['oy'] + (jj + 0.5) * f['res'])
+            f['edge_pts'] = cache
+        if not cache:
+            return None
+        try:
+            import numpy as np
+        except Exception:                      # noqa: BLE001
+            return None
+        wx, wy = cache
+        d = np.hypot(wx - self.pose[0], wy - self.pose[1])
+        return float(d.max())
+
+    # ================= P4（2026-11-11）先远后近两阶段 =================
+    def _frame_mode(self):
+        """当前是否在"框架阶段"（先远后近）。总开关关闭时永远是 False。"""
+        return bool(self.frame_far_first) and self.strategy_phase == 'frame'
+
+    def _sort_candidates(self, items):
+        """按当前阶段排序。items 均为 (score, negd, x, y)，negd = -距离。
+
+        补齐阶段：score 降序 —— 与改造前**逐位等价**（(score,-dist,x,y) 的
+        元组降序就是 score 优先、近者优先做并列裁决）。
+        框架阶段：negd 升序 = 距离降序 = **越远越优先**，score 只做并列裁决。
+
+        为什么不把"距离"塞进第一个元素：下游 `top.append((u - pen - risk_pen,
+        negd, x, y))` 里 pen/risk 是百~千量级的罚分，会把米级的距离彻底淹没。
+        改排序规则、不改元组结构，是唯一不动下游三处解包的做法。
+        """
+        if not self._frame_mode():
+            return sorted(items, reverse=True)
+        return sorted(items, key=lambda q: (q[1], -q[0]))
+
+    def known_cells(self):
+        """/map 上已知格数（>=0，即空闲+占据）。缺 numpy 时返回 None。
+
+        为什么阶段判据 (a) 用它而不是"最远前沿距离"（2026-11-11 实测）：
+        `unknown_edge_far` 在 90 s 里上涨 40 拍 / 下跌 38 拍、单拍最大变动 1.27 m,
+        是纯噪声 —— 它取的是全图最远前沿，而地图边缘/墙体背面随时会被揭示，
+        数值随机跳。实测直接后果：90 s 内阶段切换 3 次（框架→补齐→框架→补齐），
+        两阶段互相抵消，"先远"根本跑不出来。
+        已探明格数是**单调递增**的，只有真的探不下去了才会停滞，语义上也正好
+        对应"室内框架已成型"。
+        """
+        m = self.map
+        if m is None:
+            return None
+        key = (self._map_seq, m.info.width, m.info.height)
+        if key == getattr(self, '_known_key', None):
+            return self._known_n
+        try:
+            import numpy as np
+        except Exception:                      # noqa: BLE001
+            return None
+        arr = np.asarray(m.data, dtype=np.int16).reshape(m.info.height,
+                                                        m.info.width)
+        self._known_n = int((arr >= 0).sum())
+        self._known_key = key
+        return self._known_n
+
+    def _update_strategy_phase(self, now):
+        """框架 ↔ 补齐 的阶段切换（用户 D1/D2：可回退 + 滞回；远区耗尽切补齐）。
+
+        切到补齐需**同时**满足（用户 2026-11-11 选定的 (a)+(b) 组合）：
+          (a) 已探明面积连续 frame_stall_ticks 拍增长 < frame_growth_cells
+          (b) 剩余未知连通分量数 <= frame_regions_max
+        切回框架只需一条：已探明面积一次性跳增 >= frame_regrow_cells
+        （出现这种量级的新增，只可能是发现了一个没见过的房间）。
+        切换后 frame_hysteresis_sec 内不再切换，避免在阈值附近抖动。
+        """
+        if not self.frame_far_first:
+            self.strategy_phase = 'fill'
+            return
+        if not self._phase_t:
+            self._phase_t = now
+        known = self.known_cells()
+        if known is None:
+            return
+        # ---- 已探明面积增长/停滞计数（格数口径，单调）----
+        if self._phase_known_best is None:
+            self._phase_known_best = known
+            grown = 0
+        elif known > self._phase_known_best:
+            grown = known - self._phase_known_best
+            self._phase_known_best = known
+        else:
+            grown = 0
+        self._phase_stall = (0 if grown >= self.frame_growth_cells
+                             else self._phase_stall + 1)
+        if now - self._phase_t < self.frame_hysteresis:
+            return
+        f = self.unknown_region_field()
+        nreg = None if f is None else int(f['n'])
+        if self.strategy_phase == 'frame':
+            if (self._phase_stall >= self.frame_stall_ticks
+                    and nreg is not None and nreg <= self.frame_regions_max):
+                self.strategy_phase = 'fill'
+                self._phase_t = now
+                self._phase_switch_known = known
+                self._phase_stall = 0
+                self.stats['phase_to_fill'] = self.stats.get('phase_to_fill', 0) + 1
+                self.get_logger().info(
+                    'P4 阶段切换：框架 → 补齐（已探明 %d 格连续 %d 拍停滞、'
+                    '剩余未知分量 %d 个<=%d）'
+                    % (known, self.frame_stall_ticks, nreg, self.frame_regions_max))
+        else:
+            base = getattr(self, '_phase_switch_known', None)
+            if base is not None and known - base >= self.frame_regrow_cells:
+                self.strategy_phase = 'frame'
+                self._phase_t = now
+                self._phase_stall = 0
+                self.stats['phase_to_frame'] = self.stats.get('phase_to_frame', 0) + 1
+                self.get_logger().info(
+                    'P4 阶段切回：补齐 → 框架（已探明由 %d 增至 %d 格，'
+                    '+%d 格，发现新区域）' % (base, known, known - base))
+
+    def relay_point(self, gx, gy):
+        """沿"本目标已算出的那条路径"取一个中继点（P5-iii）。
+
+        依据（2026-11-11 实测）：>6 m 的派发取消率 69%，且取消前日志里
+        「卡住」16 次、「blocked」9 次、「迁移」9 次 —— 失败点在**途中**，不在选点。
+        `path_and_width` 本来就已经 BFS 出了整条路径，取路径上 far_relay_m 弧长处
+        继续走，比"随机挪 2 m"或"直接取消重选"都更接近"先把这段走通"。
+        只认可与该目标坐标匹配的那条路径，避免用到上一个候选的残值。
+        """
+        if not self.far_relay_on or self.pose is None:
+            return None
+        path = self._last_path_w
+        if not path or len(path) < 2:
+            self.stats['far_relay_miss'] = self.stats.get('far_relay_miss', 0) + 1
+            return None
+        if self._last_path_goal != (round(gx, 2), round(gy, 2)):
+            self.stats['far_relay_miss'] = self.stats.get('far_relay_miss', 0) + 1
+            return None
+        acc = 0.0
+        prev = None
+        for (px, py) in path:
+            if prev is not None:
+                acc += math.hypot(px - prev[0], py - prev[1])
+            prev = (px, py)
+            if acc < self.far_relay_m:
+                continue
+            # 离目标太近就不算"中继"了（与原目标无实质区别）
+            if math.hypot(px - gx, py - gy) < self.far_relay_min_goal:
+                break
+            if self._veto_ok(px, py):
+                self.stats['far_relay_ok'] = self.stats.get('far_relay_ok', 0) + 1
+                return px, py
+        self.stats['far_relay_miss'] = self.stats.get('far_relay_miss', 0) + 1
+        return None
+
+    def probe_pool(self, scored, raw_of):
+        """候选池快照（P2）：每拍一行，记录排序后前 N 名的全部依据。
+
+        与 probe_candidate 的分工：那个只在**真正派发**时记一条，看不到
+        "当时还有哪些候选、为什么没被选、远优先有没有把序列重排成功"；
+        这个记录整条序列，是落点倾向改造唯一的归因来源。
+        """
+        if not self.pool_probe_log or self.pool_probe_n <= 0 or not scored:
+            return
+        n = min(self.pool_probe_n, len(scored))
+        field = self.unknown_region_field()
+        rows = []
+        for rank in range(n):
+            key_s, negd, x, y = scored[rank]
+            dist = -negd
+            rid = self.unknown_region_at(x, y)
+            span = self.region_span(rid) if rid > 0 else None
+            reg_m2 = 0.0
+            if rid > 0 and field is not None:
+                reg_m2 = round(float(field['sizes'][rid - 1])
+                               * field['res'] * field['res'], 2)
+                self.stats['ureg_ok'] = self.stats.get('ureg_ok', 0) + 1
+            else:
+                self.stats['ureg_miss'] = self.stats.get('ureg_miss', 0) + 1
+            rows.append({
+                'rank': rank + 1, 'x': round(x, 2), 'y': round(y, 2),
+                'dist': round(dist, 2),
+                'u_eff': round(float(raw_of.get((round(x, 2), round(y, 2)), 0.0)), 1),
+                'key': round(float(key_s), 2),
+                'reg': rid, 'reg_m2': reg_m2,
+                'reg_near': None if span is None else round(span[0], 2),
+                'reg_cen': None if span is None else round(span[1], 2),
+                'reg_far': None if span is None else round(span[2], 2),
+                # P1 增补：未知厚度是连接分量退化后的**主**区域特征（见 unknown_region_field）
+                'depth': (None if self.unknown_depth_at(x, y) is None
+                          else round(self.unknown_depth_at(x, y), 2)),
+            })
+        self._pool_tick += 1
+        row = {'t': round(time.time(), 3), 'tick': self._pool_tick,
+               'robot': (None if self.pose is None
+                         else [round(self.pose[0], 3), round(self.pose[1], 3)]),
+               'n_pool': len(self.cands), 'n_scored': len(scored),
+               'n_regions': (None if field is None else field['n']),
+               'far_edge_m': self.unknown_edge_far(),
+               # P4：当前阶段。A/B 归因必须能分开"框架阶段拍"与"补齐阶段拍"，
+               # 否则"rank1 不是最远"的拍会被误判成排序失效（其实是补齐阶段）。
+               'phase': self.strategy_phase,
+               'known': self.known_cells(),
+               'rows': rows}
+        try:
+            os.makedirs(os.path.dirname(self.pool_probe_log) or '.', exist_ok=True)
+            with open(self.pool_probe_log, 'a', encoding='utf-8') as f:
+                f.write(json.dumps(row, ensure_ascii=False) + '\n')
+            self.stats['pool_probe'] = self.stats.get('pool_probe', 0) + 1
+        except Exception:                      # noqa: BLE001
+            pass
 
     # ---- 工具 ----
     def unknown_cells(self, x, y):
@@ -3527,6 +4016,8 @@ class Arbiter(Node):
         self._repair_tick_n = 0          # 每拍修复验证预算（防止一拍内跑太多 BFS）
         self._update_stuck(now)
         self._update_failfast(now)
+        # P4：阶段状态机每拍更新一次（总开关关闭时是常数开销）
+        self._update_strategy_phase(now)
         if self.map is None or self.pose is None or not self.cands:
             return
         if self.mgr_busy and now - self.last_pub < self.repub:
@@ -3563,10 +4054,24 @@ class Arbiter(Node):
             # P13-1：距离折现（这里只算 O(1) 的一项；开销大的落点特征放到
             # 下面已缩到 max_cand 个候选之后再算，不拖慢 1 Hz 主循环）
             _dist = math.hypot(x - self.pose[0], y - self.pose[1])
-            _p = self.risk_discount(_dist)
+            # P4（用户 Q4 答案"改为越远越优先"）：框架阶段不再对距离折现。
+            # 否则一个上升型的距离偏好会被 1/(1+(d/4.5)^2) 抵掉一半，
+            # 等于没改。补齐阶段保持原样，保证可回退。
+            _frame = self._frame_mode()
+            if _frame and self.frame_depth_min > 0.0:
+                _dep = self.unknown_depth_at(x, y)
+                if _dep is not None and _dep < self.frame_depth_min:
+                    self.stats['frame_depth_reject'] = \
+                        self.stats.get('frame_depth_reject', 0) + 1
+                    continue
+            _p = 1.0 if _frame else self.risk_discount(_dist)
             raw_of[(round(x, 2), round(y, 2))] = u_eff
             scored.append((u_eff * _p, -_dist, x, y))
-        scored.sort(reverse=True)
+        scored = self._sort_candidates(scored)
+        # P2（2026-11-11）：候选池快照 —— 记录排序后前 N 名的完整依据。
+        # 只观测、不影响决策；没配 pool_probe_log 时是纯空操作。
+        if self.pool_probe_log:
+            self.probe_pool(scored, raw_of)
         # V1：对前 max_cand 个候选先算区域特征 → 闸门硬拒 + occ/esc 罚分重排
         top, feats = [], {}
         for u, negd, x, y in scored[:self.max_cand]:
@@ -3590,8 +4095,11 @@ class Arbiter(Node):
             top.append((u - pen - risk_pen, negd, x, y))
             feats[(round(x, 2), round(y, 2))] = f
             risk_of[(round(x, 2), round(y, 2))] = risk_info
-        top.sort(reverse=True)
-        top = self.near_first_reorder(top)
+        top = self._sort_candidates(top)
+        # P4（用户 Q5）：框架阶段强制关掉"近处优先"—— 它会在 ±10% 分差带里
+        # 把近的候选提到前面，与"先远"直接打架。
+        if not self._frame_mode():
+            top = self.near_first_reorder(top)
         fallback = None
         passing = []
         for u, negd, x, y in top:
@@ -3652,6 +4160,25 @@ class Arbiter(Node):
                     '可达但不可返回否决：目标 (%.2f,%.2f) 附近掉头空间仅 %.2f m < %.2f m'
                     % (gx, gy, turn, self.return_turn_width))
                 continue
+            # ===== P5(ii)（2026-11-11）远目标准入 =====
+            # 依据：实测 >6 m 的派发取消率 69%、3~4.5 m 只有 0%，且 >6 m 取消前
+            # 日志里「卡住」16 次 /「blocked」9 次 —— 远目标失败在途中而非选点。
+            # 框架阶段特意要派远点，所以这里只对远目标把净宽门槛从 narrow_floor
+            # (0.58) 抬到 corridor_hard (0.92)：能过就派，过不了就**顺位到次远**
+            # （top 在框架阶段本来就是距离降序，continue 天然实现"降级到次远"）。
+            if (self.far_admit_on and self._frame_mode()
+                    and -negd > self.far_admit_dist
+                    and min_w is not None
+                    and min_w < (self.far_admit_width or self.pass_width)):
+                self.stats['far_admit_reject'] = \
+                    self.stats.get('far_admit_reject', 0) + 1
+                self._note_uniq('far_admit_reject', gx, gy)
+                self.get_logger().info(
+                    'P5 远目标准入否决：%.2f m 外的目标 (%.2f,%.2f) 实测净宽 %.2fm'
+                    ' < %.2fm，降级到次远'
+                    % (-negd, gx, gy, min_w,
+                       self.far_admit_width or self.pass_width))
+                continue
             # P13-1：不再"第一个通过硬门就派发" —— 硬门的通过顺序与风险无关，
             # 那样加风险项等于没加。这里收集前 risk_eval_n 个合格者，
             # 叠加沿路风险（窄段/未知占比）后取最优。
@@ -3675,7 +4202,10 @@ class Arbiter(Node):
             if len(passing) >= (self.risk_eval_n if self.risk_enabled else 1):
                 break
         if passing:
-            passing.sort(key=lambda q: q[0], reverse=True)
+            # P4：框架阶段的 passing 已经是距离降序（top 就是按距离排的，按顺序
+            # 追加），再按 score 排会把"先远"打回去。补齐阶段保持原样。
+            if not self._frame_mode():
+                passing.sort(key=lambda q: q[0], reverse=True)
             _sc, gx, gy, u, min_w, info = passing[0]
             self.stats['risk_selected'] = self.stats.get('risk_selected', 0) + 1
             self._last_risk_info = info

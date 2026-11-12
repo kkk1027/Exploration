@@ -234,6 +234,26 @@ def generate_launch_description():
                                 # 探索末段"停车友好"偏置需要知道本轮总时长
                                 'explore_sec': LaunchConfiguration('explore_sec'),
                                 'probe_log': LaunchConfiguration('candidate_probe_log'),
+                                # P1/P2（2026-11-11）：未知区特征 + 候选池快照
+                                'ureg_enabled': LaunchConfiguration('ureg_enabled'),
+                                'ureg_radius_m': LaunchConfiguration('ureg_radius'),
+                                'ureg_min_cells': LaunchConfiguration('ureg_min_cells'),
+                                'pool_probe_n': LaunchConfiguration('pool_probe_n'),
+                                'pool_probe_log': LaunchConfiguration('pool_probe_log'),
+                                # P4/P5（2026-11-11）：先远后近两阶段 + 远目标准入 + 中继降级
+                                'frame_far_first': LaunchConfiguration('frame_far_first'),
+                                'frame_depth_min_m': LaunchConfiguration('frame_depth_min'),
+                                'frame_stall_ticks': LaunchConfiguration('frame_stall_ticks'),
+                                'frame_growth_cells': LaunchConfiguration('frame_growth_cells'),
+                                'frame_regions_max': LaunchConfiguration('frame_regions_max'),
+                                'frame_hysteresis_sec': LaunchConfiguration('frame_hysteresis'),
+                                'frame_regrow_cells': LaunchConfiguration('frame_regrow_cells'),
+                                'far_admit': LaunchConfiguration('far_admit'),
+                                'far_admit_dist_m': LaunchConfiguration('far_admit_dist'),
+                                'far_admit_width_m': LaunchConfiguration('far_admit_width'),
+                                'far_relay': LaunchConfiguration('far_relay'),
+                                'far_relay_m': LaunchConfiguration('far_relay_m'),
+                                'far_relay_min_goal_m': LaunchConfiguration('far_relay_min_goal'),
                                 'timeline_log': LaunchConfiguration('timeline_log')}])
 
     # P0-1：撞障取证（只读）。与机器人层同时启动，覆盖整轮（含启动期）。
@@ -457,6 +477,45 @@ def generate_launch_description():
             description='观测工作流 v2：仲裁器每拍一行时间线 JSONL（空=不写）'),
         DeclareLaunchArgument('candidate_probe_log', default_value='',
             description='候选质量探针 JSONL 路径（空=不记录）'),
+        # P1/P2（2026-11-11）：候选落点倾向的前置设施
+        DeclareLaunchArgument('ureg_enabled', default_value='true',
+            description='P1：计算未知连通分量特征（缺 numpy/scipy 时自动关闭）'),
+        DeclareLaunchArgument('ureg_radius', default_value='0.50',
+            description='P1：候选周边多大半径内的未知格用于判定"属于哪个未知分量"（m）'),
+        DeclareLaunchArgument('ureg_min_cells', default_value='40',
+            description='P1：小于此格数的未知分量按噪声丢弃（1 m² = 400 格 @5cm）'),
+        DeclareLaunchArgument('pool_probe_n', default_value='12',
+            description='P2：候选池快照每拍记录前 N 名（0=关闭）'),
+        DeclareLaunchArgument('pool_probe_log', default_value='',
+            description='P2：候选池快照 JSONL 路径（空=不记录）'),
+        # P4/P5（2026-11-11）：先远后近两阶段 / 远目标准入 / 中继降级
+        # frame_far_first 是总开关，默认 false = 逐位等价改造前行为（A/B 基准臂）。
+        DeclareLaunchArgument('frame_far_first', default_value='false',
+            description='P4：开启"先远后近"两阶段候选排序（仅重排，不改生成）'),
+        DeclareLaunchArgument('frame_depth_min', default_value='0.0',
+            description='P4：框架阶段准入所需最小未知厚度（m，0=不过滤）'),
+        DeclareLaunchArgument('frame_stall_ticks', default_value='8',
+            description='P4 判据(a)：已探明面积连续多少拍不增长则视为框架已成型'),
+        DeclareLaunchArgument('frame_growth_cells', default_value='400',
+            description='P4 判据(a)：已探明格数增长达此值算"还在长"（400 格≈1 m² @5cm）'),
+        DeclareLaunchArgument('frame_regions_max', default_value='6',
+            description='P4 判据(b)：剩余未知连通分量 <= 此值才允许切补齐'),
+        DeclareLaunchArgument('frame_hysteresis', default_value='20.0',
+            description='P4：阶段切换后的冷却/滞回秒数'),
+        DeclareLaunchArgument('frame_regrow_cells', default_value='2500',
+            description='P4：已探明格数跳增达此值则切回框架（2500 格≈6.25 m²，新房间）'),
+        DeclareLaunchArgument('far_admit', default_value='true',
+            description='P5(ii)：框架阶段的远目标必须先凑够净宽门槛'),
+        DeclareLaunchArgument('far_admit_dist', default_value='5.0',
+            description='P5(ii)：多远的算"远目标"（m）'),
+        DeclareLaunchArgument('far_admit_width', default_value='0.0',
+            description='P5(ii)：远目标净宽门槛（0=用 pass_width 0.90）'),
+        DeclareLaunchArgument('far_relay', default_value='true',
+            description='P5(iii)：远目标被否决时改用路径上的中继点'),
+        DeclareLaunchArgument('far_relay_m', default_value='4.0',
+            description='P5(iii)：中继点取路径上多少米弧长处'),
+        DeclareLaunchArgument('far_relay_min_goal', default_value='1.5',
+            description='P5(iii)：中继点离原目标至少多少米（否则等于没改）'),
         # 2026-10-25 十轮实测：6 → 14 后 manager 自派占比 55% → 41%（仲裁派发 28% → 43%），
         # 全绿 10/10、接触 0、返航失败 0 与基线持平，内存/CPU 采样无差异。
         # 原因：每 tick 只校验前 6 个候选，一失败就记"本轮候选全部被拒"，
