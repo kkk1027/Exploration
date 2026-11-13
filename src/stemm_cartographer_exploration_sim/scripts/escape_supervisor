@@ -186,6 +186,14 @@ class EscapeSupervisor(Node):
         self._wedge_info = {}           # 触发时的判据快照（日志归因用）
         # 返航失败（manager 放弃等待人工）时允许连续小步倒车，每步仍 <=0.15 m、逐步雷达复核
         self.return_reverse_streak = int(p('return_reverse_streak', 4).value)
+        # 2026-11-13：manager 放弃（return_home_failed_waiting_manual）后不再自动
+        # 开一串倒车。实测 p14vB_vis1：车在 (4.39,2.07) 距原点 4.86 m，manager
+        # 放弃后 supervisor 连续 8 次倒车（每次 ~0.154 m，共 1.23 m）把车推到
+        # (5.28,2.48)，**离原点更远**，重试时反而更难回来。
+        # 原设计意图是"退一点让重试有通道"，但那要求"退的方向比当前更差"才成立；
+        # 返航时根本不知道原点的方向，盲退只会相向而行。
+        # 默认 False（零位移）；需要旧行为时置 true。
+        self.giveup_reverse_enabled = bool(p('giveup_reverse', False).value)
         self._rv_streak_left = 0
         # ---- 只读探针（P9-C0）：为 C 层"探索期受控倒车"定口径用，默认关、不改变任何控制行为 ----
         # 用法：STEMM_REV_PROBE=1 bash harness/round.sh <tag> <sec>
@@ -673,6 +681,9 @@ class EscapeSupervisor(Node):
         if now - self._rv_last_end < (1.0 if gave_up else 2.0):
             return False
         # manager 已放弃时开一串连续小步（每步仍独立复核后方净空）
+        # 2026-11-13：默认关闭 —— 见 giveup_reverse_enabled 的注释。
+        if gave_up and not self.giveup_reverse_enabled:
+            return False
         if gave_up and self._rv_streak_left <= 0:
             self._rv_streak_left = self.return_reverse_streak
         if now - self.points_stamp > self.scan_stale_sec:
