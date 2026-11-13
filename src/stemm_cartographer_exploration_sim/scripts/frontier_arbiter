@@ -378,6 +378,19 @@ class Arbiter(Node):
         self.clearance_mode = str(p('clearance_mode', 'distance').value).lower()
         self.use_vision_obstacles = bool(p('corridor_use_vision', True).value)
         self.vision_grid_topic = str(p('vision_grid_topic', '/vision/obstacle_grid').value)
+        # ===== 视觉就绪门（2026-11-13）=====
+        # 背景：视觉节点比探索开始晚就绪（实测 p14vA_s2：首次导航 +17.3 s、
+        # 视觉首帧 +24.4 s，中间 7.1 s 无视觉，车已走约 2 m）。更关键的是，
+        # 车停在出发点、朝向首目标前的那一小段时间，往往是某些侧方家具
+        # **唯一**能进入 60° 前向视场的时机；错过就要等到绕回来。
+        #
+        # 对策：视觉启用且未就绪时，不发布探索目标。超 `vision_ready_timeout_sec`
+        # 后无论是否就绪都放行，避免视觉节点故障时整轮探索被永久卡死。
+        # `vision_ready_min_cells`：视觉累积栅格至少要有这么多占据格才算就绪；
+        # 用 >0 而不是"收到消息"，因为节点刚起时会发空栅格。
+        self.vision_ready_gate = bool(p('vision_ready_gate', True).value)
+        self.vision_ready_timeout = float(p('vision_ready_timeout_sec', 45.0).value)
+        self.vision_ready_min_cells = int(p('vision_ready_min_cells', 1).value)
         # 候选质量探针（2026-10-24）：记录每个"实际派发"的候选在**统一障碍图**
         # （激光∪视觉）上的复杂度/可脱困性指标，供离线统计"哪类候选会导致卡死"。
         self.probe_log = str(p('probe_log', '').value)
@@ -735,15 +748,28 @@ class Arbiter(Node):
         # 框架阶段的准入门槛：未知厚度（距最近已知格）不小于此值的候选才允许
         # 作主目标，避免把"远处但只是墙角缝隙"的候选当成框架推进点。
         self.frame_depth_min = _f('frame_depth_min_m', 0.0)
-        # 阶段判据 (a)：已探明面积增长停滞 —— 用**格数**而非距离（见 _update_strategy_phase）
+        # ===== P4 阶段判据（2026-11-13 第三次修正：混合判据）=====
+        # 演进过程（每次都有实测依据，别再改回去）：
+        #   v1 停滞驱动（已探明面积连续 N 拍不增长）：实测 2.7 次/轮切换，
+        #      90 s 内在框架/补齐之间交替，一半时间有 risk_discount 保护 —— 能跑。
+        #   v2 供给驱动（远候选数为 0）：**实测失败**。远候选"有货"≠"可达"，
+        #      153 拍里从未连续 3 拍为 0 ⇒ 永不切补齐 ⇒ 全程框架阶段。
+        #      而框架阶段不做距离折现、按距离降序，最远点常落在未知边缘
+        #      净空实测 0.00m ⇒ 净宽否决 ⇒ top-14 全灭 ⇒ 只派出 2 个目标、
+        #      选点等待 80.5%。（p14v2_sm3）
+        #   v3 混合（当前）：停滞驱动为**主**，供给耗尽作为**加速通道** ——
+        #      远区真空了就不必再等停滞计时；只要还有远候选就走已验证的慢判据。
+        self.frame_supply_empty_ticks = int(p('frame_supply_empty_ticks', 3).value)
         self.frame_stall_ticks = int(p('frame_stall_ticks', 8).value)
         self.frame_growth_cells = int(p('frame_growth_cells', 400).value)
-        # 阶段判据 (b)：剩余未知连通分量数 <= 此值
+        # 判据 (b)：剩余未知连通分量数 <= 此值（停滞判据的辅助条件）
         self.frame_regions_max = int(p('frame_regions_max', 6).value)
         # 滞回（用户 D1：可回退，但切换后至少保持这么久）
         self.frame_hysteresis = _f('frame_hysteresis_sec', 20.0)
-        # 回切阈值：已探明面积一次性跳增这么多格 ⇒ 发现新房间，切回框架
+        # 回切（停滞逼的补齐）：已探明跳增这么多格 ⇒ 发现新房间
         self.frame_regrow_cells = int(p('frame_regrow_cells', 2500).value)
+        # 安全阀：框架阶段连续这么多拍无候选通过硬门 ⇒ 强制切补齐
+        self.frame_deny_limit = int(p('frame_deny_limit', 5).value)
         # P5(ii)：远目标准入 —— 超过此距离的目标必须凑够净宽门槛
         self.far_admit_on = self._as_bool(p('far_admit', True).value)
         self.far_admit_dist = _f('far_admit_dist_m', 5.0)
@@ -936,11 +962,18 @@ class Arbiter(Node):
         self._phase_known_best = None
         self._phase_switch_known = None
         self._phase_stall = 0
+        self._phase_supply_empty = 0      # 连续"无远候选"的拍数
+        self._far_supply = 0              # 上一拍打分后剩下的远候选数
+        self._phase_forced = False        # 本次入 fill 是被兜底判据（推不动）逼的
+        self._frame_all_denied = 0        # 框架阶段连续"全灭"拍数（安全阀用）
         self._known_key = None
         self._known_n = 0
         # P5(iii)：path_and_width 最近一次算出的世界坐标路径 + 它对应的目标
         self._last_path_w = None
         self._last_path_goal = None
+        # P5(iii) 修复：真正派发出去那个目标的路径（随 passing 钉住，不被后续调用覆盖）
+        self._dispatch_path = None
+        self._dispatch_goal = None
         self.blacklist = []      # [(x, y, expire_ts)]
         self.last_pub = 0.0
         self.last_goal = None
@@ -1005,6 +1038,12 @@ class Arbiter(Node):
         # D3：视觉障碍也参与"净空/宽窄"判定（此前只用于代价地图）
         self.vision_grid = None
         self._vg_seq = 0
+        # 2026-11-13：视觉就绪门状态
+        self._vision_ready = False
+        self._vision_ready_t = 0.0
+        self._vision_cells = 0
+        self._vision_gate_start = time.monotonic()
+        self._vision_ready_timeout_logged = False
         self._map_seq = 0
         self._clear_key = None
         self._clear_field = None
@@ -1030,6 +1069,34 @@ class Arbiter(Node):
     def on_vision_grid(self, m):
         self.vision_grid = m
         self._vg_seq += 1
+        if not self._vision_ready:
+            # 2026-11-13：节点刚起时会先发空栅格，必须等真正有占据格才算就绪。
+            n = sum(1 for v in m.data if v >= 50) if m.data else 0
+            self._vision_cells = n
+            if n >= self.vision_ready_min_cells:
+                self._vision_ready = True
+                self._vision_ready_t = time.monotonic()
+                self.get_logger().info(
+                    '视觉就绪：累积障碍 %d 格（启动后 %.1f s），开始派发探索目标'
+                    % (n, self._vision_ready_t - self._vision_gate_start))
+
+    def vision_ready(self):
+        """视觉是否已可用。门控关闭或视觉未启用时恒为 True（保持旧行为）。"""
+        if not self.vision_ready_gate or not self.use_vision_obstacles:
+            return True
+        if self._vision_ready:
+            return True
+        now = time.monotonic()
+        if now - self._vision_gate_start > self.vision_ready_timeout:
+            if not self._vision_ready_timeout_logged:
+                self._vision_ready_timeout_logged = True
+                self.get_logger().warn(
+                    '视觉 %.0f s 内未就绪（累计 %d 格 < %d），超时放行；'
+                    '本轮探索将在无视觉输入下运行'
+                    % (self.vision_ready_timeout, self._vision_cells,
+                       self.vision_ready_min_cells))
+            return True
+        return False
 
     def on_cmd(self, m):
         self.cmd = (m.linear.x, m.angular.z)
@@ -3376,22 +3443,31 @@ class Arbiter(Node):
     def _update_strategy_phase(self, now):
         """框架 ↔ 补齐 的阶段切换（用户 D1/D2：可回退 + 滞回；远区耗尽切补齐）。
 
-        切到补齐需**同时**满足（用户 2026-11-11 选定的 (a)+(b) 组合）：
-          (a) 已探明面积连续 frame_stall_ticks 拍增长 < frame_growth_cells
-          (b) 剩余未知连通分量数 <= frame_regions_max
-        切回框架只需一条：已探明面积一次性跳增 >= frame_regrow_cells
-        （出现这种量级的新增，只可能是发现了一个没见过的房间）。
-        切换后 frame_hysteresis_sec 内不再切换，避免在阈值附近抖动。
+        ★ 2026-11-13 改为**供给驱动**（用户 D2 原意）：
+          (a) 主判据：连续 frame_supply_empty_ticks 拍里候选池中**没有远候选**
+              （距离 > far_admit_dist 且已过 min_unknown）
+          (b) 兜底：若远候选一直有、但已探明面积也连续 frame_stall_ticks 拍不增长，
+              说明"远是远，但推不动"，也切补齐（防止永远等不到）
+        切回框架只需一条：远候选重新出现（典型场景：开了个门，新一大片未知进来）。
+
+        为什么不再只用"地图停滞"：实测 727 个框架拍里远候选为 0 的只有 6 拍(1%)，
+        却切了 17 次 —— 车开往 6 m 外目标的路上（12~20 s）全在已知区跑，地图本
+        来就不长，"停滞"从第 8 秒起恒为真。那实际测的是"行驶时间"，不是"探尽"。
         """
         if not self.frame_far_first:
             self.strategy_phase = 'fill'
             return
         if not self._phase_t:
             self._phase_t = now
+        # ---- 供给计数（主判据）----
+        if self._far_supply <= 0:
+            self._phase_supply_empty += 1
+        else:
+            self._phase_supply_empty = 0
+        # ---- 已探明面积（兜底判据）----
         known = self.known_cells()
         if known is None:
             return
-        # ---- 已探明面积增长/停滞计数（格数口径，单调）----
         if self._phase_known_best is None:
             self._phase_known_best = known
             grown = 0
@@ -3407,27 +3483,50 @@ class Arbiter(Node):
         f = self.unknown_region_field()
         nreg = None if f is None else int(f['n'])
         if self.strategy_phase == 'frame':
-            if (self._phase_stall >= self.frame_stall_ticks
-                    and nreg is not None and nreg <= self.frame_regions_max):
+            supply_empty = self._phase_supply_empty >= self.frame_supply_empty_ticks
+            stalled = (self._phase_stall >= self.frame_stall_ticks
+                       and nreg is not None and nreg <= self.frame_regions_max)
+            if supply_empty or stalled:
                 self.strategy_phase = 'fill'
                 self._phase_t = now
                 self._phase_switch_known = known
                 self._phase_stall = 0
+                # 兜底切换（远候选有但推不动）不得因"供给还在"就立刻切回，
+                # 否则每拍来回抖；那时只能靠"地图真的长出新区域"来解锁。
+                self._phase_forced = bool(stalled and not supply_empty)
                 self.stats['phase_to_fill'] = self.stats.get('phase_to_fill', 0) + 1
+                if supply_empty:
+                    self.stats['phase_to_fill_supply'] = (
+                        self.stats.get('phase_to_fill_supply', 0) + 1)
+                else:
+                    self.stats['phase_to_fill_stall'] = (
+                        self.stats.get('phase_to_fill_stall', 0) + 1)
                 self.get_logger().info(
-                    'P4 阶段切换：框架 → 补齐（已探明 %d 格连续 %d 拍停滞、'
-                    '剩余未知分量 %d 个<=%d）'
-                    % (known, self.frame_stall_ticks, nreg, self.frame_regions_max))
+                    'P4 阶段切换：框架 → 补齐（%s；远候选供给=%d，'
+                    '已探明 %d 格停滞 %d 拍，剩余未知分量 %s）'
+                    % ('远候选耗尽' if supply_empty else '远候选推不动',
+                       self._far_supply, known, self._phase_stall, nreg))
         else:
-            base = getattr(self, '_phase_switch_known', None)
-            if base is not None and known - base >= self.frame_regrow_cells:
+            # 回切条件取决于是谁触发的切换：
+            #  · 供给耗尽（远候选真空了）→ 远候选恢复即回，说明找到了新远区
+            #  · 停滞逼的（远候选一直有但推不动）→ 必须"已探明跳增"才回，
+            #    否则每拍来回抖（实测过：远候选没变，切了立刻切回）
+            if self._phase_forced:
+                base = getattr(self, '_phase_switch_known', None)
+                recover = (base is not None
+                           and known - base >= self.frame_regrow_cells)
+            else:
+                recover = self._far_supply > 0
+            if recover:
                 self.strategy_phase = 'frame'
                 self._phase_t = now
                 self._phase_stall = 0
+                self._phase_supply_empty = 0
+                self._phase_forced = False
                 self.stats['phase_to_frame'] = self.stats.get('phase_to_frame', 0) + 1
                 self.get_logger().info(
-                    'P4 阶段切回：补齐 → 框架（已探明由 %d 增至 %d 格，'
-                    '+%d 格，发现新区域）' % (base, known, known - base))
+                    'P4 阶段切回：补齐 → 框架（远候选供给=%d 个，已探明 %d 格）'
+                    % (self._far_supply, known))
 
     def relay_point(self, gx, gy):
         """沿"本目标已算出的那条路径"取一个中继点（P5-iii）。
@@ -3436,15 +3535,20 @@ class Arbiter(Node):
         「卡住」16 次、「blocked」9 次、「迁移」9 次 —— 失败点在**途中**，不在选点。
         `path_and_width` 本来就已经 BFS 出了整条路径，取路径上 far_relay_m 弧长处
         继续走，比"随机挪 2 m"或"直接取消重选"都更接近"先把这段走通"。
-        只认可与该目标坐标匹配的那条路径，避免用到上一个候选的残值。
+
+        ★ 2026-11-13 修复：路径来源改为 `_dispatch_path`（在 _tick_v1 派发那一刻
+        就随 passing 一起钉住），不再读 `_last_path_w`。旧实现里后者被每拍 top-N
+        的 path_and_width 反复覆盖，留下的必然是"最后一个被检查的候选"路径，
+        与实派目标几乎必然不同 ⇒ 坐标校验每次都判 miss（实测 far_relay_ok = 0、
+        miss = 3，中继降级从未真正生效）。
         """
         if not self.far_relay_on or self.pose is None:
             return None
-        path = self._last_path_w
+        path = self._dispatch_path
         if not path or len(path) < 2:
             self.stats['far_relay_miss'] = self.stats.get('far_relay_miss', 0) + 1
             return None
-        if self._last_path_goal != (round(gx, 2), round(gy, 2)):
+        if self._dispatch_goal != (round(gx, 2), round(gy, 2)):
             self.stats['far_relay_miss'] = self.stats.get('far_relay_miss', 0) + 1
             return None
         acc = 0.0
@@ -3458,6 +3562,10 @@ class Arbiter(Node):
             # 离目标太近就不算"中继"了（与原目标无实质区别）
             if math.hypot(px - gx, py - gy) < self.far_relay_min_goal:
                 break
+            # 中继点必须比当前位姿更靠近目标，否则等于原地打转
+            if math.hypot(px - gx, py - gy) >= math.hypot(gx - self.pose[0],
+                                                          gy - self.pose[1]):
+                continue
             if self._veto_ok(px, py):
                 self.stats['far_relay_ok'] = self.stats.get('far_relay_ok', 0) + 1
                 return px, py
@@ -4016,8 +4124,9 @@ class Arbiter(Node):
         self._repair_tick_n = 0          # 每拍修复验证预算（防止一拍内跑太多 BFS）
         self._update_stuck(now)
         self._update_failfast(now)
-        # P4：阶段状态机每拍更新一次（总开关关闭时是常数开销）
-        self._update_strategy_phase(now)
+        # P4：阶段状态机放在**打分循环之后**（2026-11-13）。
+        # 供给驱动判据需要"本拍候选池里的远候选数"，放前面只能用到上一拍的值，
+        # 会白宕一拍。定时器/位姿/候选的可用性检查仍在前面，避免无效计算。
         if self.map is None or self.pose is None or not self.cands:
             return
         if self.mgr_busy and now - self.last_pub < self.repub:
@@ -4067,6 +4176,23 @@ class Arbiter(Node):
             _p = 1.0 if _frame else self.risk_discount(_dist)
             raw_of[(round(x, 2), round(y, 2))] = u_eff
             scored.append((u_eff * _p, -_dist, x, y))
+        # P4（2026-11-13）：本拍"远候选供给" —— 通过 min_unknown 且距离超过
+        # far_admit_dist 的候选个数。阶段机靠它判定"远区是否还有货"。
+        self._far_supply = sum(1 for (_, _nd, _x, _y) in scored
+                               if -_nd > self.far_admit_dist)
+        self.stats['far_supply_ticks'] = self.stats.get('far_supply_ticks', 0) + 1
+        if self._far_supply <= 0:
+            self.stats['far_supply_empty_ticks'] = (
+                self.stats.get('far_supply_empty_ticks', 0) + 1)
+        if self.stats.get('far_supply_log_tick') is None:
+            self.stats['far_supply_log_tick'] = 0
+        if self.stats['far_supply_log_tick'] % 30 == 0:
+            self.get_logger().info(
+                'P4 供给观测：远候选=%d 个，已探明=%s 格，阶段=%s'
+                % (self._far_supply, self.known_cells(), self.strategy_phase))
+        self.stats['far_supply_log_tick'] += 1
+        # P4：拿到本拍供给后再推进阶段机
+        self._update_strategy_phase(now)
         scored = self._sort_candidates(scored)
         # P2（2026-11-11）：候选池快照 —— 记录排序后前 N 名的完整依据。
         # 只观测、不影响决策；没配 pool_probe_log 时是纯空操作。
@@ -4195,7 +4321,13 @@ class Arbiter(Node):
                 float(info.get('risk_aux', 0.0)) + route_pen
                 + float(info['risk_discount_loss']), 1)
             info['risk_source'] = 'frontier'
-            passing.append((u - route_pen, gx, gy, _raw, min_w, info))
+            # P5(iii) 修复（2026-11-13）：把**这个候选自己的**路径随 passing 一起带下去。
+            # 旧实现让 relay_point 去读 self._last_path_w，而它被每拍 top-N 的
+            # path_and_width 反复覆盖 —— 最后留下的必然是**最后一个被检查**的
+            # 候选路径，与实派的 passing[0] 几乎必然不是同一个目标，
+            # 于是坐标校验每次都将 relay 判为 miss（实测 far_relay_ok = 0）。
+            passing.append((u - route_pen, gx, gy, _raw, min_w, info,
+                            self._last_path_w))
             self.stats['risk_eval'] = self.stats.get('risk_eval', 0) + 1
             # risk 关闭时只收 1 个：必须*逐位*等价旧行为（旧逻辑是"near_first
             # 排序后第一个通过硬门的候选"，而不是"前 6 个里未知格最多的"）。
@@ -4206,9 +4338,13 @@ class Arbiter(Node):
             # 追加），再按 score 排会把"先远"打回去。补齐阶段保持原样。
             if not self._frame_mode():
                 passing.sort(key=lambda q: q[0], reverse=True)
-            _sc, gx, gy, u, min_w, info = passing[0]
+            _sc, gx, gy, u, min_w, info, _path = passing[0]
             self.stats['risk_selected'] = self.stats.get('risk_selected', 0) + 1
             self._last_risk_info = info
+            # P5(iii) 修复：把本目标的路径钉在"已派发"槽位上，_last_path_* 继续
+            # 留给后续调用的临时值，两者互不干扰。
+            self._dispatch_path = _path
+            self._dispatch_goal = (round(gx, 2), round(gy, 2))
             self.probe_candidate(gx, gy, None, min_w, u)
             self.publish_goal(gx, gy, None, u)
             return
@@ -4219,6 +4355,30 @@ class Arbiter(Node):
                 % (fallback[0], fallback[1], self.stats))
             self.publish_goal(fallback[0], fallback[1], None, 0)
             return
+        # ===== P4 安全阀（2026-11-13）：框架阶段连续"全灭"就强制切补齐 =====
+        # 依据：供给驱动版实测把车锁死在框架阶段（phase_to_fill=0），而框架阶段
+        # 按距离降序、不做折现，最远点常落在未知边缘（净空实测 0.00m）——
+        # 结果 44 次发布只换来 2 次实派、选点等待 80.5%，整轮近乎空转
+        # （p14v2_sm3）。这里加一道与判据无关的兜底：只要本拍所有候选都被
+        # 硬门否掉（passing 空且 fallback 空），就记一次；连续够多拍说明
+        # "框架阶段选不出可用点"，立即切补齐（补齐阶段有 risk_discount 保护，
+        # 会自然把近处可用点排上来）。
+        if self._frame_mode():
+            self._frame_all_denied = getattr(self, '_frame_all_denied', 0) + 1
+            if self._frame_all_denied >= self.frame_deny_limit:
+                self.strategy_phase = 'fill'
+                self._phase_t = now
+                self._phase_forced = True
+                self._phase_switch_known = self.known_cells()
+                self._phase_stall = 0
+                self._frame_all_denied = 0
+                self.stats['phase_to_fill_deny'] = (
+                    self.stats.get('phase_to_fill_deny', 0) + 1)
+                self.get_logger().warn(
+                    'P4 安全阀：框架阶段连续 %d 拍无候选通过硬门 → 强制切补齐'
+                    % self.frame_deny_limit)
+        else:
+            self._frame_all_denied = 0
         # P13-2A：原始 RRT 候选也走同一套风险评分。
         # 它排在保底观察点之前：raw 是真正的前沿收益点，观察点只是"站得住"。
         raw = self.pick_raw_goal(now)
@@ -4527,6 +4687,21 @@ class Arbiter(Node):
 
     def publish_goal(self, gx, gy, r, u=None):
         now = time.monotonic()
+        # 2026-11-13：视觉就绪门。视觉启用但还没输出有效障碍时，不派发目标
+        # （只在"尚未派过任何目标"时生效，避免跑到中途因视觉掉线而停摆）。
+        if self.stats.get('published', 0) == 0 and not self.vision_ready():
+            if not getattr(self, '_vision_gate_blocked_logged', False):
+                self._vision_gate_blocked_logged = True
+                self.get_logger().warn(
+                    '视觉尚未就绪（~%.0f s / %d 格），暂不派发首个探索目标'
+                    % (now - self._vision_gate_start, self._vision_cells))
+            return
+        # P5(iii) 修复：_dispatch_* 只对"刚在 passing 分支里钉住的那个目标"有效。
+        # 其余派发路径（fallback / raw / migrate / inplace）没有对应路径，
+        # 这里统一清空，避免 relay_point 拿到上一次目标的陈旧路径。
+        if self._dispatch_goal != (round(gx, 2), round(gy, 2)):
+            self._dispatch_path = None
+            self._dispatch_goal = None
         if (self.last_goal is not None and self.last_pub
                 and now - self.last_pub < 5.0
                 and math.hypot(gx - self.last_goal[0], gy - self.last_goal[1]) < 0.30):

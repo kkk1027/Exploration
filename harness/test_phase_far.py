@@ -42,7 +42,8 @@ def _shim(cls, **kw):
     o.frame_far_first = kw.get('frame_far_first', True)
     o.strategy_phase = 'frame' if o.frame_far_first else 'fill'
     o.frame_depth_min = 0.0
-    o.frame_stall_ticks = kw.get('frame_stall_ticks', 3)
+    o.frame_supply_empty_ticks = kw.get('frame_supply_empty_ticks', 3)
+    o.frame_stall_ticks = kw.get('frame_stall_ticks', 20)
     o.frame_growth_cells = kw.get('frame_growth_cells', 400)
     o.frame_regions_max = kw.get('frame_regions_max', 6)
     o.frame_hysteresis = kw.get('frame_hysteresis', 20.0)
@@ -56,8 +57,11 @@ def _shim(cls, **kw):
     o._phase_known_best = None
     o._phase_switch_known = None
     o._phase_stall = 0
-    o._last_path_w = kw.get('last_path_w')
-    o._last_path_goal = kw.get('last_path_goal')
+    o._phase_supply_empty = 0
+    o._far_supply = kw.get('far_supply', 0)
+    o._phase_forced = False
+    o._dispatch_path = kw.get('last_path_w')
+    o._dispatch_goal = kw.get('last_path_goal')
     # 可注入的"已探明格数 / 分量数"
     known = kw.get('known', 10000)
     nreg = kw.get('nreg', 2)
@@ -110,73 +114,66 @@ def run():
     else:
         bad.append('J 并列裁决错：%r' % (got,))
 
-    # ---- K 框架 → 补齐：(a) 停滞 且 (b) 分量数低 ----
+    # ---- K 框架 → 补齐：远候选供给耗尽（用户 D2 原意，2026-11-13 改）----
     LOGS.clear()
-    o = _shim(cls, known=10000, nreg=2, frame_stall_ticks=3,
+    o = _shim(cls, known=10000, nreg=2, frame_supply_empty_ticks=3,
               frame_hysteresis=0.0)
-    for t in (1.0, 2.0, 3.0, 4.0, 5.0):
+    o._far_supply = 0
+    for t in (1.0, 2.0, 3.0, 4.0):
+        o._far_supply = 0
         o._update_strategy_phase(t)
-    if o.strategy_phase == 'fill' and o.stats.get('phase_to_fill') == 1:
+    if o.strategy_phase == 'fill' and o.stats.get('phase_to_fill_supply') == 1:
         ok += 1
-        print('  K ✓ 已探明面积停滞 + 分量数 2<=6 → 切到补齐（1 次，无重复切）')
+        print('  K ✓ 远候选连续 3 拍为 0 → 切补齐（供给驱动，1 次）')
     else:
-        bad.append('K 未切补齐：phase=%s stats=%r'
+        bad.append('K 供给耗尽未切：phase=%s stats=%r'
                    % (o.strategy_phase, o.stats))
 
-    # 面积持续增长时不切（(a) 不满足）
-    o = _shim(cls, known=10000, nreg=2, frame_stall_ticks=3,
-              frame_hysteresis=0.0, frame_growth_cells=400)
-    o.known_cells = lambda: 10000 + 5000 * o._phase_stall     # 每拍 +5000 格
+    # 远候选一直有 → 不切（即使地图不长）
+    o = _shim(cls, known=10000, nreg=2, frame_supply_empty_ticks=3,
+              frame_hysteresis=0.0, frame_stall_ticks=99)
     for t in (1.0, 2.0, 3.0, 4.0, 5.0):
+        o._far_supply = 4
         o._update_strategy_phase(t)
     if o.strategy_phase == 'frame':
         ok += 1
-        print('  K ✓ 已探明面积持续增长（每拍 +5000 格）→ 不切，仍为框架')
+        print('  K ✓ 远候选一直有（4 个）→ 不切，保持框架')
     else:
-        bad.append('K 面积在长却切了：%s' % o.strategy_phase)
+        bad.append('K 有货却切了：%s' % o.strategy_phase)
 
-    # 分量数多时不应切（(b) 不满足）
-    o = _shim(cls, known=10000, nreg=40, frame_stall_ticks=3,
+    # 兜底：远候选有但地图长期停滞 → 也切
+    o = _shim(cls, known=10000, nreg=2, frame_supply_empty_ticks=99,
+              frame_hysteresis=0.0, frame_stall_ticks=3)
+    for t in (1.0, 2.0, 3.0, 4.0):
+        o._far_supply = 4
+        o._update_strategy_phase(t)
+    if o.strategy_phase == 'fill' and o.stats.get('phase_to_fill_stall') == 1:
+        ok += 1
+        print('  K ✓ 兜底：远候选有但地图 3 拍停滞 → 也切补齐')
+    else:
+        bad.append('K 兜底未生效：phase=%s stats=%r'
+                   % (o.strategy_phase, o.stats))
+
+    # ---- L 补齐 → 框架：远候选重新出现 ----
+    o = _shim(cls, known=10000, nreg=2, frame_supply_empty_ticks=3,
               frame_hysteresis=0.0)
-    for t in (1.0, 2.0, 3.0, 4.0, 5.0):
-        o._update_strategy_phase(t)
-    if o.strategy_phase == 'frame':
-        ok += 1
-        print('  K ✓ 只剩 (a) 满足（分量数 40>6）→ 不切，仍为框架')
-    else:
-        bad.append('K 分量数不满足却切了：%s' % o.strategy_phase)
-
-    # ---- L 补齐 → 框架：已探明面积跳增（发现新房间）----
-    o = _shim(cls, known=10000, nreg=2, frame_stall_ticks=3,
-              frame_hysteresis=0.0, frame_regrow_cells=2500)
-    for t in (1.0, 2.0, 3.0, 4.0, 5.0):
+    for t in (1.0, 2.0, 3.0, 4.0):
+        o._far_supply = 0
         o._update_strategy_phase(t)
     switched = o.strategy_phase
-    o.known_cells = lambda: 13000          # +3000 格 >= 2500
-    o._update_strategy_phase(6.0)
+    o._far_supply = 2
+    o._update_strategy_phase(5.0)
     if switched == 'fill' and o.strategy_phase == 'frame':
         ok += 1
-        print('  L ✓ 补齐后已探明跳增 +3000 格 → 切回框架')
+        print('  L ✓ 补齐后远候选重新出现（2 个）→ 切回框架')
     else:
         bad.append('L 未切回框架：%s → %s' % (switched, o.strategy_phase))
 
-    # 小幅增长不应切回
-    o = _shim(cls, known=10000, nreg=2, frame_stall_ticks=3,
-              frame_hysteresis=0.0, frame_regrow_cells=2500)
-    for t in (1.0, 2.0, 3.0, 4.0, 5.0):
-        o._update_strategy_phase(t)
-    o.known_cells = lambda: 10800          # +800 < 2500
-    o._update_strategy_phase(6.0)
-    if o.strategy_phase == 'fill':
-        ok += 1
-        print('  L ✓ 小幅增长 +800 格 < 2500 → 不切回（避免抖动）')
-    else:
-        bad.append('L 小幅增长就切回：%s' % o.strategy_phase)
-
     # 滞回：冷却期内不切
-    o = _shim(cls, known=10000, nreg=2, frame_stall_ticks=1,
+    o = _shim(cls, known=10000, nreg=2, frame_supply_empty_ticks=1,
               frame_hysteresis=100.0)
     for t in (1.0, 5.0, 9.0, 13.0):
+        o._far_supply = 0
         o._update_strategy_phase(t)
     if o.strategy_phase == 'frame':
         ok += 1
