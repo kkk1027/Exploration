@@ -89,7 +89,30 @@ class VisionObstacleGrid(Node):
         d('low_z_max', 0.35)
         d('range_max', 5.0)
         d('range_min', 0.25)
-        d('self_filter_radius', 0.38)
+        # ===== 自过滤（去掉"看到自己车体"的点）=====
+        # 2026-11-13：圆形半径 0.38 过大。实测车体真外接半径只有 0.3413 m
+        # （底盘前角 hypot(0.29,0.18)），于是多滤了 3.9 cm；而圆形包围盒
+        # 面积 0.454 m² 是包络矩形 0.207 m² 的 2.19 倍 —— 侧前方那些
+        # "在圆内、但车体实际不占"的位置上的真实障碍被一并去掉。
+        #
+        # 现在默认用**包络矩形**（在车体帧里判，车头方向就是 x 轴，矩形是
+        # 精确形状）。参数全部来自 `_t_classic.urdf.xacro`：
+        #   底盘盒 size 0.45x0.36，盒心 chassis_cx = 0.29-0.45/2 = 0.065
+        #     ⇒ x ∈ [-0.160, 0.290]，y ∈ [-0.180, 0.180]
+        #   驱动轮 半径 0.10、宽 0.05、中心 y=±0.205
+        #     ⇒ x ∈ [-0.100, 0.100]，y ∈ [±0.180, ±0.230]
+        #   万向轮 球 r=0.035 @ (0.25, ±0.09)、相机壳 0.025x0.08 @ x=0.24
+        #     ⇒ 均落在上方矩形内
+        #   合并包络：x [-0.160, 0.290]，y ±0.230
+        d('self_filter_shape', 'rect')      # rect | circle
+        d('body_x_min', -0.160)
+        d('body_x_max', 0.290)
+        d('body_y_half', 0.230)
+        # circle 模式的兼容参数；rect 模式下不用。
+        # 若要用圆形，应取精确外接 0.3413，而不是原来的 0.38。
+        d('self_filter_radius', 0.3413)
+        # 矩形外扩余量（米）。车体帧下的离散化/点噪声兜底，默认 1 cm。
+        d('self_filter_margin', 0.010)
         d('min_points_per_cell', 2)
         # 跨帧持久化：同一格必须在 >= min_frames 帧里都被观测到才算障碍。
         # 目的：抑制掠射角/深度噪点在地面与墙根产生的"幽灵格"（它们会无谓地挤窄通道）
@@ -170,6 +193,11 @@ class VisionObstacleGrid(Node):
         self.range_max = float(g('range_max').value)
         self.range_min = float(g('range_min').value)
         self.self_r = float(g('self_filter_radius').value)
+        self.self_shape = str(g('self_filter_shape').value).strip().lower()
+        self.body_x_min = float(g('body_x_min').value)
+        self.body_x_max = float(g('body_x_max').value)
+        self.body_y_half = float(g('body_y_half').value)
+        self.self_margin = float(g('self_filter_margin').value)
         self.min_pts = max(1, int(g('min_points_per_cell').value))
         self.min_frames = max(1, int(g('min_frames').value))
         self.max_points = int(g('max_points').value)
@@ -407,12 +435,25 @@ class VisionObstacleGrid(Node):
             tl = tr_live.transform.translation
             Rl = quat_to_matrix(tr_live.transform.rotation)
             Pl = P @ Rl.T + np.array([tl.x, tl.y, tl.z])
-            dist = np.hypot(Pl[:, 0], Pl[:, 1])
+            lx, ly = Pl[:, 0], Pl[:, 1]
             zc = Pl[:, 2]
         else:
-            dist = np.hypot(Pw[:, 0] - t.x, Pw[:, 1] - t.y)
+            # 拿不到机身帧时退化到以车体位姿为圆心的判定（旧行为）
+            lx = Pw[:, 0] - t.x
+            ly = Pw[:, 1] - t.y
             zc = Pw[:, 2]
-        keep = ((dist > self.self_r) & (dist < self.range_max) &
+        dist = np.hypot(lx, ly)
+        if self.self_shape == 'rect':
+            # 2026-11-13：按车体包络矩形判自车，而不是用外接圆。
+            # 圆会把"侧前方在圆内、车体其实不占"的位置上的真实障碍一并滤掉；
+            # 包络矩形面积只有外接圆的 57%。
+            m = self.self_margin
+            inside_self = ((lx > self.body_x_min - m) & (lx < self.body_x_max + m)
+                           & (np.abs(ly) < self.body_y_half + m))
+            not_self = ~inside_self
+        else:
+            not_self = dist > self.self_r
+        keep = (not_self & (dist < self.range_max) &
                 (zc > self.z_min) & (zc < self.z_max))
         n_bad = int(z.size - (np.isfinite(x) & np.isfinite(y) & np.isfinite(z)).sum())
         self.stats['bad'] += n_bad
