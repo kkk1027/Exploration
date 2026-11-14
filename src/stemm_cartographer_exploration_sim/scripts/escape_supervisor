@@ -158,7 +158,19 @@ class EscapeSupervisor(Node):
         self.return_reverse_max_m = abs(float(p('return_reverse_max_m', 0.15).value))
         self.return_reverse_rear_clear = abs(float(p('return_reverse_rear_clear', 0.30).value))
         self.return_reverse_min_points = int(p('return_reverse_min_points', 20).value)
-        self.return_reverse_max_count = int(p('return_reverse_max_count', 8).value)
+        # 2026-11-14（P）：倒车的**唯一正当理由**是"前面堵住了、退一点才能出来"。
+        # 旧实现没有这条门，只要"车端静默 ≥1 s 且 2 s 没动"就开退 ——
+        # 而返航段的等待/重试状态天然满足这个条件。
+        # 实测 p14vG_fp1：7 次倒车全部发生在 front=0.79~1.54 m（前方完全
+        # 开阔）时，累计倒退 0.89 m，把车从 (2.05,2.55) 推到 (2.62,3.33)，
+        # **离原点越来越远**。分段返航的距离读数因此一路递增：
+        #   3.12 → 3.21 → 3.44 → 3.53 → 3.57 → 3.66 → 3.76 → 3.85
+        # 前方开阔时倒车对脱困毫无作用，只是把返航越推越远。
+        self.return_reverse_front_max = abs(
+            float(p('return_reverse_front_max', 0.55).value))
+        # 每次返航尝试的倒车总距离预算（不只是次数）。旧值 8 次 × 0.15 m
+        # = 1.2 m，足以把"分段返航"完全抵消。2 次 = 0.3 m，够脱困、不会离题。
+        self.return_reverse_max_count = int(p('return_reverse_max_count', 2).value)
         # ---- 探索期的"受控小步倒车"（用户 2026-10-26 批准：短距离小速度倒车）----
         # 背景：车端 manager 在 front_blocked 时持续发零速，MPPI 的 vx_min=-0.08 到不了轮子
         # （revr1 实测：有 -0.05 指令但车一动不动，整轮只倒出 0.33 m）。脱困监督是独立通道，
@@ -772,6 +784,16 @@ class EscapeSupervisor(Node):
                 return False
             if now - self.last_motion < (1.0 if explore else 2.0):
                 return False
+            # 2026-11-14（P）：返航段倒车必须先确认"前面真的堵住了"。
+            # 否则它会在纯等待状态下反复盲退，把车推离原点（见参数注释）。
+            if not explore:
+                fclear = self.range_cone(0.0, half_deg=20.0, stride=2)
+                if fclear > self.return_reverse_front_max:
+                    self.log(type='reverse_assist_refused', why='front_open',
+                             front_clear=round(fclear, 3),
+                             front_max=round(self.return_reverse_front_max, 3),
+                             nav=self.nav_state)
+                    return False
         clear, npts = self.rear_clearance()
         need_pts = self.return_reverse_min_points
         need_clear = self.explore_reverse_rear_clear_m if explore else self.return_reverse_rear_clear
