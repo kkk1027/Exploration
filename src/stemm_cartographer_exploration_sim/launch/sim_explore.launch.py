@@ -141,6 +141,8 @@ def generate_launch_description():
                                 # body_width + 2×side_margin 派生，不再由本文件持有。
                                 'robot_profile': LaunchConfiguration('robot_profile'),
                                 'use_robot_profile': LaunchConfiguration('use_robot_profile'),
+                                # S5-B2：增量共享 BFS（false = 回退到每次从零 BFS）
+                                'bfs_share': LaunchConfiguration('bfs_share'),
                                 # 通行保证式判据（与场景无关；A/B 用）
                                 # 0 = 由 profile 派生；>0 = 显式覆盖（A/B/回退）
                                 'pass_width_m': LaunchConfiguration('pass_width'),
@@ -447,6 +449,10 @@ def generate_launch_description():
         DeclareLaunchArgument('use_robot_profile', default_value='true',
             description='S5-M1：是否由 profile 派生通行阈值。false=回退路径，'
                         '此时必须显式给 pass_width:=… narrow_floor:=…'),
+        DeclareLaunchArgument('bfs_share', default_value='true',
+            description='S5-B2：同一拍内多个候选共用一个增量 BFS 树'
+                        '（路径与逐次独立 BFS 逐位等价，见 harness/test_bfs_equivalence.py）。'
+                        'false=回退到改造前的每次从零 BFS'),
         DeclareLaunchArgument('pass_width', default_value='0.0',
             description='通行保证带宽下限。0=由 profile 派生（车宽 0.47 + 2×0.215 '
                         '= 0.90，与场景无关）；>0=显式覆盖，用于 A/B 与回退'),

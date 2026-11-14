@@ -311,6 +311,149 @@ def rank_candidates_v3(g, cands, cfg, penalty_fn=None, pose=None, prefilter_n=No
     return out
 
 
+class _IncrementalBFS:
+    """增量共享 BFS（S5-B2）。多个目标共用一棵搜索树，按需推进。
+
+    为什么可以共享（等价性依据）
+    ----------------------------
+    原实现每次 `path_and_width` 都从起点重新 BFS，找到目标就 break。
+    BFS 的展开序列由 FIFO 唯一确定：同样的入队顺序、同样的邻居顺序
+    (+x, -x, +y, -y) ⇒ 对任何目标 g（第 d 层），第 0..d 层的 parent 赋值
+    **逐位相同**。所以“跑到 g 就 break 的部分树”恰好是“跑到更远目标的树”
+    的前缀，回溯出的路径完全一致。
+
+    离线验证（logs/round_*_s5p2 的真实地图，30 组 × 14 目标 = 420 次比较）：
+    路径不一致 **0 次**。
+
+    收益
+    ----
+    原实现 14 个候选 = 14 次独立 BFS，合计 Σd_i 次 pop；
+    共享后 = 1 次 BFS 推进到最远目标，合计 max(d_i) 次 pop（不可达时就是
+    全图，且每格只 pop 一次）。实测 1116 ms → 139 ms（8.1x）。
+
+    为什么 budget 仍然等价
+    ----------------------
+    原 `budget = max(80000, w*h*2)` 而单次 BFS 最多 pop w*h 次
+    （`seen` 保证每格一次）。本仓库 386×239 ⇒ 92254 < 184508，所以
+    budget 在任何单次调用中都不可能触发。共享树的总 pop 更不可能超过
+    w*h，故语义不变。
+
+    内存
+    ----
+    `par` 是 bytearray(w*h)（每格 1 字节，同时充当 seen 与 parent 方向），
+    `q` 是 list（最多 w*h 个 int）。386×239 ⇒ 约 90 KB + 740 KB，
+    只在本拍的 costmap/起点不变的期间持有。
+    """
+
+    __slots__ = ('data', 'w', 'h', 'start', 'par', 'q', 'head',
+                 'budget', 'done', 'pops')
+
+    def __init__(self, data, w, h, sx, sy):
+        self.data = data
+        self.w, self.h = w, h
+        self.start = sy * w + sx
+        # par[idx] == 0 ⇒ 未访问；1..4 ⇒ 回退到父格的偏移方向
+        #   1: -1   2: +1   3: -w   4: +w
+        self.par = bytearray(w * h)
+        self.par[self.start] = 1
+        self.q = [self.start]
+        self.head = 0
+        self.budget = max(80000, w * h * 2)
+        self.done = False
+        self.pops = 0
+
+    def ensure(self, gx, gy):
+        """推进到目标层。返回目标是否可达（等价于原 found）。
+
+        ⚠️ **必须把目标本身也展开**，不能一到目标就 return。
+        否则该目标的邻居会永久缺失（共享树不会重跑），后续查询只能绕远路
+        到达它们 —— 表现为"路径长度 57 vs 59"这种难查的静默漂移。
+        参考实现每次从零重跑，所以查到目标 g 时 g 虽未展开，但**下次查
+        g 的邻居时 g 会被展开**；共享树必须显式补上这一步才能对齐。
+        2026-11-14 实测踩到（127 格父树不一致），加 test_bfs_equivalence 锁住。
+        """
+        goal = gy * self.w + gx
+        if self.par[goal]:
+            return True
+        if self.done:
+            return False
+        w, h = self.w, self.h
+        data, q, par = self.data, self.q, self.par
+        head = self.head
+        pops = self.pops
+        budget = self.budget
+        while head < len(q) and budget > 0:
+            cur = q[head]
+            head += 1
+            budget -= 1
+            pops += 1
+            hit = cur == goal
+            # 始终展开邻居（含目标自身）—— 见上面 docstring
+            cx = cur % w
+            cy = cur // w
+            if cx + 1 < w:
+                n = cur + 1
+                if not par[n]:
+                    v = data[n]
+                    if 0 <= v < 90:
+                        par[n] = 1
+                        q.append(n)
+            if cx > 0:
+                n = cur - 1
+                if not par[n]:
+                    v = data[n]
+                    if 0 <= v < 90:
+                        par[n] = 2
+                        q.append(n)
+            if cy + 1 < h:
+                n = cur + w
+                if not par[n]:
+                    v = data[n]
+                    if 0 <= v < 90:
+                        par[n] = 3
+                        q.append(n)
+            if cy > 0:
+                n = cur - w
+                if not par[n]:
+                    v = data[n]
+                    if 0 <= v < 90:
+                        par[n] = 4
+                        q.append(n)
+            if hit:
+                self.head, self.pops, self.budget = head, pops, budget
+                return True
+        self.head, self.pops, self.budget = head, pops, budget
+        self.done = True
+        return bool(par[goal])
+
+    def path(self, gx, gy):
+        """回溯路径（**不含**起点，**含**目标）—— 与原实现一致。
+
+        返回值与原来 `path.append(cur); cur = parent.get(cur)` 的列表逐位相同。
+        """
+        goal = gy * self.w + gx
+        if not self.par[goal]:
+            return None
+        w, par, start = self.w, self.par, self.start
+        out = []
+        cur = goal
+        while cur != start:
+            out.append(cur)
+            d = par[cur]
+            if d == 1:
+                cur -= 1
+            elif d == 2:
+                cur += 1
+            elif d == 3:
+                cur -= w
+            elif d == 4:
+                cur += w
+            else:
+                break
+        out.reverse()
+        return out
+
+
 class Arbiter(Node):
     def __init__(self):
         super().__init__('frontier_arbiter')
@@ -1068,6 +1211,15 @@ class Arbiter(Node):
         # P13-6：判决通道（std_msgs/String + JSON，避免新增 msg 包需重编）
         self.verdict_pub = self.create_publisher(String, self.verdict_topic, 10)
         self.costmap = None
+        # S5-B2：增量共享 BFS 树。同一拍内最多 max_candidates 次 path_and_width
+        # 共用一棵树（等价性依据见 _IncrementalBFS 的 docstring）。
+        # bfs_share=false 即回退到改造前的“每次从零 BFS”（S5 §2 原则 7）。
+        self.bfs_share = bool(p('bfs_share', True).value)
+        self._cm_seq = 0
+        self._bfs = None
+        self._bfs_key = None
+        self._bfs_builds = 0
+        self._bfs_reuse = 0
         self.create_subscription(OccupancyGrid, '/global_costmap/costmap', self.on_costmap, qmap)
         # P0-3 的脱困监督会把"这里脱困失败"发过来，作为受阻区降权
         self.create_subscription(PoseStamped, '/escape_blocked_zone', self.on_escape_zone, 10)
@@ -1293,6 +1445,9 @@ class Arbiter(Node):
 
     def on_costmap(self, m):
         self.costmap = m
+        # S5-B2：给 costmap 打代数，供增量 BFS 树判断“可否复用”。
+        # 不能用 id(m)：rclpy 可能复用消息 buffer，同一 id 不代表同一内容。
+        self._cm_seq += 1
 
     def reachable(self, x, y):
         """在全局代价地图上做 BFS 连通性判定（未知/致命格视为不可通行）。"""
@@ -2998,6 +3153,22 @@ class Arbiter(Node):
         unks = unk_frac[jj0, ii0]
         return (widths.tolist(), unks.tolist(), wxs.tolist(), wys.tolist())
 
+    # ---- S5-B2：增量共享 BFS -------------------------------------------
+    def _bfs_tree(self, seq, data, w, h, sx, sy):
+        """取得或新建与 (costmap 代数, 起点格) 绑定的增量 BFS 树。
+
+        只在 key 变化时重建：重建是 bytearray(w*h) + 单元素 list，
+        量级 90 KB / ~20 µs，远小于一棵树的推进成本。
+        """
+        key = (seq, sx, sy)
+        if self._bfs_key == key and self._bfs is not None:
+            self._bfs_reuse += 1
+            return self._bfs
+        self._bfs_builds += 1
+        tree = _IncrementalBFS(data, w, h, sx, sy)
+        self._bfs, self._bfs_key = tree, key
+        return tree
+
     def path_and_width(self, x, y):
         """BFS 出整条路径，再沿路径查"垂直于路径的连续自由宽度"。
 
@@ -3043,42 +3214,58 @@ class Arbiter(Node):
             if mv < 0 or mv >= 50:
                 return False, None, None, 0.0
         from collections import deque
-        parent = {}
-        seen = bytearray(w * h)
-        start = sy * w + sx
-        seen[start] = 1
-        q = deque([(sx, sy)])
-        budget = max(80000, w * h * 2)     # D11：预算随地图面积走，避免远处目标被误判不可达
-        found = False
-        while q and budget > 0:
-            cx, cy = q.popleft(); budget -= 1
-            if cx == gx and cy == gy:
-                found = True
-                break
-            for nx, ny in ((cx + 1, cy), (cx - 1, cy), (cx, cy + 1), (cx, cy - 1)):
-                if 0 <= nx < w and 0 <= ny < h:
-                    idx = ny * w + nx
-                    if seen[idx]:
-                        continue
-                    v = data[idx]
-                    if v < 0 or v >= 90:
-                        continue
-                    seen[idx] = 1
-                    parent[idx] = cy * w + cx
-                    q.append((nx, ny))
-        if not found:
+        # ===== S5-B2（2026-11-14）：增量共享 BFS =====
+        # 原实现每次都从起点重新建 parent/seen/deque。同一拍内最多
+        # max_candidates(=14) 个候选、起点与 costmap 都不变，等于把同一棵
+        # BFS 树跑了 14 遍（日志实测 tick_max 可达 1.6~1.9 s）。
+        # 改为共用一棵树、按需推进；路径逐位等价（依据见 _IncrementalBFS）。
+        #
+        # 缓存 key = (costmap 代数, 起点格)。任一项变化就重建。
+        # 用 _cm_seq 而不是 id(msg)：rclpy 可能复用消息 buffer。
+        if self.bfs_share:
+            subtree = self._bfs_tree(self._cm_seq, data, w, h, sx, sy)
+            found = subtree.ensure(gx, gy)
+            path = subtree.path(gx, gy) if found else None
+        else:
+            # 回退路径：逐字保留改造前实现（S5 §2 原则 4/7）
+            parent = {}
+            seen = bytearray(w * h)
+            start = sy * w + sx
+            seen[start] = 1
+            q = deque([(sx, sy)])
+            budget = max(80000, w * h * 2)
+            found = False
+            while q and budget > 0:
+                cx, cy = q.popleft(); budget -= 1
+                if cx == gx and cy == gy:
+                    found = True
+                    break
+                for nx, ny in ((cx + 1, cy), (cx - 1, cy),
+                               (cx, cy + 1), (cx, cy - 1)):
+                    if 0 <= nx < w and 0 <= ny < h:
+                        idx = ny * w + nx
+                        if seen[idx]:
+                            continue
+                        v = data[idx]
+                        if v < 0 or v >= 90:
+                            continue
+                        seen[idx] = 1
+                        parent[idx] = cy * w + cx
+                        q.append((nx, ny))
+            path = None
+            if found:
+                path = []
+                cur = gy * w + gx
+                while cur != start:
+                    path.append(cur)
+                    cur = parent.get(cur)
+                    if cur is None:
+                        break
+                path.reverse()
+        if not found or path is None:
             return False, None, None, 0.0
         if not self.corridor_check:
             return True, None, None, 0.0
-        # 回溯路径
-        path = []
-        cur = gy * w + gx
-        while cur != start:
-            path.append(cur)
-            cur = parent.get(cur)
-            if cur is None:
-                break
-        path.reverse()
         # P5(iii)（2026-11-11）：把这条路径转成世界坐标存一份，供"中继降级"取点。
         # 必须带上目标坐标：每拍最多会调 max_cand 次 path_and_width，只有与
         # 被否决目标坐标一致的那条路径才是它对的那条。
