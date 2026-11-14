@@ -1,0 +1,86 @@
+{
+ "pass_width_m": 0.9,
+ "narrow_floor_m": 0.58,
+ "corridor_width_m": 1.05,
+ "arb_pass_width_m": 0.9,
+ "arb_narrow_floor_m": 0.58,
+ "arb_corridor_hard_m": 0.92,
+ "arb_max_candidates": 12,
+ "arb_max_candidates_doc": 5,
+ "arb_pass_width_uses": 8,
+ "arb_pass_width_lines": 19,
+ "arb_narrow_floor_uses": 7,
+ "arb_narrow_floor_lines": 11,
+ "nav2_footprint_yaml": [
+  [
+   -0.18,
+   -0.2
+  ],
+  [
+   -0.18,
+   0.2
+  ],
+  [
+   0.32,
+   0.2
+  ],
+  [
+   0.32,
+   -0.2
+  ]
+ ],
+ "nav2_footprint_yaml_derived": {
+  "body_width_m": 0.4,
+  "body_length_m": 0.5,
+  "inscribed_radius_m": 0.18,
+  "circumscribed_radius_m": 0.377359
+ },
+ "nav2_footprint_runtime": [
+  [
+   -0.18,
+   -0.235
+  ],
+  [
+   -0.18,
+   0.235
+  ],
+  [
+   0.32,
+   0.235
+  ],
+  [
+   0.32,
+   -0.235
+  ]
+ ],
+ "nav2_footprint_runtime_derived": {
+  "body_width_m": 0.47,
+  "body_length_m": 0.5,
+  "inscribed_radius_m": 0.18,
+  "circumscribed_radius_m": 0.39702
+ },
+ "body_geometry": {
+  "collision_probe": {
+   "body_x_min": -0.16,
+   "body_x_max": 0.29,
+   "body_half_width": 0.23,
+   "laser_x": 0.24,
+   "circumscribed_radius_m": 0.370135,
+   "front_offset_m": 0.05
+  },
+  "escape_supervisor": {
+   "body_x_min": -0.16,
+   "body_x_max": 0.29,
+   "body_half_width": 0.23,
+   "laser_x": 0.24,
+   "circumscribed_radius_m": 0.370135,
+   "front_offset_m": 0.05
+  }
+ },
+ "goal_clearance_m": 0.38,
+ "return_home_goal_clearance_m": 0.35,
+ "side_open_m__yaml": 0.25,
+ "side_tight_m__yaml": 0.09,
+ "side_open_m__runtime": 0.215,
+ "side_tight_m__runtime": 0.055
+}

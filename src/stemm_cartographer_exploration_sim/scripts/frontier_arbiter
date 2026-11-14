@@ -403,6 +403,24 @@ class Arbiter(Node):
         self._tl_fh = None
         self._tl_n = 0
         self._tl_last_wall = 0.0
+        # 2026-11-14（S5 Step 0）：每拍耗时探针。
+        # 为什么要单独记：S5 §5-B 要求"tick P95 ≤ 基线 P95 × 1.5 且 ≤ 80 ms"，
+        # 但改造前**根本没有任何 tick 耗时数据**（见 S5 §4 Step 0 的说明）：
+        #   probe.jsonl   只有 reverse_msgs 一个耗时类字段
+        #   timeline.jsonl 无耗时字段
+        #   candidate_probe.jsonl 无耗时字段
+        # ⇒ 如不先补，Step 2 的"单拍 P95 增量 ≤ 10 ms"永远无法判定。
+        # 实现口径：tick() 开头计时，finally 里记账；耗时写入**下一拍**的
+        # timeline 行（因为 write_timeline 在本拍开头就写了），滞后 ≤ 1 s。
+        self._tick_ms_prev = None       # 上一拍耗时（毫秒）
+        self._tick_paw_prev = 0         # 上一拍 path_and_width 调用次数
+        self._tick_paw_calls = 0        # 本拍累计（path_and_width 里自增）
+        self._tick_ms_max = 0.0
+        self._tick_ms_sum = 0.0
+        self._tick_ms_n = 0
+        self._tick_ms_over_budget = 0   # 超过 tick_budget_ms 的拍数
+        # S5 §5-B 的硬上限 80 ms；超限只计数告警，**不降级**（降级会改决策）
+        self.tick_budget_ms = float(p('tick_budget_ms', 80.0).value)
         self.probe_escape_r = float(p('probe_escape_clear_m', 0.60).value)
         self.probe_narrow_r = float(p('probe_narrow_clear_m', 0.35).value)
         self.probe_radius = float(p('probe_radius_m', 2.0).value)
@@ -2631,6 +2649,19 @@ class Arbiter(Node):
                 'verdict_feasible': self.stats.get('verdict_feasible', 0),
                 # P13-4a 脱困目标放宽轮
                 'escape_relaxed': self.stats.get('escape_relaxed', 0),
+                # 2026-11-14（S5 Step 0）性能观测：上一拍的耗时口径 / 本拍耗时。
+                # tick_ms_prev 是**上一拍**的实测值（滞后 ≤ 1 s，见 __init__ 注释）：
+                #   tick() 开头就调 write_timeline()，本拍还不能知道自己的耗时。
+                # tick_paw_prev 是上一拍 path_and_width（BFS 路径 + 测宽）调用次数，
+                # 上限 = max_candidates（默认 12） + 若干重试，是性能热点的直接画像。
+                'tick_ms_prev': (None if self._tick_ms_prev is None
+                                 else round(self._tick_ms_prev, 2)),
+                'tick_paw_prev': int(self._tick_paw_prev),
+                'tick_ms_max': round(self._tick_ms_max, 2),
+                'tick_ms_avg': (round(self._tick_ms_sum / self._tick_ms_n, 2)
+                                if self._tick_ms_n else None),
+                'tick_n': int(self._tick_ms_n),
+                'tick_over_budget': int(self._tick_ms_over_budget),
             }
             if extra:
                 row.update(extra)
@@ -2866,6 +2897,8 @@ class Arbiter(Node):
         判据：路径上任一点，垂直方向上连续自由格（<90 且已知）的总长必须 >= corridor_width，
         以免把目标派到"必须挤过窄缝"的地方 —— 这正是反复楔死的来源。
         """
+        # S5 Step 0：纯计数，供 tick 耗时归因（BFS 路径+测宽是本节点的性能热点）
+        self._tick_paw_calls = getattr(self, '_tick_paw_calls', 0) + 1
         # P13-3：每次调用先清零，防止上一次路径的软门罚分泄漏到本次
         self._last_path_soft = 0.0
         cm = self.costmap
@@ -4107,17 +4140,40 @@ class Arbiter(Node):
         return pen
 
     def tick(self):
+        # 2026-11-14（S5 Step 0）：纯观测的耗时探针。
+        # 只测时间与计数，**不改变任何分支/阈值/时序**（决策逻辑逐位不变）。
+        _t0 = time.perf_counter()
+        self._tick_paw_calls = 0
         self._tick_uniq = set()
         self._last_risk_info = None      # P13-1：避免上一拍的风险分项误贴到本拍
         self.write_timeline()
         # P13-6：判决表周期重发（丢包/merge 后启动自愈），放在早退之前，
         # 保证"候选全空 => _tick_v1 提前 return"时判决仍能持续下发。
         self.publish_verdict_snapshot()
-        if self.scoring == 'v3':
-            return self._tick_v3()
-        if self.scoring == 'v2':
-            return self._tick_v2()
-        return self._tick_v1()
+        try:
+            if self.scoring == 'v3':
+                return self._tick_v3()
+            if self.scoring == 'v2':
+                return self._tick_v2()
+            return self._tick_v1()
+        finally:
+            # 早退路径也从这里出去，所以 finally 是唯一不漏记的位置。
+            _ms = (time.perf_counter() - _t0) * 1000.0
+            self._tick_ms_prev = _ms
+            self._tick_paw_prev = self._tick_paw_calls
+            self._tick_ms_sum += _ms
+            self._tick_ms_n += 1
+            if _ms > self._tick_ms_max:
+                self._tick_ms_max = _ms
+            if _ms > self.tick_budget_ms:
+                self._tick_ms_over_budget += 1
+                # 节流告警：≥10 次才吭声，避免刷屏拖慢本就吃紧的这一拍
+                if self._tick_ms_over_budget % 10 == 1:
+                    self.get_logger().warn(
+                        'tick budget exceeded: %.1f ms > %.1f ms '
+                        '(%d times so far, path_and_width calls=%d)'
+                        % (_ms, self.tick_budget_ms,
+                           self._tick_ms_over_budget, self._tick_paw_calls))
 
     def _tick_v1(self):
         now = time.monotonic()
