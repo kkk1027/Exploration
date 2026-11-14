@@ -1065,6 +1065,9 @@ class Arbiter(Node):
         self._map_seq = 0
         self._clear_key = None
         self._clear_field = None
+        # 2026-11-14（S5-B1）：未知占比窗口均值的缓存 (key, ndarray)。
+        # 只随 /map 变化，见 _path_lateral_widths 里的说明。
+        self._unk_frac_cache = None
         self.create_subscription(OccupancyGrid, self.vision_grid_topic,
                                  self.on_vision_grid, qmap)
         self.create_timer(1.0, self.tick)
@@ -2662,6 +2665,11 @@ class Arbiter(Node):
                                 if self._tick_ms_n else None),
                 'tick_n': int(self._tick_ms_n),
                 'tick_over_budget': int(self._tick_ms_over_budget),
+                # 2026-11-14（S5-B1）：未知占比滤波缓存的命中/重建次数。
+                # 判据：builds 应 ≈ (轮数 × /map 更新次数)，而 reuse ≈ 调用总数，
+                # 若 builds 与 paw 调用数同量级，说明缓存没生效。
+                'unk_frac_builds': int(self.stats.get('unk_frac_builds', 0)),
+                'unk_frac_reuse': int(self.stats.get('unk_frac_reuse', 0)),
             }
             if extra:
                 row.update(extra)
@@ -2882,9 +2890,30 @@ class Arbiter(Node):
         lower = 2.0 * dist_m[jj0, ii0]            # 旧实现值 = 理论下界
         widths = np.maximum(d_plus + d_minus, lower)
         # 未知占比：整张未知图做一次窗口均值再查表（与 clearance_at 同口径，0.5 m 窗）
+        #
+        # ★ 2026-11-14（S5 Step 0 性能优化 B1）：这里原来**每次调用**都对整张
+        # 未知掩码重做一次 uniform_filter。实测代价：单次 path_and_width
+        # P50 = 30 ms，而一拍最多调 189 次 ⇒ tick P95 达 467~827 ms，
+        # 195 拍里 120 拍超过 S5 §5-B 的 80 ms 上限。
+        # 关键事实：`unknown` 只随 /map 变化，而 /map 已由 `clearance_field()`
+        # 按 (_map_seq, _vg_seq, ...) 缓存。所以这个滤波结果在同一张图上是
+        # **纯常量**，重复算毫无意义。
+        # 缓存键与 clearance_field 保持一致；不改变任何数值结果（同一个
+        # 输入数组、同一组参数、同一个 mode），因此决策逐位不变。
         r = max(1, int(0.5 / fres))
-        unk_frac = ndimage.uniform_filter(
-            unknown.astype(np.float64), size=2 * r + 1, mode='nearest')
+        ckey = (id(unknown), fres, r, fw, fh,
+                int(getattr(self, '_map_seq', -1)),
+                int(getattr(self, '_vg_seq', -1)))
+        cached = getattr(self, '_unk_frac_cache', None)
+        if cached is not None and cached[0] == ckey:
+            unk_frac = cached[1]
+        else:
+            unk_frac = ndimage.uniform_filter(
+                unknown.astype(np.float64), size=2 * r + 1, mode='nearest')
+            self._unk_frac_cache = (ckey, unk_frac)
+            self.stats['unk_frac_builds'] = (
+                self.stats.get('unk_frac_builds', 0) + 1)
+        self.stats['unk_frac_reuse'] = self.stats.get('unk_frac_reuse', 0) + 1
         unks = unk_frac[jj0, ii0]
         return (widths.tolist(), unks.tolist(), wxs.tolist(), wys.tolist())
 
