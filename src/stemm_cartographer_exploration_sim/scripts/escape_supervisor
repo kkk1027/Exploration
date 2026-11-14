@@ -117,19 +117,15 @@ class EscapeSupervisor(Node):
         # 故安全半径取 0.34（escB 实测 0.26 时旋转过程中轮子蹭到了东西）
         self.rotate_min_range = float(p('rotate_min_range', 0.34).value)
         # 2026-11-14（I）：上面的 0.34 只算了轮子，**没算车尾两角**。
-        # URDF 实读（wheeltec_two_wheel_model/_t_classic.urdf.xacro）：
-        #   车体 x∈[-0.160, 0.290]、|y|≤0.230（base_footprint 系）
-        #   雷达 x = axle_to_front - 0.05 = 0.240
-        # 换算到"以雷达为原点"：x∈[-0.400, 0.050]、|y|≤0.230
+        # 车体几何已由 body_x_min/-0.16、body_x_max/0.29、body_half_width/0.23、
+        # laser_x/0.24 给出（base_footprint 系，且雷达挂在 x=0.24）。
+        # 换算到"以雷达为原点"：x∈[-0.400, +0.050]、|y|≤0.230
         # → 后角 distance = hypot(0.400, 0.230) = 0.461 m，比 0.34 大 12 cm。
         # 实测 p14vE_sw1：车在 (7.03,-9.74) 旋转 77°（offset=-1.35），旋转前
         # 左 0.356 m、右 0.583 m，range_cone 只看"目标朝向±45°"，判为安全；
         # 但车尾在雷达后方 0.40 m，扫掠时扫进 HouseWallB，接触 365 帧 / 365.6 s。
         # 对策：旋转前用矩形包络逐方位角核对"该方向的测距 >= 车体在该方向的
-        # 边界距离 + margin"。
-        self.body_x_min = float(p('body_x_min', -0.400).value)
-        self.body_x_max = float(p('body_x_max', 0.050).value)
-        self.body_y_half = float(p('body_y_half', 0.230).value)
+        # 边界距离 + margin"。几何值一律由上面 4 个既有参数派生，不新增事实源。
         self.body_sweep_margin = float(p('body_sweep_margin', 0.030).value)
         self.body_sweep_check = str(
             p('body_sweep_check', True).value).lower() in ('true', '1', 'yes', 'on')
@@ -138,9 +134,9 @@ class EscapeSupervisor(Node):
         self.rotate_sector_deg = float(p('rotate_sector_deg', 45.0).value)
         self.rotate_pick_margin = float(p('rotate_pick_margin', 0.04).value)
         # 前进停止口径：advance_stop_range 是"雷达测距"，雷达在前沿后方
-        # body_front_offset，所以真实前沿净空 = advance_stop_range - body_front_offset。
-        # 2026-11-14：改口径后默认值取 0.35，等价于旧的 0.30 但语义明确。
-        self.body_front_offset = float(p('body_front_offset', 0.05).value)
+        # body_front_offset = body_x_max - laser_x = 0.05 m，
+        # 所以真实前沿净空 = advance_stop_range - body_front_offset。
+        # 2026-11-14：默认 0.30→0.35，使真实前沿净空回到 0.30 m 且口径明确。
         self.advance_stop_range = float(p('advance_stop_range', 0.35).value)
         self.min_dir_range = float(p('min_dir_range', 0.50).value)
         self.clearance_gain = float(p('clearance_gain', 0.20).value)
@@ -434,16 +430,24 @@ class EscapeSupervisor(Node):
         return best
 
     def body_radius_at(self, phi):
-        """矩形车体在极角 phi（相对车头，弧度）方向的边界距离（以雷达为原点）。"""
+        """矩形车体在极角 phi（相对车头，弧度）方向的边界距离（以雷达为原点）。
+
+        几何全部由既有参数派生（base_footprint 系 → 雷达系 = 减去 laser_x）：
+            x 范围 [body_x_min - laser_x, body_x_max - laser_x]
+            |y| <= body_half_width
+        """
+        x_lo = self.x_min - self.laser_x          # -0.400
+        x_hi = self.x_max - self.laser_x          # +0.050
+        y_half = self.y_half                      # 0.230
         dx = math.cos(phi)
         dy = math.sin(phi)
         cand = []
         if dx > 1e-9:
-            cand.append(self.body_x_max / dx)
+            cand.append(x_hi / dx)
         elif dx < -1e-9:
-            cand.append(self.body_x_min / dx)
+            cand.append(x_lo / dx)
         if abs(dy) > 1e-9:
-            cand.append(self.body_y_half / abs(dy))
+            cand.append(y_half / abs(dy))
         if not cand:
             return 0.0
         return min(cand)
