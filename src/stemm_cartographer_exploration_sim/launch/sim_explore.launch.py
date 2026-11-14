@@ -143,6 +143,11 @@ def generate_launch_description():
                                 'use_robot_profile': LaunchConfiguration('use_robot_profile'),
                                 # S5-B2：增量共享 BFS（false = 回退到每次从零 BFS）
                                 'bfs_share': LaunchConfiguration('bfs_share'),
+                                # ===== S5 M2：扫掠可通行性（影子模式）=====
+                                # 默认关闭：只算、只落盘，不参与决策（S5 §2 原则 5）
+                                'sweep_shadow': LaunchConfiguration('sweep_shadow'),
+                                'sweep_top_n': LaunchConfiguration('sweep_top_n'),
+                                'sweep_budget_ms': LaunchConfiguration('sweep_budget_ms'),
                                 # 通行保证式判据（与场景无关；A/B 用）
                                 # 0 = 由 profile 派生；>0 = 显式覆盖（A/B/回退）
                                 'pass_width_m': LaunchConfiguration('pass_width'),
@@ -453,6 +458,14 @@ def generate_launch_description():
             description='S5-B2：同一拍内多个候选共用一个增量 BFS 树'
                         '（路径与逐次独立 BFS 逐位等价，见 harness/test_bfs_equivalence.py）。'
                         'false=回退到改造前的每次从零 BFS'),
+        DeclareLaunchArgument('sweep_shadow', default_value='false',
+            description='S5-M2：扫掠可通行性影子模式。true 时把 swept_clear / '
+                        'swept_min_clearance 写进 candidate_probe.jsonl，'
+                        '**不参与决策**（要攒数据再看是否切换口径）'),
+        DeclareLaunchArgument('sweep_top_n', default_value='8',
+            description='S5-M2：每拍只对前 N 名候选做扫掠'),
+        DeclareLaunchArgument('sweep_budget_ms', default_value='8.0',
+            description='S5-M2：单次扫掠硬预算（ms）。超限会计数并截断，不静默变慢'),
         DeclareLaunchArgument('pass_width', default_value='0.0',
             description='通行保证带宽下限。0=由 profile 派生（车宽 0.47 + 2×0.215 '
                         '= 0.90，与场景无关）；>0=显式覆盖，用于 A/B 与回退'),
@@ -495,7 +508,7 @@ def generate_launch_description():
             description='P9-CORR：把"穿窄处"的窄点记成不可通行走廊并拒绝穿过（本轮内存）'),
         DeclareLaunchArgument('corridor_radius', default_value='0.35',
             description='P9-CORR：走廊半径（m）'),
-        DeclareLaunchArgument('corridor_ttl', default_value='30.0',
+        DeclareLaunchArgument('corridor_ttl', default_value='8.0',
             description='P9-CORR：走廊基础记忆时长（s，命中递增）'),
         DeclareLaunchArgument('corridor_ttl_max', default_value='180.0',
             description='P9-CORR：走廊记忆上限（s）'),
@@ -805,7 +818,7 @@ def generate_launch_description():
             description='车体包络矩形半宽（车体帧，含轮外沿 ±0.23）'),
         DeclareLaunchArgument('vision_delay', default_value='25.0',
             description='视觉源/看门狗/nudge 相对"栈启动"再延迟多少秒（起栈降载）'),
-        DeclareLaunchArgument('rviz_delay', default_value='30.0',
+        DeclareLaunchArgument('rviz_delay', default_value='8.0',
             description='rviz 相对"栈启动"再延迟多少秒（渲染会抢 CPU）'),
         DeclareLaunchArgument('nudge', default_value='true',
             description='是否启用 nav2 生命周期 nudge（推卡在 inactive 的节点起来）'),

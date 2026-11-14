@@ -584,6 +584,45 @@ class Arbiter(Node):
         self._tick_ms_over_budget = 0   # 超过 tick_budget_ms 的拍数
         # S5 §5-B 的硬上限 80 ms；超限只计数告警，**不降级**（降级会改决策）
         self.tick_budget_ms = float(p('tick_budget_ms', 80.0).value)
+        # ===== S5 M2（2026-11-14）：扫掠可通行性 —— 影子模式 =====
+        # 只把结果写进 candidate_probe.jsonl，**不参与任何决策**（S5 §2 原则 5）。
+        # 要修的缺陷：走廊宽度按轴向法向测量，斜向通道被高估 1/cos45 ≈ 1.41 倍
+        # （docs/P1_候选生成缺陷清单.md D2）。根因是 BFS 父格差只给 4 连通方向。
+        # 扫掠直接回答"车放不放得下"，不测宽度，所以不存在这个偏差。
+        self.sweep_shadow = bool(p('sweep_shadow', False).value)
+        self.sweep_top_n = int(p('sweep_top_n', 8).value)
+        # ★ 预算是**每拍共享**的，不是每次调用（2026-11-14 实测修正）
+        #   原实现把 sweep_budget_ms 直接传给 sweep_path()，是"单次调用"上限；
+        #   而 probe_candidate() 每拍会被调用最多 max_candidates(=14) 次，
+        #   于是每拍最坏开销 = 14 × 30 ms = 420 ms，远超 S5 §4 Step 2 的
+        #   "单拍 P95 增量 ≤ 10 ms"。6 轮 A/B 实测 P95 增量 +31 ms（仅计活跃拍）。
+        #   改为按拍重置的共享预算池，超了就本拍不再扫掠（只是少攒数据）。
+        # ★ 默认值 8.0 而不是 30.0：验收是"单拍 P95 增量 ≤ 10 ms"，
+        #   若每拍预算本身就大于 10 ms，这个验收在原理上就不可能达成。
+        #   留 2 ms 给导入/配对的杂项开销。
+        self.sweep_budget_ms = float(p('sweep_budget_ms', 8.0).value)
+        self._sweep_calls = 0
+        self._sweep_exceeded = 0
+        self._sweep_disagree = 0        # 扫掠与轴向口径结论不一致的次数
+        self._sweep_skipped = 0         # 因未配对/超 top_n/超预算而没扫的次数
+        self._sweep_skipped_topn = 0    # 其中因超 top_n 或超预算
+        self._sweep_tick_id = -1        # 预算池所属的拍号
+        self._sweep_tick_n = 0          # 本拍已扫次数
+        self._sweep_ms_left = self.sweep_budget_ms
+        # ★ 影子**自身耗时**的直接测量（2026-11-14）
+        #   为什么不能用"影子开/关两轮 P95 相减"来算增量：
+        #   两次运行的轨迹不同 => 每拍 path_and_width 调用数不同
+        #   （实测 sw 组 9.7~13.0，off 组 8.0~8.8，差 20~60%），
+        #   于是 P95 差异大部分来自"这一轮本就干了更多活"，不是影子。
+        #   直接测自己花了多少毫秒，才是无混淆的口径。
+        self._sweep_ms_sum = 0.0        # 全程累计
+        self._sweep_ms_tick = 0.0       # 本拍累计（拍尾重置）
+        self._sweep_ms_tick_prev = 0.0  # 上一拍（写 timeline 用）
+        if self.sweep_shadow:
+            self.get_logger().info(
+                'S5-M2 影子扫掠已启用：每拍最多 %d 次 / 每拍共 %.1f ms '
+                '（只落盘，不参与决策）' % (self.sweep_top_n,
+                                          self.sweep_budget_ms))
         self.probe_escape_r = float(p('probe_escape_clear_m', 0.60).value)
         self.probe_narrow_r = float(p('probe_narrow_clear_m', 0.35).value)
         self.probe_radius = float(p('probe_radius_m', 2.0).value)
@@ -2906,6 +2945,20 @@ class Arbiter(Node):
                 # 若 builds 与 paw 调用数同量级，说明缓存没生效。
                 'unk_frac_builds': int(self.stats.get('unk_frac_builds', 0)),
                 'unk_frac_reuse': int(self.stats.get('unk_frac_reuse', 0)),
+                # 2026-11-14（S5-M2）：影子扫掠的配额命中情况。
+                # 判据：sweep_calls / tick_n 必须 <= sweep_top_n，
+                # 否则说明"每拍配额"没生效（第一版就是这个 bug：top_n 只
+                # 出现在日志里，压根没参与限制）。
+                'sweep_calls': int(self._sweep_calls),
+                'sweep_tick_n_prev': int(self._sweep_tick_n),
+                'sweep_skipped': int(self._sweep_skipped),
+                'sweep_skipped_quota': int(self._sweep_skipped_topn),
+                'sweep_exceeded': int(self._sweep_exceeded),
+                'sweep_disagree': int(self._sweep_disagree),
+                'sweep_ms_left_prev': round(self._sweep_ms_left, 2),
+                # ★ 影子自身耗时（上一拍），无跨轮混淆的 P95 增量口径
+                'sweep_ms_prev': round(self._sweep_ms_tick_prev, 2),
+                'sweep_ms_sum': round(self._sweep_ms_sum, 1),
             }
             if extra:
                 row.update(extra)
@@ -2954,6 +3007,30 @@ class Arbiter(Node):
             if _k not in row:
                 row[_k] = _v
         row.update(cx or {})
+        # S5-M2：影子扫掠字段。放在最后，且用**独立前缀** （swept_*），
+        # 避免与上面 row.update(cx) 的键冲突（cx 里已有 'unknown' 等键，
+        # 历史上就因为无脑 update 出现过字段被静默覆盖）。
+        #
+        # ★ 必须核对"路径属于哪个目标"：`_last_path_w` 在同一拍里会被
+        #   max_cand 次 path_and_width 反复覆盖，只有 `_last_path_goal` 与
+        #   本候选坐标一致时那条路径才是它的（原代码 3083 行的注释就警告过）。
+        #   2026-11-14 实测踩到：不核对时拿别的候选的路径去扫掠，
+        #   84.5% 的记录报 obstacle_inside，而 min_w 高达 1.8 m —— 一眼假。
+        try:
+            pg = getattr(self, '_last_path_goal', None)
+            same = (pg is not None
+                    and abs(pg[0] - round(gx, 2)) < 1e-9
+                    and abs(pg[1] - round(gy, 2)) < 1e-9)
+            sw = (self._sweep_shadow_probe(self._last_path_w, min_w)
+                  if same else None)
+            if sw is None and self.sweep_shadow:
+                if not same:
+                    self._sweep_skipped += 1
+        except Exception as exc:                       # noqa: BLE001
+            sw = None
+            self.get_logger().warn('S5-M2 影子扫掠异常（忽略）：%r' % (exc,))
+        if sw:
+            row.update(sw)
         try:
             os.makedirs(os.path.dirname(self.probe_log) or '.', exist_ok=True)
             with open(self.probe_log, 'a', encoding='utf-8') as f:
@@ -3154,6 +3231,159 @@ class Arbiter(Node):
         return (widths.tolist(), unks.tolist(), wxs.tolist(), wys.tolist())
 
     # ---- S5-B2：增量共享 BFS -------------------------------------------
+    def _sweep_shadow_probe(self, path_w, min_w):
+        """S5 M2 影子扫掠：只算、只落盘，**绝不改动任何决策量**。
+
+        为什么必须影子先行（S5 §2 原则 5）
+        ---------------------------------
+        扫掠与现有的"轴向法向测宽"是**两套口径**。直接切换会让"同一批候选
+        的通过集合"整体变化，而当前 A/B 基线（11 轮 0 接触）正是建立在那套
+        口径上的。影子模式先攒够"两套口径在哪些点上分歧、分歧点是否真的
+        过不去"的数据，再决定是否切换。
+
+        返回 dict（合并进 candidate_probe 行）或 None。
+        """
+        if not self.sweep_shadow or not path_w:
+            return None
+        field = self.clearance_field()
+        if field is None:
+            return None
+        try:
+            here = os.path.dirname(os.path.realpath(__file__))
+            if here not in sys.path:
+                sys.path.insert(0, here)
+            from sweep_kernel import sweep_path
+        except Exception as exc:                       # noqa: BLE001
+            self.get_logger().warn(
+                'S5-M2：加载 sweep_kernel 失败（影子扫掠关闭）：%r' % (exc,))
+            self.sweep_shadow = False
+            return None
+        fp = getattr(self.profile, 'footprint', None)
+        if not fp:
+            return None
+        # ---- 每拍配额：top_n 次 + 共享毫秒池 -------------------------
+        # tick_id 用 _tick_ms_n（finally 里每拍 +1），是最可靠的拍边界。
+        tid = self._tick_ms_n
+        if tid != self._sweep_tick_id:
+            self._sweep_tick_id = tid
+            self._sweep_tick_n = 0
+            self._sweep_ms_left = self.sweep_budget_ms
+        if self._sweep_tick_n >= self.sweep_top_n or self._sweep_ms_left <= 0.0:
+            self._sweep_skipped += 1
+            self._sweep_skipped_topn += 1
+            return None
+        self._sweep_tick_n += 1
+        self._sweep_calls += 1
+        _t0 = time.perf_counter()
+        res = sweep_path(fp, path_w, field,
+                         budget_ms=self._sweep_ms_left,
+                         unknown_blocks=bool(self.width_unknown_block))
+        # 无论是否超预算，实际花掉的时间都要扣（否则低估开销）
+        _used = (time.perf_counter() - _t0) * 1000.0
+        self._sweep_ms_left -= _used
+        self._sweep_ms_tick += _used
+        self._sweep_ms_sum += _used
+        if res.exceeded:
+            self._sweep_exceeded += 1
+        out = res.as_dict()
+        # ★ 超预算时扫掠**没有做完**，结论是"未知"，不是"能过"。
+        #   内核为了安全默认 clear=True（不否决），但落盘必须如实记为 None，
+        #   否则后面拿这批数据算"扫掠误杀率"会把没算完的当成通过。
+        if res.exceeded:
+            out['swept_clear'] = None
+            return out
+        # 碰撞归因：扫掠的障碍集合是 `/map` 占据 ∪ 视觉障碍，而 `min_w` 用的
+        # 是 `/map` 单独一张。若扫掠报碰撞而 min_w 很宽，必须能分辨是哪一类
+        # 障碍 —— 否则"扫掠误杀率"这个指标会被视觉层的陈旧累积污染。
+        if not res.clear:
+            out['swept_cause'] = self._sweep_cause(res)
+        # 与轴向口径的分歧标记：轴向说"能过"（min_w >= narrow_floor）但扫掠说
+        # "过不去" —— 这正是 D2 缺陷会误派的那一类
+        if min_w is not None:
+            axis_ok = min_w >= self.narrow_floor
+            if axis_ok != bool(res.clear):
+                self._sweep_disagree += 1
+                out['swept_disagree'] = True
+        return out
+
+    def _sweep_cause(self, res):
+        """判断扫掠碰撞是哪一类障碍造成的（只用于落盘归因）。
+
+        ★ 2026-11-14 修正：第一版把 `yaw` 写死成 0.0，于是归因时把 footprint
+          摆成**轴对齐**去查图，而实际失败位姿是旋转过的 —— 查到的格子可能
+          压根不在车体上。实测后果：`p14vP` 三批 33/33 条分歧全部报
+          `vision_or_other`，而对应 `min_w` 高达 0.90~1.15 m，明显不可信。
+          现在从 `res.at_pose` 取真实 (x, y, yaw)。
+
+        分开统计三类来源，因为三类的处置方式完全不同：
+          `map_obstacle`    —— /map 真障碍：得改路径
+          `vision_obstacle` —— 只在视觉栅格里有：可能是视觉陈旧/累积
+          `unknown_blocked` —— 未知格被当障碍（只有 width_unknown_block 才可能）
+          `other`           —— 都不命中：说明距离场与原始图不一致，需查代码
+        """
+        try:
+            ap = getattr(res, 'at_pose', None)
+            if not ap:
+                return 'unknown'
+            x, y, yaw = ap[0], ap[1], ap[2]
+            m = self.map
+            if m is None:
+                return 'unknown'
+            info = m.info
+            res_m = info.resolution
+            if res_m <= 0:
+                return 'unknown'
+            ox, oy = info.origin.position.x, info.origin.position.y
+            fp = getattr(self.profile, 'footprint', None) or []
+            here = os.path.dirname(os.path.realpath(__file__))
+            if here not in sys.path:
+                sys.path.insert(0, here)
+            from sweep_kernel import transform_footprint, point_in_polygon
+            verts = transform_footprint(fp, x, y, yaw)
+            xs = [v[0] for v in verts]
+            ys = [v[1] for v in verts]
+            i0 = max(0, int((min(xs) - ox) / res_m))
+            i1 = min(info.width - 1, int((max(xs) - ox) / res_m))
+            j0 = max(0, int((min(ys) - oy) / res_m))
+            j1 = min(info.height - 1, int((max(ys) - oy) / res_m))
+            # 只统计**真的落在 footprint 多边形内**的格，不取外接矩形，
+            # 否则车斜着时会把大片车体外的格子算进来（和第一版的错同源）。
+            poly = verts
+            nmap = nvis = nunk = 0
+            vg = self.vision_grid
+            has_vis = bool(self.use_vision_obstacles and vg is not None)
+            if has_vis:
+                vr = vg.info.resolution
+                vox = vg.info.origin.position.x
+                voy = vg.info.origin.position.y
+                vw, vh = vg.info.width, vg.info.height
+            for j in range(j0, j1 + 1):
+                yc = oy + (j + 0.5) * res_m
+                for i in range(i0, i1 + 1):
+                    xc = ox + (i + 0.5) * res_m
+                    if not point_in_polygon(xc, yc, poly):
+                        continue
+                    v = m.data[j * info.width + i]
+                    if v is not None and v >= 50:
+                        nmap += 1
+                    elif v is not None and v < 0:
+                        nunk += 1
+                    if has_vis and vr > 0:
+                        ci = int((xc - vox) / vr)
+                        cj = int((yc - voy) / vr)
+                        if 0 <= ci < vw and 0 <= cj < vh:
+                            if vg.data[cj * vw + ci] == 100:
+                                nvis += 1
+            if nmap:
+                return 'map_obstacle'
+            if nvis:
+                return 'vision_obstacle'
+            if nunk and self.width_unknown_block:
+                return 'unknown_blocked'
+            return 'other'
+        except Exception:                              # noqa: BLE001
+            return 'unknown'
+
     def _bfs_tree(self, seq, data, w, h, sx, sy):
         """取得或新建与 (costmap 代数, 起点格) 绑定的增量 BFS 树。
 
@@ -4460,6 +4690,9 @@ class Arbiter(Node):
             self._tick_paw_prev = self._tick_paw_calls
             self._tick_ms_sum += _ms
             self._tick_ms_n += 1
+            # 影子耗时的拍边界快照：在这里做才能和 tick_ms_prev 同拍对齐
+            self._sweep_ms_tick_prev = self._sweep_ms_tick
+            self._sweep_ms_tick = 0.0
             if _ms > self._tick_ms_max:
                 self._tick_ms_max = _ms
             if _ms > self.tick_budget_ms:

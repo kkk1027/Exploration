@@ -20,7 +20,8 @@ bad()  { echo "  ✗ $*"; FAIL=$((FAIL+1)); }
 # ---------------------------------------------------------------------------
 HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 echo "[smoke] 0) 静态断言"
-for t in "$HARNESS_DIR"/test_robot_profile.py "$HARNESS_DIR"/test_no_magic_numbers.py; do
+for t in "$HARNESS_DIR"/test_robot_profile.py "$HARNESS_DIR"/test_no_magic_numbers.py \
+         "$HARNESS_DIR"/test_sweep_kernel.py "$HARNESS_DIR"/test_bfs_equivalence.py; do
   [ -f "$t" ] || continue
   N=$(basename "$t" .py)
   if OUT=$(timeout 20 python3 "$t" 2>&1); then

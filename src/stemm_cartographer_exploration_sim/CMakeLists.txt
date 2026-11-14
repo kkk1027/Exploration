@@ -13,4 +13,6 @@ install(DIRECTORY scripts/sim_shims DESTINATION lib/${PROJECT_NAME})
 # S5 M1：车体画像包 + 构型 profile（几何唯一事实源）
 install(DIRECTORY scripts/robot_model DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY config/robot_profiles DESTINATION share/${PROJECT_NAME}/config)
+# S5 M2：扫掠可通行性内核（构型无关）
+install(DIRECTORY scripts/sweep_kernel DESTINATION lib/${PROJECT_NAME})
 ament_package()
