@@ -134,6 +134,14 @@ T_START=$(date +%s)
 # 默认世界（放在走廊阈值判定之前：走廊默认值要按世界取）
 DEFAULT_WORLD=$(ros2 pkg prefix wheeltec_two_wheel_model 2>/dev/null)/share/wheeltec_two_wheel_model/world/aws_small_house.world
 POSES=("1.00 5.10 -1.5708" "0.80 5.10 -1.5708" "1.20 5.10 -1.5708" "1.00 5.05 -1.5708" "0.90 5.15 -1.5708")
+# 2026-11-14（N）：出生点改由**可达性/净空**决定（原来固定原点附近，净空只有
+# 0.40~0.45 m，而车体外接半径 0.370 m / Nav2 footprint 0.397 m ⇒ 只剩 3~8 cm
+# 余量，出生后第一个目标一动就贴墙）。实测 p14vF 三轮的物理接触全部落在
+# sim≈23、出生点附近（p14vF_sw1 接触位姿净空 0.350 m < 0.370 m）。
+# 下面这组用 harness/pick_spawn.py 从真实 map.pgm 距离变换选出，净空
+# ≥ 1.0 m（≈ 车体外接的 2.7 倍），仍在本轮出生位姿同一房间内。
+# 重新生成：python3 harness/pick_spawn.py --min-clear 1.0 --emit-shell
+POSES=("1.4220 4.2987 -1.5708" "1.7220 4.3987 -1.5708" "1.3220 3.9987 -1.5708" "1.2220 3.5987 -1.5708" "1.1720 4.4987 -1.5708")
 # 浮点参数统一格式化成 "x.y"：launch_ros 会把 "10" 解析成 int，
 # 而节点 declare 的默认值是 float → 类型不匹配会让节点当场崩（vx1 就这么废了 7 轮）。
 as_float() { awk -v v="$1" 'BEGIN{printf "%.4f", v}'; }
@@ -267,6 +275,15 @@ trap 'python3 /home/kbf/stemm_exploration_sim_ws/harness/vision_nav_params.py --
     # Fallback），这里只负责把 Grid2D 注册进 planner_plugins。
     if [ "${PLANNER_FALLBACK:-1}" = "1" ]; then
       NAV_ARGS+=(--planner-fallback)
+    fi
+    # 2026-11-14（M）：碰撞判据改用车体真实足迹 + 足迹边界余量。
+    # 旧配置 consider_footprint=false ⇒ 只用"车心到障碍"的距离，
+    # 车侧壳沿（半宽 0.230）可以贴到墙上而不被记为碰撞。
+    # 实测 p14vF_sw1 接触瞬间车侧正好在半宽上（left=0.231）。
+    # COLLISION_MARGIN：足迹边界到障碍的最小余量，0.05 足够抵定位误差，
+    # 又不至于在 0.7~0.8 m 的室内通道里寸步难行。
+    if [ "${CONSIDER_FOOTPRINT:-1}" = "1" ]; then
+      NAV_ARGS+=(--consider-footprint true --collision-margin "${COLLISION_MARGIN:-0.05}")
     fi
     python3 harness/nav_params.py --apply "${NAV_ARGS[@]}" 2>&1 | tee -a "$OUT/harness.log"
     NAV_RC=${PIPESTATUS[0]}

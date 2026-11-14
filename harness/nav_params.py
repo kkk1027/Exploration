@@ -63,6 +63,7 @@ def patch_text(txt, a):
     """从原厂文本生成目标文本；返回 (新文本, 生效项列表)。"""
     out = []
     done = []
+    done_fallback_block = False
     # footprint_padding：按**精确的三行锚点**插（costmap 节点自己的 ros__parameters），
     # 不能用"哪个 ros__parameters 先出现"——同一段里还有 local_costmap_client /
     # local_costmap_rclcpp_node 这些内部节点的块，会一起被塞进去（实测一次塞了 4 份）。
@@ -135,6 +136,66 @@ def patch_text(txt, a):
             out.append(f'{ind}reverse_penalty: {a.reverse_penalty}    # sim_patch：倒车更贵\n')
             done.append('reverse_penalty')
             continue
+        # 2026-11-14（M）：把 MPPI 的碰撞判据从"车心点"改成"真实足迹多边形"。
+        # 根因：ObstaclesCritic 默认 consider_footprint: false ⇒ 碰撞代价只用
+        # 车心到障碍的距离；而车体半宽 0.23、外接半径 0.370（Nav2 footprint
+        # 0.397）。实测 p14vF_sw1：接触瞬间 left_min_range=0.231（雷达系），
+        # 换算到车体系正好在半宽 0.230 上 —— 即车侧壳沿贴住墙，而车心到障碍
+        # 仍有 0.332 m，点式判据不会报碰撞。
+        # 打开后必须同时把 collision_margin_distance 从 0.42 降下来：0.42 是
+        # 按"车心 − 内切 0.18"算的旧口径，直接套到足迹边界会要求壳沿外再留
+        # 0.42 m，车在室内基本动不了。
+        if st.startswith('consider_footprint:') and a.consider_footprint is not None:
+            out.append(f'{ind}consider_footprint: {a.consider_footprint}    '
+                       '# sim_patch(M)：碰撞用真实足迹多边形\n')
+            done.append('consider_footprint')
+            continue
+        if st.startswith('collision_margin_distance:') and a.collision_margin is not None:
+            out.append(f'{ind}collision_margin_distance: {a.collision_margin}    '
+                       '# sim_patch(M)：足迹边界到障碍的最小余量\n')
+            done.append('collision_margin')
+            continue
+        # 2026-11-13：规划器回退（GridBased -> Grid2D）。
+        # 为什么必须在这里注入而不是直接写进 src 的 yaml：每轮 round.sh 都会
+        # 调用本脚本，从 pristine 快照**整份重写** TARGET，任何直接改 TARGET 的
+        # 内容都会被抹掉（实测 p14vC_2d1：BT 里写了 Grid2D，但 planner 只加载了
+        # GridBased，日志报 "Grid2D is not a valid planner"）。
+        # 触发原因：返航长距离时 SmacPlannerHybrid + DUBIN（含 72 个角度分箱）
+        # 反复 exceeded maximum iterations，而 SmacPlanner2D 没有角度维度，
+        # 状态空间小 72 倍，用作兜底出条路。
+        if st.startswith('planner_plugins:') and a.planner_fallback:
+            out.append(f'{ind}planner_plugins: ["GridBased", "Grid2D"]    '
+                       f'# sim_patch：规划器回退\n')
+            done.append('planner_fallback')
+            continue
+        # 锚点唯一：全文件只有 GridBased.smoother 这一处 `tolerance: 1.0e-10`
+        # （缩进 8 空格）—— 已用 grep 核实。Grid2D 块与 GridBased 同级（缩进 4）。
+        if (st.strip() == 'tolerance: 1.0e-10' and len(ind) == 8
+                and a.planner_fallback and not done_fallback_block):
+            # GridBased 块的末尾锚点 -> 追加 Grid2D 块（与 GridBased 同级缩进）
+            out.append(ln)
+            out.append(
+                '\n'
+                '    # sim_patch：2D 规划器回退（无角度维度，状态空间小 72 倍）\n'
+                '    Grid2D:\n'
+                '      plugin: "nav2_smac_planner/SmacPlanner2D"\n'
+                '      tolerance: 0.25\n'
+                '      downsample_costmap: false\n'
+                '      downsampling_factor: 1\n'
+                '      allow_unknown: true\n'
+                '      max_iterations: 1000000\n'
+                '      max_on_approach_iterations: 500\n'
+                '      max_planning_time: 5.0\n'
+                '      cost_travel_multiplier: 2.0\n'
+                '      use_final_approach_orientation: false\n'
+                '      smoother:\n'
+                '        max_iterations: 1000\n'
+                '        w_smooth: 0.3\n'
+                '        w_data: 0.2\n'
+                '        tolerance: 1.0e-10\n')
+            done_fallback_block = True
+            done.append('Grid2D_block')
+            continue
         # S4（2026-11-11）：切换 BT —— 挂上 GoalUpdater 后，后置否决可以「原地改向」
         # 而不是「取消重派」。必须配合已重编的 nav2_behavior_tree（跨目标污染已修）。
         if st.startswith('default_nav_to_pose_bt_xml:') and a.bt_xml is not None:
@@ -165,11 +226,22 @@ def main():
     ap.add_argument('--motion', default=None,
                     choices=['DUBIN', 'REEDS_SHEPP', 'GRID_A_STAR', 'STATE_LATTICE'])
     ap.add_argument('--reverse-penalty', type=float, default=None)
+    ap.add_argument('--consider-footprint', choices=['true', 'false'], default=None,
+                    help='MPPI ObstaclesCritic 是否用真实足迹多边形判碰撞'
+                         '（默认 false = 只用车心点，车侧壳沿可以贴墙）')
+    ap.add_argument('--collision-margin', type=float, default=None,
+                    help='足迹（或车心，视 consider_footprint）到障碍的最小余量，米')
     ap.add_argument('--bt-xml', default=None,
                     help='S4：覆盖 default_nav_to_pose_bt_xml（用于挂 GoalUpdater）')
     ap.add_argument('--cost-penalty', type=float, default=None,
                     help='Smac 的 cost_penalty：代价地图的代价按"每米 × 系数"累加，'
                          '系数调大就会宁可绕远也不穿高代价的窄缝')
+    ap.add_argument('--planner-fallback', action='store_true',
+                    help='注册第二个规划器 Grid2D（SmacPlanner2D，无角度维度）'
+                         '并把 planner_plugins 改为 ["GridBased", "Grid2D"]，'
+                         '配合 BT 的 ComputePathToPose 回退链使用。'
+                         '返航长距离时 Hybrid+DUBIN 反复 exceeded maximum '
+                         'iterations 的兜底方案。')
     a = ap.parse_args()
     if not os.path.exists(TARGET):
         print(f'✗ 找不到 {TARGET}')
