@@ -94,6 +94,49 @@ def structural_checks():
     check('D 净空环半径使用 ceil', m is not None and 'ceil' in (m.group(1) or ''),
           repr(m.group(1))[:60] if m else 'not found')
 
+    # --- I4：转角门必须用全向最小测距（左右扇区盖不到车轮） ---
+    # 车轮在雷达系约 128°~151°，而 side_left/right 只到 ±103°。
+    check('I4a 记录了 min_range_all',
+          'self.min_range_all = min(all_ranges)' in text)
+    m = re.search(r'if return_home_active and all_clear is not None'
+                  r' and all_clear < sweep', text)
+    check('I4b 返航转角门用 all_clear（全向）', m is not None)
+
+    # --- J：supervisor 的返航倒车必须先确认前方被堵 ---
+    sup_path = os.environ.get(
+        'STEMM_SUPERVISOR_PY',
+        '/home/kbf/stemm_exploration_sim_ws/src/'
+        'stemm_cartographer_exploration_sim/scripts/escape_supervisor')
+    if os.path.isfile(sup_path):
+        stext = open(sup_path, encoding='utf-8').read()
+        check('J1 存在 return_reverse_front_max 参数',
+              'return_reverse_front_max' in stext)
+        m = re.search(r'if fclear > self\.return_reverse_front_max:'
+                      r'\s*\n\s*self\.log\(type=\'reverse_assist_refused\'',
+                      stext)
+        check('J2 前方开阔时拒绝倒车（front_open 分支）', m is not None)
+        m = re.search(r"p\('return_reverse_max_count', (\d+)\)", stext)
+        cnt = int(m.group(1)) if m else -1
+        check('J3 返航倒车次数预算 <= 2', 0 <= cnt <= 2, 'got %s' % cnt)
+    else:
+        check('J supervisor 可读', False, sup_path)
+
+    # --- K：标点可站性必须走 global costmap（与规划器同口径） ---
+    cm_path = os.environ.get(
+        'STEMM_CARTOGRAPHER_MANAGER_PY',
+        '/home/kbf/wheeltec_ros2/src/stemm_cartographer_exploration/'
+        'stemm_cartographer_exploration/cartographer_manager.py')
+    if os.path.isfile(cm_path):
+        ctext = open(cm_path, encoding='utf-8').read()
+        check('K1 存在 _goal_stand_ok（costmap 权威判据）',
+              'def _goal_stand_ok' in ctext)
+        check('K2 返航目标启用 authoritative=True',
+              'authoritative=is_home_goal' in ctext)
+        check('K3 存在失败标点黑名单',
+              '_home_target_recently_failed' in ctext)
+    else:
+        check('K cartographer_manager 可读', False, cm_path)
+
 
 # --------------------------------------------------------------------------
 # I3：几何到位判据行为
