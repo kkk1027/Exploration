@@ -149,8 +149,15 @@ VETO_CD_F=$(as_float "${VETO_CD:-10.0}")
 # 通行判据**不随场景切换**（2026-10-25 用户要求）：阈值只由车体尺寸+误差决定。
 # ★ S5 M1（2026-11-14）：pass_width / narrow_floor 已改为由 RobotProfile 派生
 #   （config/robot_profiles/<name>.yaml 的 body_width + 2×side_margin）。
-#   这里默认传 0 = “不指定，用 profile 派生值”；要 A/B 或回退时显式给
-#   PASS_W=0.90 NARROW_FLOOR=0.58（数值与派生值相同，行为等价）。
+#   默认 PASS_W/NARROW_FLOOR 留空 = 传 0 = “不指定，用 profile 派生值”。
+#
+# ⚠️ 回退路径（USE_ROBOT_PROFILE=0）**必须**给显式阈值，否则仲裁器按设计
+#    拒绝启动（S5 M1：阈值不许猜）。这里自动填历史字面量，避免"以为在跑
+#    A/B、其实每轮仲裁器一起就崩"——2026-11-14 实测踩过一次。
+if [ "${USE_ROBOT_PROFILE:-1}" = "0" ]; then
+  PASS_W=${PASS_W:-0.90}
+  NARROW_FLOOR=${NARROW_FLOOR:-0.58}
+fi
 # CORRIDOR_W 仅作为旧接口保留（默认等于 pass_width），不再按 World 分支取值。
 CORRIDOR_W_F=$(as_float "${CORRIDOR_W:-0.90}")
 GATE_OCC_F=$(as_float "${GATE_OCC:-0.30}")
