@@ -528,7 +528,17 @@ class SessionDriver(Node):
         # （重发在目标结束后会命中 _dispatch_pending_home_goal 分支）
         # 只在"车真的没在动"时才走这条兜底：车还在往回家方向开的时候去 cancel-all，
         # 等于把 manager 已经发起的返航目标掐掉，纯属自伤（实测占全部返航失败的 100%）。
+        #
+        # 2026-11-14（R）：manager 现在会**故意**等活跃导航目标到点再返航
+        # （return_home_wait_active_goal，state=mapping_done_waiting_active_goal）。
+        # 那段等待里车可能原地转向（4 s 位移 < 0.06 m ⇒ _moved_recently()=False），
+        # 兜底就会被误触发，第 3 次还会 cancel-all 把正在执行的目标砍掉 ——
+        # 正好破坏刚加的"不中断"语义。所以 manager 明确在等的时候一律不插嘴。
+        _waiting_active_goal = (
+            str((getattr(self, 'nav', None) or {}).get('navigation_state') or '')
+            == 'mapping_done_waiting_active_goal')
         if (self.return_home_ok is None and self.t_done_called is not None
+                and not _waiting_active_goal
                 and not self._moved_recently()
                 and now - self.t_done_called > 3.0
                 and now - self.t_done_called > 3.0 * (getattr(self, '_retries', 0) + 1)

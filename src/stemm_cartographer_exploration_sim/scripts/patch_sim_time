@@ -50,17 +50,51 @@ if [ "$DISABLE_RETREAT" = "1" ]; then
     # 阶段2：探索期只允许"受控小步倒车"——包络 0.15 m / 0.05 m/s，每次会话最多 2 步，
     # 触发条件仍是车端自己的 R1b（前向 blocked_retreat_after_sec 秒内持续 <0.45 m，
     # 且后方条带在 /map 上先复核过 rear_margin=0.25 m）。返航倒车仍保持关闭。
-    retry_until 12 "$MGR" exploration_retreat_enabled true
-    retry_until 6  "$MGR" exploration_retreat_max_distance_m 0.15
+    #
+    # ★★ 2026-11-14 竞态修复（p14vQ_far3 实测暴露）★★
+    #
+    # 原来这里的第一句是 `exploration_retreat_enabled true`，然后才设上限。
+    # 但 cartographer_manager 里这个参数**默认就是 True**（第 393 行），
+    # 且默认 `max_distance_m=0.35` / `speed_mps=0.10` / `max_sec=3.0`。
+    # 于是从 manager 启动那一刻起，它就以 0.35 m / 0.10 m/s 的包络在跑；
+    # 本脚本是异步的（retry_until 带重试 + timeout），"开闸"到"设限"之间存在窗口。
+    #
+    # 实测后果（p14vQ_far3）：sim=14 就因 front=0.2285 触发 R1b，
+    # 日志 `R1 bounded reverse: moved back 0.30 m at 0.10 m/s (limit 0.35 m / 3.0 s)`
+    # —— 用的是旧默认值，退 0.302 m（设计上限只有 0.15 m），退完 min_d=0.004，
+    # 单窗 0.302 m > 探索期包络 0.20 m ⇒ reverse_authorized=False ⇒ no_reverse FAIL。
+    # 同一轮 patch 的第 418 行才写下 max_distance_m=0.15，但为时已晚。
+    #
+    # 正确顺序（2026-11-14 第二轮修正）：**先落"真正起作用的上限"，再动开关**。
+    #
+    # 第一版修法写的是「先关闸 → 设上限 → 再开闸」，但 p14vR_far1 实测
+    # `exploration_retreat_enabled=false ✗（超时）`（far2 同一句却 ✓）
+    # —— 说明 manager 的参数服务在 patch 跑的时候还没准备好，
+    # 12 s 的重试窗口不够，这一步**时灵时不灵**，不能拿它兜底。
+    #
+    # 关键事实：`exploration_retreat_enabled` 默认已是 True，
+    # 所以"关闸"本来就只是个形式；真正保护车的是 `max_distance_m`。
+    # R1b 的实际位移上界 = min(max_distance_m, speed_mps*max_sec)，
+    # 只要 0.15 m 这条先落地，后面 speed/max_sec 还是默认值也翻不出 0.15 m。
+    #
+    # 因此改成：把 max_distance_m 提到**第一条**并给足 30 s 等待（等节点起来），
+    # 其余上限紧随其后（节点一旦应答，后续都是亚秒级），最后才写 enabled。
+    # 残余窗口 = 节点开始应答 → 第一条 set 落地 ≈ 一次 RPC，不再是 12 s 级。
+    retry_until 30 "$MGR" exploration_retreat_max_distance_m 0.15
     retry_until 6  "$MGR" exploration_retreat_speed_mps 0.05
+    retry_until 6  "$MGR" exploration_retreat_max_sec 2.0
+    retry_until 6  "$MGR" exploration_retreat_rear_margin_m 0.25
     retry_until 6  "$MGR" blocked_retreat_max_per_session "$RETREAT_MAX"
     retry_until 6  "$MGR" blocked_retreat_min_interval_sec "$RETREAT_IVL"
-    retry_until 6  "$MGR" exploration_retreat_rear_margin_m 0.25
-    retry_until 6  "$MGR" exploration_retreat_max_sec 2.0
+    retry_until 6  "$MGR" exploration_retreat_enabled true
     echo "[patch] 阶段2 探索期受控小步倒车已启用（<=0.15m @0.05m/s，雷达复核后方；每局 $RETREAT_MAX 步 / 间隔 ${RETREAT_IVL}s）"
   else
-    retry_until 12 "$MGR" exploration_retreat_enabled false
-    retry_until 4  "$MGR" blocked_retreat_max_per_session 0
+    # 同理（2026-11-14）：`exploration_retreat_enabled` 默认就是 True，
+    # "关闸"这一步会因 manager 参数服务未就绪而超时（p14vR_far1 实测 ✗（超时））。
+    # 真正让 R1b 停手的是**会话预算**：把 max_per_session 先压到 0，
+    # 即使 enabled 一直是 True 也不会再退。所以预算优先，enabled 只作可读性。
+    retry_until 30 "$MGR" blocked_retreat_max_per_session 0
+    retry_until 6  "$MGR" exploration_retreat_enabled false
     echo "[patch] 探索期倒车保持绝对禁止（EXPLORE_BACKSTEP=0）"
   fi
   retry_until 4  "$MGR" return_home_retreat_enabled false
