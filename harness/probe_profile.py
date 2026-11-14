@@ -58,6 +58,35 @@ if not os.path.exists(PATCH):
 SNAP = os.path.join(BASE, 'runs', 'profile_baseline.json')
 MGR = os.path.join(WS, 'src', 'stemm_nav2_manager', 'stemm_nav2_manager',
                    'manager.py')
+SCRIPTS = os.path.join(SIM_PKG, 'scripts')
+
+
+def load_robot_profile(name='wheeltec_diff'):
+    """加载 RobotProfile（S5 M1）。失败返回 None，不报错。
+
+    本脚本要能区分"改造前（无 profile）"与"改造后（profile 驱动）"两种情况，
+    所以这里只尝试、不抛异常。
+    """
+    try:
+        if SCRIPTS not in sys.path:
+            sys.path.insert(0, SCRIPTS)
+        from robot_model import load_profile
+        return load_profile(name)
+    except Exception:                                  # noqa: BLE001
+        return None
+
+
+def derived_or(explicit, prof, attr):
+    """S5 M1 的取值口径：显式值 > 0 时用它，否则用 profile 派生值。
+
+    与 `frontier_arbiter._metric_threshold` 必须一致（同一套语义）：
+    launch/节点参数里的 0.0 是"未指定，用 profile"的哨兵值，不是真的 0 米。
+    """
+    if explicit is not None and explicit > 0.0:
+        return explicit
+    if prof is not None:
+        return round(float(getattr(prof, attr)), 9)
+    return explicit
 
 
 def read(p):
@@ -148,12 +177,30 @@ def collect():
 
     out = {}
 
+    # ---- 0) S5 M1：先加载 profile，后面所有米制阈值都按"显式 > profile"解析 ----
+    prof = load_robot_profile()
+    out['robot_profile__loaded'] = bool(prof is not None)
+    if prof is not None:
+        out['robot_profile__name'] = prof.profile_name
+        d = prof.as_dict()
+        for k in ('body_width_m', 'inscribed_radius_m', 'circumscribed_radius_m',
+                  'collision_radius_m', 'min_origin_edge_m', 'turn_corridor_m'):
+            out['profile__' + k] = d[k]
+
     # ---- 1) 通行阈值（launch 声明值 + 节点代码默认值） ----
-    out['pass_width_m'] = launch_default(launch, 'pass_width')
-    out['narrow_floor_m'] = launch_default(launch, 'narrow_floor')
+    # 0.0 是"未指定，用 profile 派生值"的哨兵（S5 M1），不是真的 0 米。
+    # 这里同时保留原始值与生效值，避免"看起来只有 0"这种误读。
+    out['pass_width_m__raw'] = launch_default(launch, 'pass_width')
+    out['narrow_floor_m__raw'] = launch_default(launch, 'narrow_floor')
+    out['pass_width_m'] = derived_or(out['pass_width_m__raw'], prof,
+                                     'pass_width_m')
+    out['narrow_floor_m'] = derived_or(out['narrow_floor_m__raw'], prof,
+                                       'narrow_floor_m')
     out['corridor_width_m'] = launch_default(launch, 'corridor_width')
-    out['arb_pass_width_m'] = param_default(arb, 'pass_width_m')
-    out['arb_narrow_floor_m'] = param_default(arb, 'narrow_floor_m')
+    out['arb_pass_width_m'] = derived_or(
+        param_default(arb, 'pass_width_m'), prof, 'pass_width_m')
+    out['arb_narrow_floor_m'] = derived_or(
+        param_default(arb, 'narrow_floor_m'), prof, 'narrow_floor_m')
     out['arb_corridor_hard_m'] = param_default(arb, 'corridor_hard_m')
     out['arb_max_candidates'] = param_default(arb, 'max_candidates', int)
     out['arb_max_candidates_doc'] = None      # 文件头注释里写的默认值，见下
@@ -265,12 +312,18 @@ def main():
     print('  来源均为源码/配置实读，本脚本不硬编码任何常量')
     print()
     print('-- 通行阈值（launch 声明） --')
-    show('pass_width_m', 'pass_width_m')
-    show('narrow_floor_m', 'narrow_floor_m')
+    print('  %-38s raw=%s → 生效=%s'
+          % ('pass_width_m', cur.get('pass_width_m__raw'), cur.get('pass_width_m')))
+    print('  %-38s raw=%s → 生效=%s'
+          % ('narrow_floor_m', cur.get('narrow_floor_m__raw'),
+             cur.get('narrow_floor_m')))
+    print('  0.0 是"未指定→用 profile 派生"的哨兵值（S5 M1），不是真的 0 米')
     show('corridor_width_m', 'corridor_width_m')
     print('-- 通行阈值（frontier_arbiter 代码默认） --')
-    show('pass_width_m（节点参数）', 'arb_pass_width_m')
-    show('narrow_floor_m（节点参数）', 'arb_narrow_floor_m')
+    show('pass_width_m（节点参数，生效值）', 'arb_pass_width_m')
+    show('narrow_floor_m（节点参数，生效值）', 'arb_narrow_floor_m')
+    show('pass_width_m 参数原始默认', 'pass_width_m__raw')
+    show('narrow_floor_m 参数原始默认', 'narrow_floor_m__raw')
     show('corridor_hard_m', 'arb_corridor_hard_m')
     show('max_candidates（代码）', 'arb_max_candidates')
     show('max_candidates（文件头注释）', 'arb_max_candidates_doc')
@@ -301,6 +354,15 @@ def main():
     print('-- 车端净空口径 --')
     show('goal_clearance_m', 'goal_clearance_m')
     show('return_home_goal_clearance_m', 'return_home_goal_clearance_m')
+    if cur.get('robot_profile__loaded'):
+        print('-- S5 M1 RobotProfile 派生量（阈值唯一来源） --')
+        print('  profile = %s' % cur.get('robot_profile__name'))
+        for k in ('body_width_m', 'inscribed_radius_m', 'circumscribed_radius_m',
+                  'collision_radius_m', 'min_origin_edge_m', 'turn_corridor_m'):
+            show(k, 'profile__' + k)
+    else:
+        print('-- S5 M1 RobotProfile --')
+        print('  未加载（改造前状态，或 profile 目录缺失）')
     print('-- 反推的两侧余量（两种 body_width 都算一遍，逐一看等价性） --')
     show('side_open_m  (pass_width - 0.40)/2', 'side_open_m__yaml')
     show('side_tight_m (narrow_floor - 0.40)/2', 'side_tight_m__yaml')

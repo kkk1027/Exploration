@@ -28,6 +28,7 @@ from collections import deque
 import math
 import os
 import random
+import sys
 import time
 
 # P9-L1：「在等」而不是「过不去」的状态词（来自 50 轮历史 timeline 的实测分类）
@@ -346,24 +347,43 @@ class Arbiter(Node):
         # 另加两条硬约束（这次 P0 的核心：不再允许"勉强能过"）：
         #   * 窄段（带宽 < pass_width）累计长度 > narrow_len_max → 否决；
         #   * 连续未知段 > unknown_span_max → 否决（未知一律按障碍算，只允许短跨度例外）。
-        self.pass_width = float(p('pass_width_m', 0.90).value)
+        #
+        # ★ S5 M1（2026-11-14）：本文件**不再持有米制阈值**。
+        #   pass_width / narrow_floor 由 RobotProfile 的
+        #   `body_width + 2×side_margin` 算出（车体几何唯一事实源）。
+        #   参数默认改为 0.0 = "未指定，用 profile 派生值"；
+        #   显式给正数时以参数为准（A/B 与回退用）。
+        #   见 docs/S5_构型无关适配层_实施计划.md §3 M1 / §4 Step 1。
+        self.use_robot_profile = bool(p('use_robot_profile', True).value)
+        self.robot_profile_name = str(p('robot_profile', 'wheeltec_diff').value)
+        self.profile = self._load_robot_profile()
+        self.pass_width = self._metric_threshold(
+            'pass_width', float(p('pass_width_m', 0.0).value))
         self.narrow_len_max = float(p('narrow_len_max_m', 1.00).value)
         self.unknown_span_max = float(p('unknown_span_max_m', 0.35).value)
         # 兼容旧参数：corridor_width 不再按世界给默认值，统一取 pass_width
         self.corridor_width = float(p('corridor_width_m', self.pass_width).value)
-        # 硬下限：低于这个净宽一律不派（车宽 0.40 + 车端前向安全闸 0.45 的几何下界 0.90，
-        # 取 0.92 留 2 cm 余地）；未知占比过高说明"这块还没探"，同样不派。
+        # 硬下限：低于这个净宽一律不派（0.92 = pass_width 0.90 再留 2 cm 余地）。
+        # ⚠️ S5 M1 的派生量表**不包含** corridor_hard：它是"物理下限 + 余量"的
+        #    组合，换车时需要重推但不是 profile 的纯函数。Step 1 保持原值不动，
+        #    未覆盖项登记在 docs/S5_实施报告.md。
         self.corridor_hard = float(p('corridor_hard_m', 0.92).value)
         # ===== S3（2026-11-11）：把"物理过不去"与"能过但窄"彻底拆开 =====
         # 旧实现只有 corridor_hard 一道门，0.92 以下一律硬拒。实测后果：
         #   每轮 reject_narrow_hard 中位 2942 次，而 published 仅 30 次
         #   → 候选池被卡几乎归零 → 车 34% 的探索时间在原地等目标。
-        # 物理上真正过不去的是"车宽 0.40，两侧各连 0.09 m 余量都没有"，
-        # 即净宽 < 0.58 m。介于 0.58~0.92 的车**能过**，只是风险高 —— 这类
+        # 物理上真正过不去的是"车宽 + 两侧余量都不剩"，即净宽 < narrow_floor。
+        # 介于 narrow_floor~corridor_hard 的车**能过**，只是风险高 —— 这类
         # 不该被否决，应该被"大额罚分排到后面"，让排序决定而不是直接没得选。
         # 注意：宽度测量同时改了 S2（沿法向两侧求和），实测值只会比旧值大或相等，
         # 因此本项放开不会把"旧尺度下就过不去"的点放进来。
-        self.narrow_floor = float(p('narrow_floor_m', 0.58).value)
+        #
+        # 历史注释更正（S5 §3 M1 遗留矛盾 #1）：
+        #   原文写 "车宽 0.40 + 两侧各 0.09 余量" —— 数值 0.58 对，两个因子都错。
+        #   真值是 车宽 0.470 + 两侧各 0.055 = 0.58（见 robot_profiles/wheeltec_diff.yaml）。
+        #   **只改注释不改数值**：改数值会让 S3 的 A/B 结论失效。
+        self.narrow_floor = self._metric_threshold(
+            'narrow_floor', float(p('narrow_floor_m', 0.0).value))
         self.corridor_unknown_max = float(p('corridor_unknown_max', 0.35).value)
         # D1：末端也查（原来 skip=1.2 m 会整段跳过目标点附近）；保留参数名做兼容，
         # 但语义改为"末端额外加密采样距离"，不再"跳过"。
@@ -1081,6 +1101,67 @@ class Arbiter(Node):
             'max_cand=%d pool_probe_n=%d pool_probe_log=%s'
             % (self.ureg_enabled, self.ureg_radius, self.ureg_min_cells,
                self.max_cand, self.pool_probe_n, repr(self.pool_probe_log)))
+
+    # ---- S5 M1：车体画像与阈值派生 ---------------------------------------
+    def _load_robot_profile(self):
+        """加载 RobotProfile。**任何失败都不许打死仲裁节点**。
+
+        理由：仲裁节点死了整个探索会话就没有目标来源（历史事故：一个
+        未声明的 `corridor_skip_far` 属性把节点当场 AttributeError 打死，
+        车端表现为"路径不刷新、长时间卡住"）。所以这里只告警、返回 None，
+        由 `_metric_threshold` 退回显式参数。
+        """
+        if not self.use_robot_profile:
+            self.get_logger().warn(
+                'use_robot_profile=false：通行阈值只取显式参数，profile 不参与'
+                '（回退路径，需同时显式给 pass_width:=… narrow_floor:=…）')
+            return None
+        try:
+            # install 里本脚本是**符号链接**，__file__ 指向 install。
+            # 先 realpath 回 src（免重新编译即可生效），再退回 install 布局
+            # （CMake 里 robot_model 也装到 lib/<pkg>，非 symlink-install 时用）。
+            for d in (os.path.dirname(os.path.realpath(__file__)),
+                      os.path.dirname(os.path.abspath(__file__))):
+                if d and d not in sys.path:
+                    sys.path.insert(0, d)
+            from robot_model import load_profile
+            prof = load_profile(self.robot_profile_name)
+        except Exception as exc:                        # noqa: BLE001
+            self.get_logger().error(
+                'S5-M1：加载 robot_profile=%r 失败（%s）。'
+                '通行阈值退回显式参数——请显式给 pass_width:=… narrow_floor:=…，'
+                '否则本节点会拒绝启动。'
+                % (self.robot_profile_name, exc))
+            return None
+        self.get_logger().info('S5-M1：%s（来源 %s）'
+                               % (prof.describe(), prof.source))
+        return prof
+
+    def _metric_threshold(self, name, explicit):
+        """米制阈值的唯一取值入口：显式参数 > profile 派生值 > 报错。
+
+        `explicit <= 0` 表示"未指定，用 profile 派生值"。这是 S5 §2 原则 1
+        （阈值不得出现在代码里）的落地方式：代码里只有 0.0 这个哨兵值，
+        真正的数字来自车体几何。
+
+        两处都拿不到值时**在启动期抛错**，而不是猜一个数——判据用错一个
+        米制阈值会直接变成物理接触（P0），宁可起不来。
+        """
+        if explicit and explicit > 0.0:
+            if self.profile is not None:
+                derived = getattr(self.profile, name + '_m')
+                if abs(explicit - derived) > 1e-9:
+                    self.get_logger().warn(
+                        'S5-M1：%s_m 显式参数 %.4f 与 profile 派生值 %.4f 不一致，'
+                        '以显式参数为准（A/B/回退路径）'
+                        % (name, explicit, derived))
+            return float(explicit)
+        if self.profile is None:
+            raise RuntimeError(
+                'S5-M1：%s 既没有显式参数（=%r）也没有可用 profile。'
+                '请给 --ros-args -p %s_m:=<米>，或修好 robot_profile。'
+                % (name, explicit, name))
+        return float(getattr(self.profile, name + '_m'))
 
     # ---- 回调 ----
     def on_map(self, m):

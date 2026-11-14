@@ -1,0 +1,46 @@
+# omni_mecanum —— 全向轮（麦克纳姆）构型占位 profile
+#
+# ⚠️ 状态：**未仿真验证**。S5 Step 6 之前不得用于任何结论。
+#    Step 1 只保证它能被加载、派生量自洽、能力 flag 合法。
+#    在 Step 6 通过 §5-D 之前，README/文档只允许写"参数化预留，已验证差速"。
+#
+# 与 wheeltec_diff 的**关键差异**
+#   1. lateral_motion: true —— 可横移。但横移**不减少通行净宽需求**：
+#      车体宽度在横移时依然占那么多地方，所以 side_open/side_tight 不变。
+#      真正的收益在"扫掠内核"(Step 2) 里体现：横移是平移而不旋转，
+#      车角扫过的包络比差速原地转小。
+#   2. 麦克纳姆辊子外沿比驱动轮更宽，含轮半宽取 0.245。
+#
+# 这些数字是从同级别 V550/R550 机械尺寸拍的**占位值**，
+# 没有实测依据——Step 6 必须先量车再改。
+profile_name: omni_mecanum
+
+kinematics: omni
+
+footprint:
+  - [-0.20, -0.245]
+  - [-0.20,  0.245]
+  - [ 0.30,  0.245]
+  - [ 0.30, -0.245]
+
+collision_geometry:
+  x_min: -0.18
+  x_max:  0.27
+  y_half: 0.245
+
+body_height_m: 0.15
+scan_plane_height_m: 0.225
+
+capabilities:
+  in_place_rotation: true
+  min_turning_radius_m: 0.0
+  reverse_allowed: false
+  max_reverse_step_m: 0.15
+  lateral_motion: true
+
+clearance_budget:
+  # 全向轮贴墙横移时，辊子外沿是**滚动摩擦**而非滑动摩擦，理论上可以更贴，
+  # 但取证口径（collision_probe）不区分摩擦类型，所以余量保守取同值。
+  side_open_m:  0.215
+  side_tight_m: 0.055
+  goal_disc_m:  0.35

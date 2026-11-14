@@ -1,0 +1,66 @@
+# wheeltec_diff —— 当前实车/仿真配置（差速两轮 + 前后万向球）
+#
+# ★ 本文件是**唯一几何事实源**（S5 §2 原则 6）。
+#   Step 1 等价性闸门要求它派生出与改造前**完全一致**的阈值：
+#       pass_width_m        = 0.90
+#       narrow_floor_m      = 0.58
+#       inscribed_radius_m  = 0.235
+#   改这里任何一个数字之前，先跑 harness/test_robot_profile.py。
+#
+# 几何真值来源：stemm_sim_ws/src/wheeltec_two_wheel_model/urdf/_t_classic.urdf.xacro
+#   wheel_radius 0.10 / wheel_width 0.05 / 轮中心 y=±0.205 ⇒ 含轮外沿 ±0.230
+#   axle_to_front 0.29 / base_l 0.45 / base_w 0.36 / base_z 0.08 / base_h 0.06
+#   ⇒ 车体盒子 x∈[0.065-0.225, 0.065+0.225] = [-0.16, +0.29]，高 0.14
+#   ⇒ 雷达 x = axle_to_front - 0.05 = 0.24，z = lidar_height = 0.225
+#
+# 注意：以下所有键都是**几何/余量**，不许写 pass_width 之类的阈值——
+# profile.py 构造时会拒绝派生量出现在配置里。
+profile_name: wheeltec_diff
+
+kinematics: differential
+
+# 外廓（含轮），逆时针，单位 m。这是**规划口径**，比实测碰撞盒前后各留约 2 cm。
+# 宽 = 0.470（不是 0.400！launch 里"车宽 0.40"的历史注释是错的，
+# 0.400 是 stemm_safe_nav2_params.yaml 的原始值，运行期由 patch_sim_time 覆盖成 0.470）
+footprint:
+  - [-0.18, -0.235]
+  - [-0.18,  0.235]
+  - [ 0.32,  0.235]
+  - [ 0.32, -0.235]
+
+# 与 footprint **独立**的"传感器/取证口径"，给 collision_probe 判物理接触。
+# 它比 footprint 小一圈是故意的：footprint 用于规划膨胀，碰撞盒用于取证。
+# 把两者统一 ⇒ 要么取证误报，要么规划兜不住车角。
+collision_geometry:
+  x_min: -0.16
+  x_max:  0.29
+  y_half: 0.23            # 含轮外沿（轮心 0.205 + 半轮宽 0.025）
+
+# 不参与 Step 1 判据，但决定"哪些障碍 2D 雷达看不见"：
+# 低于 scan_plane_height_m 的物件（0.36 m 见方的贴地桌腿、门槛）会被整层漏掉。
+body_height_m: 0.14
+scan_plane_height_m: 0.225
+
+capabilities:
+  in_place_rotation: true
+  min_turning_radius_m: 0.0
+  reverse_allowed: false        # 探索期不允许无前置条件的倒车（P0，见 §7.3）
+  max_reverse_step_m: 0.15
+  lateral_motion: false
+
+# 通行所需净宽 = body_width + 2 × 余量。
+#   side_open_m  → pass_width   = 0.470 + 2×0.215 = 0.90
+#   side_tight_m → narrow_floor = 0.470 + 2×0.055 = 0.58
+# 这两个余量是**几何余量**，不是"调参旋钮"：0.055 ≈ 轮子离墙 5.5 cm，
+# 再小就是贴壳摩擦（p14vF 的接触实测就是 left_min_range=0.231 ≈ 半宽 0.230）。
+clearance_budget:
+  side_open_m:  0.215
+  side_tight_m: 0.055
+  goal_disc_m:  0.35          # 对应车端 manager 的 goal_clearance
+
+# 备注（S5 §3 M1 遗留矛盾 #1）：
+# 历史上 launch/sim_explore.launch.py 里 narrow_floor 的注释写的是
+#   "车宽 0.40 + 两侧各 0.09 余量"
+# 那是错的：0.40 + 2×0.09 = 0.58 数值虽然对得上，但两个因子都错
+# （真车宽 0.470、真余量 0.055）。**只改注释不改数值**——改数值会让 S3 的
+# A/B 结论失效。

@@ -10,4 +10,7 @@ install(PROGRAMS scripts/session_driver scripts/patch_sim_time scripts/frontier_
         scripts/nav_plan_audit scripts/fake_base
         DESTINATION lib/${PROJECT_NAME})
 install(DIRECTORY scripts/sim_shims DESTINATION lib/${PROJECT_NAME})
+# S5 M1：车体画像包 + 构型 profile（几何唯一事实源）
+install(DIRECTORY scripts/robot_model DESTINATION lib/${PROJECT_NAME})
+install(DIRECTORY config/robot_profiles DESTINATION share/${PROJECT_NAME}/config)
 ament_package()

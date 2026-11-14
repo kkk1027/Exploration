@@ -136,9 +136,16 @@ def generate_launch_description():
                                 # （声明了 corridor_width，但节点参数里没有映射），
                                 # 所以 CORRIDOR_W=0.85 一直是空操作（实测日志仍打 1.05）。
                                 'corridor_width_m': LaunchConfiguration('corridor_width'),
+                                # ===== S5 M1（2026-11-14）：车体画像 =====
+                                # 几何唯一事实源。pass_width/narrow_floor 由
+                                # body_width + 2×side_margin 派生，不再由本文件持有。
+                                'robot_profile': LaunchConfiguration('robot_profile'),
+                                'use_robot_profile': LaunchConfiguration('use_robot_profile'),
                                 # 通行保证式判据（与场景无关；A/B 用）
+                                # 0 = 由 profile 派生；>0 = 显式覆盖（A/B/回退）
                                 'pass_width_m': LaunchConfiguration('pass_width'),
                                 # S3（2026-11-11）：硬拒下限（只拒物理过不去的）
+                                # 0 = 由 profile 派生；>0 = 显式覆盖（A/B/回退）
                                 'narrow_floor_m': LaunchConfiguration('narrow_floor'),
                                 'narrow_len_max_m': LaunchConfiguration('narrow_len_max'),
                                 'unknown_span_max_m': LaunchConfiguration('unknown_span_max'),
@@ -434,11 +441,19 @@ def generate_launch_description():
             description='探索期受控倒车每局步数上限（原 2 步对 0.34 m 贴脸不够用）'),
         DeclareLaunchArgument('retreat_interval', default_value='8.0',
             description='探索期受控倒车最小间隔秒数（原 8 s 太慢）'),
-        DeclareLaunchArgument('pass_width', default_value='0.90',
-            description='通行保证带宽下限（车宽 0.47 + 2×0.215 ≈ 0.90，与场景无关）'),
-        DeclareLaunchArgument('narrow_floor', default_value='0.58',
-            description='S3：净宽低于此值才硬拒（车宽 0.40 + 两侧各 0.09 余量；'
-                        'corridor_hard 之上改为软罚分，不再否决候选）'),
+        DeclareLaunchArgument('robot_profile', default_value='wheeltec_diff',
+            description='S5-M1：车体画像名（config/robot_profiles/<name>.yaml）。'
+                        '几何唯一事实源，见 docs/S5_构型无关适配层_实施计划.md §3 M1'),
+        DeclareLaunchArgument('use_robot_profile', default_value='true',
+            description='S5-M1：是否由 profile 派生通行阈值。false=回退路径，'
+                        '此时必须显式给 pass_width:=… narrow_floor:=…'),
+        DeclareLaunchArgument('pass_width', default_value='0.0',
+            description='通行保证带宽下限。0=由 profile 派生（车宽 0.47 + 2×0.215 '
+                        '= 0.90，与场景无关）；>0=显式覆盖，用于 A/B 与回退'),
+        DeclareLaunchArgument('narrow_floor', default_value='0.0',
+            description='S3：净宽低于此值才硬拒。0=由 profile 派生（车宽 0.470 + '
+                        '两侧各 0.055 = 0.58）；>0=显式覆盖。'
+                        '注意历史注释里"车宽 0.40 + 两侧各 0.09"是错的，只改注释不改数值'),
         DeclareLaunchArgument('exploration_behavior_tree',
             # ★ 必须给**真实路径**，不能给 ''：DeclareLaunchArgument 一旦声明，
             #   下游 LaunchConfiguration 的 code-level default 就失效，空串会把

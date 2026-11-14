@@ -1,0 +1,46 @@
+# ackermann_small —— 阿克曼（前轮转向）构型占位 profile
+#
+# ⚠️ 状态：**未仿真验证**。S5 Step 6 之前不得用于任何结论。
+#
+# 与 wheeltec_diff 的**关键差异**
+#   1. in_place_rotation: false —— **不能原地转**。这是最危险的一条：
+#      本仓库现有的恢复策略（escape_supervisor 的"旋转+前进"）、
+#      转角门（75°/80°）、以及"原地转一圈扫四周"都假定能原地转。
+#      Step 6 必须先给这些路径加能力分支，否则全链路卡死（S5 §6 R3）。
+#   2. reverse_allowed: **必须为 true**。阿克曼掉头只能靠倒车，
+#      禁倒车等于禁掉头。
+#   3. turn_corridor_m 从 0 变成一个正数：掉头需要一段宽度 ≥ 2×R_outer 的空地。
+#      派生公式见 robot_model/profile.py；本文件不写这个阈值。
+#
+# 数字是从 mini_akm 级别机械尺寸拍的占位值，Step 6 必须先量车再改。
+profile_name: ackermann_small
+
+kinematics: ackermann
+
+footprint:
+  - [-0.25, -0.160]
+  - [-0.25,  0.160]
+  - [ 0.25,  0.160]
+  - [ 0.25, -0.160]
+
+collision_geometry:
+  x_min: -0.23
+  x_max:  0.23
+  y_half: 0.160
+
+body_height_m: 0.13
+scan_plane_height_m: 0.200
+
+capabilities:
+  in_place_rotation: false
+  min_turning_radius_m: 0.45      # 前轮转角约 25° @ 轴距 0.42 的量级
+  reverse_allowed: true
+  max_reverse_step_m: 0.30
+  lateral_motion: false
+
+clearance_budget:
+  # 车窄（0.32），同样的物理余量占车宽比例更大；仍取与差速车一致的绝对值，
+  # 因为"离墙 21.5 cm 才叫宽松"是**取证口径**的要求，不是车宽的函数。
+  side_open_m:  0.215
+  side_tight_m: 0.055
+  goal_disc_m:  0.35

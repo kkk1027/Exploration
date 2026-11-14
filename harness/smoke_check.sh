@@ -13,6 +13,25 @@ FAIL=0
 ok()   { echo "  ✓ $*"; }
 bad()  { echo "  ✗ $*"; FAIL=$((FAIL+1)); }
 
+# ---------------------------------------------------------------------------
+# 0) 静态断言（S5 §5-E）：不需要起栈，< 1 秒。
+#    放在最前面，这样"阈值已被改坏"能在花 4 分钟起栈之前就被挡住。
+#    新加的 test_*.py 自动纳入，不用改这里。
+# ---------------------------------------------------------------------------
+HARNESS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+echo "[smoke] 0) 静态断言"
+for t in "$HARNESS_DIR"/test_robot_profile.py "$HARNESS_DIR"/test_no_magic_numbers.py; do
+  [ -f "$t" ] || continue
+  N=$(basename "$t" .py)
+  if OUT=$(timeout 20 python3 "$t" 2>&1); then
+    ok "$N（$(echo "$OUT" | tail -1)）"
+  else
+    bad "$N"
+    echo "$OUT" | grep -E '^ *✗' | head -6 | sed 's/^/       /'
+  fi
+done
+
+
 echo "[smoke] 1) 关键节点"
 NODES=$(timeout 20 ros2 node list 2>/dev/null)
 for n in /stemm_cartographer_nav2_manager /controller_server /planner_server /bt_navigator \
