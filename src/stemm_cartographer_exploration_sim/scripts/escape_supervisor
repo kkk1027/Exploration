@@ -116,11 +116,32 @@ class EscapeSupervisor(Node):
         # 车轮外沿半径 0.23、雷达在轮轴前 0.24：旋转时轮子扫掠到距雷达 ~0.31，
         # 故安全半径取 0.34（escB 实测 0.26 时旋转过程中轮子蹭到了东西）
         self.rotate_min_range = float(p('rotate_min_range', 0.34).value)
+        # 2026-11-14（I）：上面的 0.34 只算了轮子，**没算车尾两角**。
+        # URDF 实读（wheeltec_two_wheel_model/_t_classic.urdf.xacro）：
+        #   车体 x∈[-0.160, 0.290]、|y|≤0.230（base_footprint 系）
+        #   雷达 x = axle_to_front - 0.05 = 0.240
+        # 换算到"以雷达为原点"：x∈[-0.400, 0.050]、|y|≤0.230
+        # → 后角 distance = hypot(0.400, 0.230) = 0.461 m，比 0.34 大 12 cm。
+        # 实测 p14vE_sw1：车在 (7.03,-9.74) 旋转 77°（offset=-1.35），旋转前
+        # 左 0.356 m、右 0.583 m，range_cone 只看"目标朝向±45°"，判为安全；
+        # 但车尾在雷达后方 0.40 m，扫掠时扫进 HouseWallB，接触 365 帧 / 365.6 s。
+        # 对策：旋转前用矩形包络逐方位角核对"该方向的测距 >= 车体在该方向的
+        # 边界距离 + margin"。
+        self.body_x_min = float(p('body_x_min', -0.400).value)
+        self.body_x_max = float(p('body_x_max', 0.050).value)
+        self.body_y_half = float(p('body_y_half', 0.230).value)
+        self.body_sweep_margin = float(p('body_sweep_margin', 0.030).value)
+        self.body_sweep_check = str(
+            p('body_sweep_check', True).value).lower() in ('true', '1', 'yes', 'on')
         # 旋转安全扇区半角：选向校验与执行复核必须用同一个值，否则会出现
         # "选出来了却一启动就判 rotate_into_obstacle" 的自相矛盾（escA2 实测）
         self.rotate_sector_deg = float(p('rotate_sector_deg', 45.0).value)
         self.rotate_pick_margin = float(p('rotate_pick_margin', 0.04).value)
-        self.advance_stop_range = float(p('advance_stop_range', 0.30).value)
+        # 前进停止口径：advance_stop_range 是"雷达测距"，雷达在前沿后方
+        # body_front_offset，所以真实前沿净空 = advance_stop_range - body_front_offset。
+        # 2026-11-14：改口径后默认值取 0.35，等价于旧的 0.30 但语义明确。
+        self.body_front_offset = float(p('body_front_offset', 0.05).value)
+        self.advance_stop_range = float(p('advance_stop_range', 0.35).value)
         self.min_dir_range = float(p('min_dir_range', 0.50).value)
         self.clearance_gain = float(p('clearance_gain', 0.20).value)
         self.cost_gain = int(p('cost_gain', 40).value)
@@ -412,6 +433,45 @@ class EscapeSupervisor(Node):
                 best = r
         return best
 
+    def body_radius_at(self, phi):
+        """矩形车体在极角 phi（相对车头，弧度）方向的边界距离（以雷达为原点）。"""
+        dx = math.cos(phi)
+        dy = math.sin(phi)
+        cand = []
+        if dx > 1e-9:
+            cand.append(self.body_x_max / dx)
+        elif dx < -1e-9:
+            cand.append(self.body_x_min / dx)
+        if abs(dy) > 1e-9:
+            cand.append(self.body_y_half / abs(dy))
+        if not cand:
+            return 0.0
+        return min(cand)
+
+    def body_sweep_clear(self, margin=None):
+        """原地旋转是否安全：逐方位角核对"测距 >= 车体在该方向的边界 + margin"。
+
+        为什么不能只看 range_cone：range_cone 只扫"目标朝向 ±half_deg"，而车体
+        矩形是**包住雷达原点**的（x∈[-0.400,+0.050]、|y|≤0.230），车尾沿在雷达
+        后方 0.40 m —— 车头方向再空旷也挡不住车尾扫到后方墙壁。旋转任何角度，
+        车体都会扫过全部方位角，所以必须逐方位核对。
+
+        返回 (ok, worst_phi_deg, worst_range, worst_need)。
+        """
+        if not self.body_sweep_check or not self.points:
+            return True, 0.0, 9.0, 0.0
+        m = self.body_sweep_margin if margin is None else margin
+        worst_slack = float('inf')
+        worst = (0.0, 9.0, 0.0)          # (phi_deg, range, need)
+        for i in range(0, len(self.points), 1):
+            r, th = self.points[i]
+            need = self.body_radius_at(th) + m
+            slack = r - need
+            if slack < worst_slack:
+                worst_slack = slack
+                worst = (math.degrees(th), r, need)
+        return (worst_slack >= 0.0), worst[0], worst[1], worst[2]
+
     def remaining_sector_anchor(self, now):
         """旋转阶段复核用的朝向：用当前剩余转角（含已转过的部分由 step 递减体现）。"""
         return self.unit_remaining
@@ -421,7 +481,15 @@ class EscapeSupervisor(Node):
 
         单元测试（escA）暴露过：只看全局最小测距时，车侧/车后某个方向的近物会让
         旋转闸门永远误报；只看目标朝向又会在"扫过去的那一段"刮到东西。所以按步校验。
+
+        2026-11-14（I）：上面两步都只扫"目标朝向 ±45°"，管不住**车尾**。车体矩形
+        包住雷达原点（车尾沿在雷达后方 0.40 m），旋转时车尾会扫过全部方位角，
+        所以只要真的转（|offset| > eps），先要求整个包络逐方位角都安全。
         """
+        if abs(offset) > math.radians(3.0):
+            ok, _phi, _r, _need = self.body_sweep_clear()
+            if not ok:
+                return False
         n = max(1, int(round(abs(offset) / step)))
         for i in range(1, n + 1):
             th = offset * i / n
@@ -897,6 +965,17 @@ class EscapeSupervisor(Node):
             if cur < self.rotate_min_range:
                 self.abort_unit(now, 'rotate_into_obstacle')
                 return
+            # 2026-11-14（I）：执行期也复核车体包络 —— 选向时安全不代表转了一半还安全
+            # （p14vE_sw1：选向时左 0.356 m，转到一半就只剩 0.185 m）。
+            if abs(self.unit_remaining) > math.radians(3.0):
+                ok, phi, r, need = self.body_sweep_clear()
+                if not ok:
+                    self.abort_unit(now, 'rotate_sweep_blocked')
+                    self.log(type='rotate_sweep_blocked',
+                             phi_deg=round(phi, 1), range_m=round(r, 3),
+                             need_m=round(need, 3), nav=self.nav_state,
+                             note='车体包络扫掠空间不足，立即停转')
+                    return
             if abs(self.unit_remaining) < 0.10 or unit_dt >= self.rotate_budget_sec:
                 self.unit_remaining = 0.0
                 self.phase = 'advance'
@@ -907,6 +986,9 @@ class EscapeSupervisor(Node):
             return
         # advance
         # 前进闸门看 ±45°（车体侧向也会蹭），不再只看 ±20°
+        # 口径（2026-11-14）：advance_stop_range 是**雷达测距**门限，真实前沿净空
+        # = advance_stop_range - body_front_offset（雷达在车体前沿后方 0.05 m）。
+        # 默认 0.35 → 前沿净空 0.30 m（旧代码直接写 0.30 时真实净空只有 0.25）。
         fwd = self.range_cone(0.0, half_deg=45.0, stride=2)
         if fwd <= self.advance_stop_range:
             self.end_unit(now, degraded=False)
