@@ -264,6 +264,47 @@ check('X.5 返航转向调用点是唯一新增调用方且已判净空',
 check('X.6 默认参数下 stop(0.397) > emergency(0.235)',
       0.397 > 0.235)
 
+# ---------------------------------------------------------------- 修复 6
+print('\n=== 修复 6：走廊判定分级 + 重试去重（2026-11-15 U） ===')
+#
+# 背景：p14x2_nomin 轮 2 车停在 (4.36,-8.80) 一动不动，
+# `B approach corridor rejected` 连续 3 次 → 3 次重试全失败 →
+# return_home_failed_waiting_manual。
+# 根因：该函数用 `last_map.data >= 50` 判占用，而地图**保存**用
+# occupied_thresh 0.65 ⇒ occupancy 50~65 在运行期算占用、存盘算未知，
+# 一个 occupancy=55 的模糊格就能永久阻断返航。
+
+seg = block(cmgr, 'def _approach_corridor_is_clear', 7000)
+check('6.1 走廊判定不再用单一 >= 50 硬阈',
+      'self.last_map.data[my * info.width + mx] >= 50' not in seg,
+      '旧写法一个模糊格就永久阻断返航')
+check('6.2 存在硬阈参数且与 map_saver 对齐（默认 65）',
+      "declare_parameter('approach_corridor_hard_occupancy', 65)" in cmgr)
+check('6.3 灰度占用单独计数而非直接否决',
+      'gray_hits' in seg and 'hard_hits' in seg)
+check('6.4 灰度占比超限才拒',
+      'gray_frac_max' in seg and 'frac > gray_frac_max' in seg)
+check('6.5 拒绝日志带真实 occupancy 与坐标（禁止推测）',
+      'hard obstacle occupancy=%d at' in seg
+      and '(%.2f,%.2f) %.2f m ahead' in seg)
+check('6.6 通过时也记录灰度比例（可观测）',
+      'accepted with %.0f%% gray occupancy' in seg)
+check('6.7 同一位置+同一原因会被记录下来',
+      '_note_corridor_fail' in seg
+      and 'round(float(rx), 1)' in cmgr)
+sched = block(cmgr, 'def _schedule_return_home_retry', 9000)
+check('6.8 连续 2 次同因失败触发降级',
+      '_corridor_same_fail' in sched and '_same >= 2' in sched)
+check('6.9 降级动作是跳过预防性走廊检查（不是放弃）',
+      '_skip_approach_corridor_once = True' in sched)
+check('6.10 被跳过时该函数真的会放行',
+      '_skip_approach_corridor_once' in seg
+      and 'B approach corridor bypassed once' in seg)
+check('6.11 降级后计数归零，不会每次重试都触发',
+      '_corridor_same_fail = 0' in sched)
+check('6.12 参数已声明（否则 get_parameter 抛异常）',
+      "declare_parameter('approach_corridor_gray_frac_max'" in cmgr)
+
 print('\n' + '=' * 60)
 print('return_home_deadlock: %d 通过, %d 失败' % (PASS, FAIL))
 if FAILS:
