@@ -64,11 +64,31 @@ def launch_events(path):
         elif is_mgr and 'navigation goal canceled' in line:
             ev.append((t, 'cancel', line.strip()))
         elif (is_mgr and 'mapping done acknowledged' in line) \
-                or '探索限时到（' in line:
-            # 结束建图的"起点"：manager 确认行，或会话驱动打印的"探索限时到"
+                or '探索限时到（' in line \
+                or '结束探索（' in line \
+                or ('SetBool_Response' in line and 'success=True' in line):
+            # 结束建图的"起点"。四个来源都要认：
+            #   1) manager 自己的确认行
+            #   2) 定时器终止：会话驱动打印"探索限时到（"
+            #   3) 覆盖率终止：会话驱动打印"结束探索（…
+            #      ★ 2026-11-15 修：P2 把 coverage_terminate 默认打开后，
+            #      "探索限时到（"不再出现，这里没跟上 ⇒ done 缺失 ⇒
+            #      return_s=None ⇒ 误报"返航未完成"。实测当天 19 轮全部
+            #      被误判，是历史单日最高。
+            #   4) set_mapping_done 的返回值（节点名是 session_driver，
+            #      不是 manager，所以上面的 is_mgr 拦不住）
             ev.append((t, 'done', line.strip()))
         elif is_mgr and ('return-home completed' in line
                          or 'return-home goal reached' in line):
+            ev.append((t, 'home', line.strip()))
+        elif re.search(r'返航(?:到位|完成)', line):
+            # ★ 2026-11-15：会话驱动的返航终点有两种措辞，都必须认：
+            #   「=== 返航完成（manager 状态：…」—— manager 走到最终态
+            #   「=== 返航到位：距 map 原点 X m，返航用时 Y s」—— 到点判定
+            # 正则与 evaluate.py 的 POS 保持一致（r'返航(?:到位|完成)'），
+            # 否则两个工具的 return_home 会再次分歧。
+            # 早于 manager 自报 goal reached 的轮次（2026-10 期）只有这两句，
+            # 之前漏认导致 return_s=None、报告里返航耗时显示"—"。
             ev.append((t, 'home', line.strip()))
         elif is_mgr and 'front blocked' in low:
             ev.append((t, 'frontblocked', line.strip()))
@@ -209,6 +229,32 @@ def context_lines(launch_log, wall_ts, n=20):
     return lines[lo:best + n]
 
 
+def load_evaluate(run_dir):
+    """读 evaluate.json —— 结论的**唯一权威源**。
+
+    ★ 2026-11-15：本文件原来自行实现一套判据（看 `assist` 真假、看 return_s
+    是否为 None），与 evaluate.py 的两处差异造成**166 / 955 轮（17.4%）结论相反**：
+
+      1) 硬倒车：旧代码只看 `assist == False and dist >= 0.05`，
+         而 evaluate.py 有三级授权包络（explore_ok / return_ok / mppi_ok）。
+         后果：0.065 m 的受控探索期小步倒车被当成\"非受控\" ⇒ 126 轮误判。
+      2) 返航：旧代码看 `return_s`（home 时间戳 - done 时间戳），
+         而 done 事件在覆盖率终止后识别不到 ⇒ 50 轮误报\"返航未完成\"。
+
+    现在：evaluate.json 存在就以它为准，本文件不再重算结论；
+    只有在 evaluate.json 缺失时（例如单独跑单个目录）才回退到内置逻辑，
+    并在报告里明确标注\"回退口径\"，避免又一次无声分歧。
+    """
+    p = os.path.join(run_dir, 'evaluate.json')
+    if not os.path.exists(p):
+        return None
+    try:
+        with open(p, encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:                      # noqa: BLE001 - 坏文件按缺失处理
+        return None
+
+
 def main():
     run_dir = sys.argv[1] if len(sys.argv) > 1 else '.'
     tag = sys.argv[2] if len(sys.argv) > 2 else os.path.basename(run_dir.rstrip('/'))
@@ -219,6 +265,7 @@ def main():
     launch_log = os.path.join(run_dir, 'launch.log')
     probe = load_jsonl(os.path.join(run_dir, 'probe.jsonl'))
     sup = load_jsonl(os.path.join(run_dir, 'supervisor.jsonl'))
+    evj = load_evaluate(run_dir)
 
     ev = launch_events(launch_log)
     tb = time_breakdown(ev, first_log_ts(launch_log))
@@ -234,23 +281,45 @@ def main():
                   if e.get('type') == 'reverse' and e.get('phase') == 'end'
                   and e.get('assist')]
 
-    verdict = 'PASS'
-    fails = []
-    if tb['dispatch_n'] == 0:
-        verdict, _ = 'FAIL', fails.append('无目标派发')
-    if tb['return_s'] is None:
-        verdict = 'FAIL'
-        fails.append('返航未完成')
-    if physical:
-        verdict = 'FAIL'
-        fails.append(f'物理接触 {physical}')
-    if hard_rev:
-        verdict = 'FAIL'
-        fails.append(f'非受控硬倒车 {len(hard_rev)}')
+    if evj is not None:
+        # ——— 权威口径：完全复刻 evaluate.py 的结论，不重算 ———
+        verdict = evj.get('verdict') or 'UNKNOWN'
+        failed = [k for k, v in (evj.get('checks') or {}).items() if not v]
+        coll = evj.get('collision') or {}
+        rev_authorized = bool(coll.get('reverse_authorized'))
+        rev_hard_n = int(coll.get('reverse_hard_windows') or 0)
+        src = 'evaluate.json'
+        fails = [f'{k}' for k in failed]
+        if rev_hard_n and not rev_authorized:
+            fails.append(f'非受控硬倒车 {rev_hard_n}')
+    else:
+        # ——— 回退口径（evaluate.json 缺失）：保留旧逻辑，但标注清楚 ———
+        src = '回退口径（无 evaluate.json）'
+        verdict = 'PASS'
+        fails = []
+        if tb['dispatch_n'] == 0:
+            verdict = 'FAIL'
+            fails.append('无目标派发')
+        if tb['return_s'] is None:
+            verdict = 'FAIL'
+            fails.append('返航未完成')
+        if physical:
+            verdict = 'FAIL'
+            fails.append(f'物理接触 {physical}')
+        if hard_rev:
+            verdict = 'FAIL'
+            fails.append(f'非受控硬倒车 {len(hard_rev)}')
+        rev_authorized = None
+        rev_hard_n = len(hard_rev)
 
     out = []
     out.append(f'# 单轮体检报告 · {tag}\n')
-    out.append(f'**结论：{verdict}**' + (f"（{'；'.join(fails)}）" if fails else '（全项通过）') + '\n')
+    out.append(f'**结论：{verdict}**'
+               + (f"（{'；'.join(fails)}）" if fails else '（全项通过）')
+               + f'\n\n> 判定来源：{src}'
+               + ('' if evj is not None
+                  else ' —— ⚠ 与 evaluate.py 口径可能不同，请以 evaluate.py 为准')
+               + '\n')
 
     out.append('## 1. 时间分布\n')
     out.append('| 项 | 值 |')
@@ -260,6 +329,22 @@ def main():
     out.append(f"| 其中 导航中（派发→终态） | {fmt(tb['nav_s'])}（{pct(tb['nav_s'], tb['explore_s'])}）|")
     out.append(f"| 其中 选点等待（终态→下次派发） | {fmt(tb['select_wait_s'])}（{pct(tb['select_wait_s'], tb['explore_s'])}）|")
     out.append(f"| 返航（结束建图→返航完成） | {fmt(tb['return_s'])} |")
+    # 2026-11-15：返航为 None 有两种完全不同的原因，不能都显示成"—"：
+    #   a) 真的没返航（evaluate 也判失败）
+    #   b) evaluate 用**位置兜底**放行（by_geometry：地图原点被家具围住不可规划，
+    #      车停在 1.03~2.0 m 内且已静止）—— 此时日志里本来就没有"到点"事件，
+    #      return_s 为空是事实正确，不是漏识别。
+    if tb['return_s'] is None and evj is not None:
+        _rk = evj.get('return_home_kind') or {}
+        if _rk.get('by_geometry'):
+            out.append('')
+            out.append(f"> 注：本轮返航由 **位置兜底** 放行（终点距原点 "
+                       f"{_rk.get('final_dist_to_home')} m、已静止）。"
+                       f"日志中没有\"到点\"事件，故返航耗时不可算。")
+        elif _rk.get('by_manager_geometry'):
+            out.append('')
+            out.append('> 注：本轮返航由 **manager 几何判据** 放行，'
+                       '日志中无\"到点\"事件，故返航耗时不可算。')
     out.append(f"| 目标派发/成功/失败/取消 | {tb['dispatch_n']} / {tb['succ_n']} / {tb['fail_n']} / {tb['cancel_n']} |")
     out.append(f"| front blocked / 无净进展 事件 | {tb['front_blocked_n']} / {tb['no_progress_n']} |")
 
@@ -269,8 +354,20 @@ def main():
     out.append(f"| 物理接触（底盘/轮） | {p_last.get('chassis_contacts', 0)} / {p_last.get('wheel_contacts', 0)} |")
     out.append(f"| 受控倒车（仅返航，允许） | {len(assist_rev)} 次 / "
                f"{sum((e.get('dist') or 0) for e in assist_rev):.3f} m |")
-    out.append(f"| **非受控硬倒车（必须 0）** | **{len(hard_rev)} 次 / "
-               f"{sum((e.get('dist') or 0) for e in hard_rev):.3f} m** |")
+    # 2026-11-15：\"非受控\"不再由本文件自行判定，而是引用 evaluate.py 的授权结论。
+    # 两者必须同源，否则又会出现\"同一轮两份报告说法不同\"。
+    if rev_authorized is None:
+        _hard_txt = (f"{len(hard_rev)} 次 / "
+                     f"{sum((e.get('dist') or 0) for e in hard_rev):.3f} m"
+                     f"（回退口径，未做包络授权）")
+    elif rev_hard_n == 0:
+        _hard_txt = "**0 次**（无倒车窗口）"
+    elif rev_authorized:
+        _hard_txt = (f"**{rev_hard_n} 次，但全部在授权包络内**"
+                     f"（explore_ok/return_ok/mppi_ok 之一成立）")
+    else:
+        _hard_txt = f"**{rev_hard_n} 次，且未被授权** ← 必须修"
+    out.append(f"| 硬倒车窗口（判定见右） | {_hard_txt} |")
     out.append(f"| 雷达近距点 contact/graze/alert | {p_last.get('contacts', 0)} / "
                f"{p_last.get('grazes', 0)} / {p_last.get('alerts', 0)} |")
     out.append(f"| 全程最小车体间隙 | {fmt(p_last.get('min_d_ever'), 'm', 3)} |")
