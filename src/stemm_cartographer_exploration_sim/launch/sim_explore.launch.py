@@ -442,8 +442,14 @@ def generate_launch_description():
         #
         # coverage_terminate=true 时，explore_sec 不再是终止依据，降级为看门狗
         # （explore_watchdog_sec，默认 600 s）。
-        # 默认 false = 回到旧的定时器行为，便于 A/B 对照与回退。
-        DeclareLaunchArgument('coverage_terminate', default_value='false'),
+        #
+        # 2026-11-15（T）：默认改为 **true**。
+        # 依据（s4manual 手动轮 900 s）：known_total 在 180 s 已达 49080 格
+        # （99.4%），之后 720 s 只多探 283 格（0.6%）；而该轮日志是
+        # 「终止判据=定时器 900s（覆盖率终止未启用）」⇒ 必然跑满，
+        # 约 80% 的轮次时间被白白丢掉。
+        # 回退：coverage_terminate:=false 即回到旧的定时器行为（A/B 对照用）。
+        DeclareLaunchArgument('coverage_terminate', default_value='true'),
         DeclareLaunchArgument('explore_watchdog_sec', default_value='600.0'),
         DeclareLaunchArgument('return_wait_goal_sec', default_value='20.0',
             description='探索限时到点时若候选仍在执行，等它结束再返航的上限秒数（0=关闭，旧行为）'),

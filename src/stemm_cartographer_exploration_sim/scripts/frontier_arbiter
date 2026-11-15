@@ -1099,6 +1099,26 @@ class Arbiter(Node):
         # 依据：p13c A/B 实测 rejected_narrow 812~936 次/轮 vs published 29~33 次/轮，
         # 供给被砍到只剩 10%，merge 因此回落到未评分的 raw（47~103 条/轮）。
         self.route_gate_soft = self._as_bool(p('route_gate_soft', True).value)
+        # ===== 2026-11-15（T，方案 b）：视觉独有窄缝 → 罚分而非硬拒 =====
+        # 实测 s4manual（900 s 手动轮）：`前向净空预检否决：实测 0.00m < 下限
+        # 0.58m` 出现 425 次，全轮 published 只有 12~13 条 ⇒ 车两次长时间
+        # 空等（86 s + 96 s，合计占全轮 80% 时间）。
+        #
+        # 根因是**两套口径不一致**：
+        #   · 可达性 BFS 用 costmap（data < 90 可通行）→ 认为能过
+        #   · 宽度 min_w 用 clearance_field()，其中把**视觉障碍栅格(==100)**
+        #     也算作障碍（见 clearance_field 的 D3）→ 判死
+        # 也就是说被拒的"障碍"里有一大半只是视觉层点云投影出来的，
+        # 而车体碰撞盒只有 0.06 m 高（z∈[0.08,0.14]），激光平面在 0.225 m，
+        # 二者本来就不是同一个物理口径。
+        #
+        # 现在的语义：
+        #   /map 也说窄（min_w_map < narrow_floor）⇒ 真过不去，仍硬拒（安全不变）
+        #   只有视觉层说窄 ⇒ 降级成大额罚分，交给 risk_route 排序决定，
+        #                  不再一刀切掐断供给
+        # 关掉这个开关（vision_narrow_soft:=false）即回到旧行为。
+        self.vision_narrow_soft = self._as_bool(
+            p('vision_narrow_soft', True).value)
         self.risk_w_soft = float(p('risk_w_soft', 900.0).value)
         self._last_path_soft = 0.0
         self.risk_eval_n = max(1, int(p('risk_eval_n', 6).value))
@@ -1284,6 +1304,10 @@ class Arbiter(Node):
         self._map_seq = 0
         self._clear_key = None
         self._clear_field = None
+        # 2026-11-15（T）：只用 /map（不含视觉障碍）的距离场缓存，
+        # 供"视觉独有窄缝"复核。按 _map_seq 失效，见 map_only_field()。
+        self._map_only_key = None
+        self._map_only_field = None
         # 2026-11-14（S5-B1）：未知占比窗口均值的缓存 (key, ndarray)。
         # 只随 /map 变化，见 _path_lateral_widths 里的说明。
         self._unk_frac_cache = None
@@ -1675,6 +1699,77 @@ class Arbiter(Node):
         self._clear_key = key
         self._clear_field = field
         return field
+
+    def map_only_field(self):
+        """只用 `/map` 占据（**不含视觉障碍**）的距离场，格式同 clearance_field()。
+
+        用途：判断"某条路径被某成窄缝"到底是谁造成的（2026-11-15 T，方案 b）。
+        clearance_field() 把视觉障碍也算作障碍（D3，为的是让雷达盲区里的
+        桌底座也参与净空）；但视觉栅格是 3D 点云投影到 2D 的结果，而车体
+        碰撞盒只有 0.06 m 高，两者并非同一物理口径。用它做"物理过不去"的
+        硬门会系统性地过拒。
+
+        这里给出同一张图、同一分辨率、**只是不含视觉障碍**的距离场，让
+        path_and_width 复核：/map 也说窄才算真过不去。
+
+        缓存按 `_map_seq` 失效；同一张 /map 上结果不变。
+        """
+        m = self.map
+        if m is None:
+            return None
+        info = m.info
+        res = info.resolution
+        if res <= 0:
+            return None
+        w, h = info.width, info.height
+        ox, oy = info.origin.position.x, info.origin.position.y
+        key = (self._map_seq, bool(self.width_unknown_block),
+               w, h, round(res, 6), round(ox, 4), round(oy, 4))
+        if key == self._map_only_key and self._map_only_field is not None:
+            return self._map_only_field
+        try:
+            import numpy as np
+            from scipy import ndimage
+        except Exception:                     # noqa: BLE001 - 无 scipy 则不复核
+            self._map_only_key = None
+            self._map_only_field = None
+            return None
+        arr = np.asarray(m.data, dtype=np.int16).reshape(h, w)
+        blocked = arr >= 50
+        unknown = arr < 0
+        if self.width_unknown_block:
+            blocked = blocked | unknown
+        dist_cells = ndimage.distance_transform_edt(~blocked)
+        field = (dist_cells * res, ox, oy, res, w, h, unknown)
+        self._map_only_key = key
+        self._map_only_field = field
+        return field
+
+    def _narrow_is_vision_only(self, path, idxs, res, ox, oy, w, h):
+        """当前路径的"窄"是否只由视觉障碍造成（2026-11-15 T，方案 b）。
+
+        返回 (vision_only, min_w_map)。vision_only=True 表示：
+          · 视觉障碍确实参与测宽（use_vision_obstacles 且视觉栅格可用）
+          · 用**只用 /map** 的距离场重测同一条路径，最小净宽 >= narrow_floor
+        即：/map 认为能过，是视觉层把它判死 —— 这类不再硬拒，只罚分。
+
+        `idxs` 与 path 都与原测量完全一致，只换距离场，保证可比。
+        """
+        if not self.vision_narrow_soft:
+            return False, None
+        if not self.use_vision_obstacles or self.vision_grid is None:
+            return False, None
+        fmap = self.map_only_field()
+        if fmap is None:
+            return False, None
+        lat = self._path_lateral_widths(fmap, path, idxs, res, ox, oy, w, h)
+        if lat is None:
+            return False, None
+        widths = lat[0]
+        if not widths:
+            return False, None
+        min_w_map = min(widths)
+        return (min_w_map >= self.narrow_floor), min_w_map
 
     def region_complexity(self, field, wx, wy):
         """候选点周围 2 m 的"复杂度/可脱困性"（基于激光∪视觉的统一净空场）。
@@ -3664,6 +3759,33 @@ class Arbiter(Node):
                 #   净宽 < narrow_floor  ⇒ 物理过不去，硬拒（保留防楔死能力）
                 #   净宽 >= narrow_floor ⇒ 能过，只是风险高 ⇒ 大额罚分放行
                 if min_w < self.narrow_floor:
+                    # ===== 2026-11-15（T，方案 b）：视觉独有窄缝降级为罚分 =====
+                    # 先问一句"不加视觉障碍还窄不窄"：
+                    #   /map 也窄  ⇒ 真物理过不去，保持硬拒（安全性一点不减）
+                    #   只有视觉窄 ⇒ 罚分放行，由 risk_route 排序决定
+                    # 复核只在**本来就要硬拒**的分支里做（惰性），因此不增加
+                    # 正常候选的 CPU 开销。
+                    _vis_only, _w_map = False, None
+                    try:
+                        _vis_only, _w_map = self._narrow_is_vision_only(
+                            path, idxs, res, ox, oy, w, h)
+                    except Exception as exc:      # noqa: BLE001 - 复核不得打断仲裁
+                        self.get_logger().warn(
+                            '视觉独有复核失败（按硬门处理）：%s: %s'
+                            % (type(exc).__name__, exc))
+                    if _vis_only:
+                        self.stats['narrow_vision_soft'] = self.stats.get(
+                            'narrow_vision_soft', 0) + 1
+                        # 2.0 = 现有软门罚分的上界（risk 侧按 min(1.0, soft)
+                        # 饱和），语义是"最差优先级但可选"。
+                        self._last_path_soft = 2.0
+                        self._last_path_reject = None
+                        self.get_logger().info(
+                            '视觉独有窄缝（/map 净宽 %.2fm >= %.2fm，融合场 %.2fm）'
+                            '目标 (%.2f,%.2f)：降级为罚分放行'
+                            % (_w_map, self.narrow_floor, min_w, x, y),
+                            throttle_duration_sec=5.0)
+                        return True, None, min_w, min_unk
                     self._last_path_reject = 'narrow_hard'
                     self.stats['reject_narrow_hard'] = self.stats.get(
                         'reject_narrow_hard', 0) + 1
