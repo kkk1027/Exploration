@@ -194,7 +194,53 @@ check('4.9 日志记录"从哪个状态重新武装"（不是覆盖后的新状�
       'gave_up_state' in seg,
       '若直接打 self.navigation_state，日志只会显示 rearmed，丢失归因')
 
-# ------------------------------------------------------- 交叉：不得回归
+# ---------------------------------------------------------------- 修复 5
+print('\n=== 修复 5：接线错误（2026-11-15 补） ===')
+#
+# 背景：修复 1a（紧包络）与修复 3（转向）实现都对，但**接线错了**——
+# 它们分别写在 _retreat_from_occupied_cells 和
+# _fail_return_home_before_dispatch 里，而实际拒绝返航的路径是
+# _schedule_return_home_retry。实测 p14w1_cov_1_4220：36 次
+# `too close to occupied` 而日志里一条 R1 都没有。
+#
+# 这类错误不报错、只静默失效，必须用断言钉住。
+
+seg = block(cmgr, 'def _schedule_return_home_retry', 6000)
+check('5.1 实际失败路径里存在紧包络分支',
+      '_tight_ok' in seg and 'return-home tight retreat' in seg,
+      '缺它则 return_home_retreat_enabled=false 时一步也不动')
+check('5.2 紧包络分支不再被"两个宽包络开关同时为真"挡住',
+      'elif _tight_ok' in seg)
+check('5.3 紧包络分支内部调用 _retreat_from_occupied_cells',
+      "_retreat_from_occupied_cells('return_home')" in seg)
+check('5.4 倒车不可用时在该路径里也试转向',
+      'return-home escape turn' in seg)
+check('5.5 紧包络分支被 _safe_call 包住',
+      "_safe_call(\n                'return-home tight retreat'" in seg
+      or "'return-home tight retreat'" in seg)
+check('5.6 宽包络分支仍然保留（回退路径没被破坏）',
+      '_wide_ok and _failure_ok' in seg)
+# ★ 实测 p14w2_cov_r1：前方 3.12 m 开阔却仍倒车 0.10 m —— 无条件分支纯浪费。
+check('5.9 紧包络分支有"确实被贴住"判据，不会每个重试都倒车',
+      '_looks_stuck' in seg and 'no retreat needed' in seg,
+      '没有它则开阔空间也会倒车，与回家方向相反')
+check('5.10 判据包含 three 种触发源（reason / front_blocked / 前门带）',
+      "'too close to occupied' in str(reason)" in seg
+      and "getattr(self, 'front_blocked', False)" in seg
+      and 'float(_front) < _gate' in seg)
+
+# 三条路径都必须能触达脱困：这是"接线"的核心
+def reachable(fn_marker, call_marker, window=6000):
+    s = block(cmgr, fn_marker, window)
+    return call_marker in s
+
+check('5.7 _fail_return_home_before_dispatch 里仍有倒车+转向',
+      reachable('def _fail_return_home_before_dispatch',
+                'return-home escape turn'))
+check('5.8 _schedule_return_home_retry 里现在也有脱困',
+      reachable('def _schedule_return_home_retry',
+                'return-home escape turn'))
+
 print('\n=== 交叉检查：不得引入新隐患 ===')
 
 # 直发 cmd_vel 的脱困必须仍有限速（不能变成无限速倒车）

@@ -1242,6 +1242,14 @@ class Arbiter(Node):
         # 车端 manager 的状态流里带 escape/blocked/retreat 等事件
         self.create_subscription(String, '/stemm_cartographer/nav_state',
                                  self.on_nav_state, 10)
+        # P2（2026-11-15）：订阅车端 manager 发布的覆盖率（NCR）。
+        # **纯观测**：只写进 timeline.jsonl 供离线标定阈值，不参与任何决策。
+        # 为什么让 arbiter 代收而不是自己算：arbiter 已有 1 Hz 的 timeline
+        # 落盘通道，且它本来就在 /map 上做大量计算；在 manager 里算完发布一次，
+        # 比让 arbiter 再算一遍便宜（NCR 实测 7~12 ms）。
+        self._coverage_msg = None
+        self.create_subscription(String, '/exploration_coverage',
+                                 self.on_coverage, 10)
         self.create_subscription(GoalStatusArray, '/navigate_to_pose/_action/status',
                                  self.on_status, 10)
         # V2-③：planner_server 的 /plan 末位点 = 正在执行的目标
@@ -1407,6 +1415,20 @@ class Arbiter(Node):
                         pass
         self.mgr_busy = busy
         self._active_uuid = uu
+
+    def on_coverage(self, m):
+        """P2：接收车端 manager 的覆盖率消息（纯观测，不参与决策）。
+
+        解析失败只记一次告警，绝不抛异常 —— 它只影响 timeline 的一个字段，
+        不能因为它把仲裁器搞崩。
+        """
+        try:
+            self._coverage_msg = json.loads(m.data or '{}')
+        except Exception as exc:                          # noqa: BLE001
+            if not getattr(self, '_coverage_bad_logged', False):
+                self._coverage_bad_logged = True
+                self.get_logger().warn(
+                    f'coverage message unparsable ({exc}); timeline will show null')
 
     def on_nav_state(self, m):
         txt_raw = m.data or ''
@@ -2960,6 +2982,33 @@ class Arbiter(Node):
                 'sweep_ms_prev': round(self._sweep_ms_tick_prev, 2),
                 'sweep_ms_sum': round(self._sweep_ms_sum, 1),
             }
+            # P2（2026-11-15）：覆盖率观测。仅当收到车端消息时才有值，
+            # 收不到就写 None（**不写 0**，以便区分"没测到"与"测到 0"）。
+            cov = self._coverage_msg
+            if isinstance(cov, dict) and cov:
+                row.update({
+                    'ncr': cov.get('ncr'),
+                    'ncr_interior': cov.get('ncr_interior'),
+                    'ncr_nav_known': cov.get('navigable_known'),
+                    'ncr_reach_unknown': cov.get('reach_unknown'),
+                    'ncr_reach_exterior': cov.get('reach_unknown_exterior'),
+                    'ncr_reach_interior': cov.get('reach_unknown_interior'),
+                    'ncr_reach_ok': cov.get('reach_ok'),
+                    'ncr_elapsed': cov.get('elapsed_sec'),
+                    'ncr_streak': cov.get('streak'),
+                    'ncr_converged': cov.get('converged'),
+                    'ncr_stalled': cov.get('stalled'),
+                    'ncr_reason': cov.get('reason'),
+                })
+            else:
+                row.update({
+                    'ncr': None, 'ncr_interior': None,
+                    'ncr_nav_known': None, 'ncr_reach_unknown': None,
+                    'ncr_reach_exterior': None, 'ncr_reach_interior': None,
+                    'ncr_reach_ok': None, 'ncr_elapsed': None,
+                    'ncr_streak': None, 'ncr_converged': None,
+                    'ncr_stalled': None, 'ncr_reason': None,
+                })
             if extra:
                 row.update(extra)
             self._tl_fh.write(json.dumps(row) + '\n')

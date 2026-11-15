@@ -38,6 +38,23 @@ class SessionDriver(Node):
     def __init__(self):
         super().__init__('sim_session_driver')
         self.explore_sec = float(self.declare_parameter('explore_sec', 180.0).value)
+        # ★ P2-3（2026-11-15）：终止判据从"定时器"改为"可通行面积覆盖比例"。
+        #
+        # 用户明确要求（2026-11-15）：
+        #   1. 判据不是"没有前沿可选"，而是可通行面积已覆盖比例
+        #   2. 去掉 180 s 一到就结束探索的行为
+        #
+        # 现在的语义：
+        #   coverage_terminate=true → 收到 manager 的 converged=true 才结束；
+        #       `explore_sec` 降级为**看门狗**（explore_watchdog_sec），
+        #       触发时记为 'explore_watchdog'，与正常收敛**分开记账**。
+        #   coverage_terminate=false → 完全回到旧行为（定时器），便于回退对照。
+        self.coverage_terminate = bool(
+            self.declare_parameter('coverage_terminate', False).value)
+        self.explore_watchdog_sec = float(
+            self.declare_parameter('explore_watchdog_sec', 600.0).value)
+        self._cov = None          # 最近一次覆盖率消息
+        self._cov_reason = ''     # 结束原因（ncr_threshold / explore_watchdog …)
         # 用户 2026-10-26 追加规则：探索限时到时若"候选任务还在执行"，**不许中断它去返航**，
         # 等这个候选到达/取消/失败之后再返航；0 = 关闭（旧行为），默认 20 s 上限兜底。
         self.return_wait_goal = float(self.declare_parameter('return_wait_goal_sec', 20.0).value)
@@ -60,6 +77,9 @@ class SessionDriver(Node):
         # 车端 manager 的返航完成信号（含"姿态超时后按位置完成"的兜底路径）
         self.create_subscription(String, '/stemm_cartographer/nav_state',
                                  self._on_nav_state, 10)
+        # P2-3：覆盖率终止判据。话题由车端 manager 发布（每 2 s 一帧）。
+        self.create_subscription(String, '/exploration_coverage',
+                                 self._on_coverage, 10)
         # /map 是 RELIABLE+TRANSIENT_LOCAL（2 s/帧）；自己缓存最后一帧，结束时不依赖 map_saver 时机
         from rclpy.qos import DurabilityPolicy, QoSProfile, ReliabilityPolicy
         qos_map = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE,
@@ -107,8 +127,16 @@ class SessionDriver(Node):
         self.nav_cli = ActionClient(self, NavigateToPose, 'navigate_to_pose')
         self._start_clock_resampler_for_return()   # 栈启动即启用（滞后插值，不会超前引擎时间）
         self.create_timer(1.0, self._tick)
+        # 如实报告当前终止模式 —— 2026-11-15 踩过"以为开了覆盖率终止、
+        # 其实参数没传到"的坑，所以这行必须区分两种模式。
+        if self.coverage_terminate:
+            mode = ('覆盖率终止（explore_sec=%.0fs 仅作停车偏置参考；'
+                    '看门狗 %.0fs）' % (self.explore_sec,
+                                       self.explore_watchdog_sec))
+        else:
+            mode = '定时器 %.0fs（覆盖率终止未启用）' % self.explore_sec
         self.get_logger().info(
-            f'session_driver 就绪：探索限时 {self.explore_sec:.0f}s（从收到第一个探索目标算起）；'
+            f'session_driver 就绪：终止判据={mode}；探索起点=收到第一个探索目标；'
             f'返航不限时（>{self.hard_warn:.0f}s 仅告警）；地图输出 {self.map_out}')
 
 
@@ -162,6 +190,18 @@ class SessionDriver(Node):
         if ('return' in blob) or ('home' in blob) or ('finalizing' in blob) or ('shutdown' in blob):
             return False
         return True
+
+    def _on_coverage(self, msg):
+        """P2-3：缓存管理器的覆盖率消息（纯缓存，判定在 _tick 里做）。
+
+        解析失败不影响主流程：只当没收到，下一帧再试。
+        """
+        try:
+            o = json.loads(msg.data or '{}')
+        except Exception:                       # noqa: BLE001
+            return
+        if isinstance(o, dict) and o:
+            self._cov = o
 
     def _on_nav_state(self, msg):
         raw = msg.data or ''
@@ -477,14 +517,39 @@ class SessionDriver(Node):
 
         # 阶段2：到点则触发"结束建图"（与实机同一条服务）
         if not self.done_sent:
-            if now - self.t_first_goal >= self.explore_sec:
+            # ★ P2-3：判定"该结束了"的依据。
+            # 旧：到 explore_sec 无条件结束（定时器，Not A 收敛判据）。
+            # 新：coverage_terminate=true 时以 manager 的 converged 为准，
+            #     explore_sec 降级为看门狗；两者**分开记账**，便于统计
+            #     "多少轮是真探完、多少轮是兜底掐断"。
+            if self.coverage_terminate:
+                cov = self._cov or {}
+                converged = bool(cov.get('converged'))
+                if converged:
+                    self._cov_reason = str(cov.get('reason') or 'ncr_threshold')
+                    why = ('覆盖率达标 ncr_interior=%s threshold=%s（%s）'
+                           % (cov.get('ncr_interior'), cov.get('threshold'),
+                              self._cov_reason))
+                elif now - self.t_first_goal >= self.explore_watchdog_sec:
+                    self._cov_reason = 'explore_watchdog'
+                    why = ('覆盖率看门狗触发：%.0fs 内未达标（ncr_interior=%s）'
+                           % (self.explore_watchdog_sec,
+                              cov.get('ncr_interior')))
+                else:
+                    return          # 没达标也没超看门狗 → 继续探索
+            else:
+                if now - self.t_first_goal < self.explore_sec:
+                    return
+                self._cov_reason = 'explore_sec_timer'
+                why = '探索限时到（%.0fs，定时器模式）' % self.explore_sec
+            if True:
                 # 用户规则（2026-10-26）：正在执行的候选不许被打断 —— 等它到/取消/失败。
                 if self.return_wait_goal > 0 and self._goal_in_progress():
                     if self._rwg_started is None:
                         self._rwg_started = now
                         self.get_logger().info(
-                            '=== 探索限时到（%.0fs）但候选任务仍在执行 → 等它结束再返航（上限 %.0fs）==='
-                            % (self.explore_sec, self.return_wait_goal))
+                            '=== %s 但候选任务仍在执行 → 等它结束再返航（上限 %.0fs）==='
+                            % (why, self.return_wait_goal))
                     if now - self._rwg_started < self.return_wait_goal:
                         return
                     self.get_logger().warn(
@@ -508,7 +573,16 @@ class SessionDriver(Node):
                         self._standoff_deadline = now + self.standoff_timeout
                         return
                 self.get_logger().info(
-                    f'=== 探索限时到（{self.explore_sec:.0f}s），调用 set_mapping_done 结束建图 ===')
+                    '=== 结束探索（%s）：调用 set_mapping_done 结束建图 ===' % why)
+                # 记账：结束原因写进 nav_state 之外的独立日志行，供离线统计
+                # "多少轮是真探完、多少轮是被看门狗掐断"。
+                cov_final = self._cov or {}
+                self.get_logger().info(
+                    '=== exploration_end_reason=%s ncr_interior=%s known=%s '
+                    'elapsed=%s ==='
+                    % (self._cov_reason, cov_final.get('ncr_interior'),
+                       cov_final.get('known_total'),
+                       cov_final.get('elapsed_sec')))
                 self.t_done_called = now
                 self.done_sent = True
                 self._start_clock_resampler_for_return()
@@ -534,11 +608,49 @@ class SessionDriver(Node):
         # 那段等待里车可能原地转向（4 s 位移 < 0.06 m ⇒ _moved_recently()=False），
         # 兜底就会被误触发，第 3 次还会 cancel-all 把正在执行的目标砍掉 ——
         # 正好破坏刚加的"不中断"语义。所以 manager 明确在等的时候一律不插嘴。
+        #
+        # ★ 2026-11-15（X）：守卫必须**覆盖整个返航过程**，不只是一个状态。
+        # 实测 p14vZ：覆盖率终止后返航正常启动，但途中车短暂静止（规划/让行），
+        # `_moved_recently()` 变 False ⇒ 兜底误判"返航未启动" ⇒ 重发
+        # set_mapping_done ⇒ 第 3 次 cancel-all 把**正在执行的返航目标自己砍掉**
+        # ⇒ `return-home goal was canceled` ×2 + `status 6`（ABORTED）⇒ 返航失败。
+        # 也就是说这个兜底会把"本来能成功的返航"亲手打断。
+        # 现在：只要 manager 的状态表明它正在处理返航（或已交付返航目标），
+        # 一律不插嘴。
+        _nav_state = str((getattr(self, 'nav', None) or {})
+                         .get('navigation_state') or '')
+        _RETURN_HOME_STATES = (
+            'mapping_done_waiting_active_goal',
+            'mapping_done_active_goal_reached',
+            'mapping_done_return_home_pending',
+            'return_home_rearmed',
+            'return_home_retry_recovery',
+            'return_home_retry_after_reverse',
+            'return_home_retry_after_turn',
+            'returning_home',
+        )
         _waiting_active_goal = (
-            str((getattr(self, 'nav', None) or {}).get('navigation_state') or '')
-            == 'mapping_done_waiting_active_goal')
+            _nav_state in _RETURN_HOME_STATES
+            or _nav_state.startswith('return_home_'))
+        # ★ 2026-11-15（Z）：**有活跃导航目标就一律不插嘴** —— 这是硬语义。
+        #
+        # 实测 p14w2_cov_r1：状态序列里有 `executing`（正在执行某个前沿目标），
+        # 它既不在 _RETURN_HOME_STATES 里、也不以 return_home_ 开头，于是上面的
+        # 状态守卫照样放行 ⇒ "返航未启动" 重发 3 次 ⇒ cancel-all ⇒
+        # **把正在执行的导航目标砍掉** ⇒ `return-home goal was canceled` +
+        # `status 6`(ABORTED)。这直接违背用户要求：
+        #   「返航前必须要确认是否有导航任务，若有，则等待此轮导航结束、到点后
+        #     才开始返航，而不是中断正在进行的任务。」
+        #
+        # 只靠状态字符串枚举永远会漏（manager 的状态机有几十个态，"正在执行
+        # 某目标"这一点与状态名并不一一对应）。改用 manager 直接发布的
+        # `nav_goal_active` 布尔量（manager.py 状态 JSON，1 Hz）：只要它 True，
+        # 车就一定在执行某个导航目标，此时重发/取消都是自伤。
+        _nav_goal_active = bool(
+            (getattr(self, 'nav', None) or {}).get('nav_goal_active'))
         if (self.return_home_ok is None and self.t_done_called is not None
                 and not _waiting_active_goal
+                and not _nav_goal_active
                 and not self._moved_recently()
                 and now - self.t_done_called > 3.0
                 and now - self.t_done_called > 3.0 * (getattr(self, '_retries', 0) + 1)
@@ -549,7 +661,10 @@ class SessionDriver(Node):
             try:
                 self._call_done()
                 # P0-1：连续 3 次重发仍不启动 ⇒ 判定"等活跃目标取消卡住"，主动 cancel-all
-                if self._retries >= 3 and self._cancel_sent < 2:
+                # 但取消前再确认一次没有活跃目标：宁可慢，也不许打断进行中的任务。
+                if (self._retries >= 3 and self._cancel_sent < 2
+                        and not bool((getattr(self, 'nav', None) or {})
+                                     .get('nav_goal_active'))):
                     self._cancel_sent += 1
                     self._cancel_all_goals()
             except Exception as exc:                 # noqa: BLE001
@@ -674,6 +789,12 @@ class SessionDriver(Node):
         action_msgs/srv/CancelGoal 的约定：goal_info.goal_id.uuid 与 stamp 全 0 ⇒ 取消全部。
         manager 的"等活跃目标取消"分支因此可以继续推进，不必等它自己超时。
         """
+        # 最后一道闸：哪怕上游判错，只要 manager 说还有活跃目标，就绝不 cancel。
+        if bool((getattr(self, 'nav', None) or {}).get('nav_goal_active')):
+            self.get_logger().warn(
+                '拒绝 cancel-all：manager 报告 nav_goal_active=True'
+                '（不中断进行中的导航任务）')
+            return
         if not self.cancel_cli.wait_for_service(timeout_sec=1.0):
             self.get_logger().warn('cancel_goal 服务不可用，跳过主动取消')
             return

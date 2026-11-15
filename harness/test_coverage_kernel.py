@@ -25,11 +25,13 @@ import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-REAL_PKG = ('/home/kbf/wheeltec_ros2/src/stemm_cartographer_exploration/'
-            'stemm_cartographer_exploration')
+# 内核归属 stemm_nav2_manager —— 这是依赖方向的正确一侧：
+# stemm_cartographer_exploration 是它的子类包（cartographer_manager 继承
+# StemmNav2Manager），反向 import 会循环。
+REAL_PKG = '/home/kbf/wheeltec_ros2/src/stemm_nav2_manager'
 sys.path.insert(0, REAL_PKG)
 
-from coverage_kernel import (          # noqa: E402
+from stemm_nav2_manager.coverage_kernel import (   # noqa: E402
     ConvergenceTracker, coverage_stats, is_converged,
     masks_from_occupancy_grid, masks_from_pgm,
 )

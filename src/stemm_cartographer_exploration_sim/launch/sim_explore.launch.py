@@ -398,6 +398,15 @@ def generate_launch_description():
         output='screen',
         parameters=[{'use_sim_time': use_sim_time,
                      'explore_sec': explore_sec,
+                     # ★ P2-3（2026-11-15）：终止判据改为覆盖率。
+                     # 注意：这两个必须传给 **session_driver**（决策者），
+                     # 而不是 frontier_arbiter。2026-11-15 第一版插到了 arbiter
+                     # 的参数里，结果 coverage_terminate 根本没到 driver，
+                     # 日志仍旧显示"探索限时 240s"—— 一次典型的"改了但没生效"。
+                     'coverage_terminate':
+                         LaunchConfiguration('coverage_terminate'),
+                     'explore_watchdog_sec':
+                         LaunchConfiguration('explore_watchdog_sec'),
                      'return_wait_goal_sec': LaunchConfiguration('return_wait_goal_sec'),
                      'map_out': map_out}])
 
@@ -429,6 +438,13 @@ def generate_launch_description():
         DeclareLaunchArgument('spawn_y', default_value='0.0'),
         DeclareLaunchArgument('spawn_yaw', default_value='0.0'),
         DeclareLaunchArgument('explore_sec', default_value='180.0'),
+        # ★ P2-3（2026-11-15）：覆盖率终止判据。
+        #
+        # coverage_terminate=true 时，explore_sec 不再是终止依据，降级为看门狗
+        # （explore_watchdog_sec，默认 600 s）。
+        # 默认 false = 回到旧的定时器行为，便于 A/B 对照与回退。
+        DeclareLaunchArgument('coverage_terminate', default_value='false'),
+        DeclareLaunchArgument('explore_watchdog_sec', default_value='600.0'),
         DeclareLaunchArgument('return_wait_goal_sec', default_value='20.0',
             description='探索限时到点时若候选仍在执行，等它结束再返航的上限秒数（0=关闭，旧行为）'),
         DeclareLaunchArgument('frontier_source', default_value='rrt'),
