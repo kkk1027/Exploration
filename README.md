@@ -321,8 +321,8 @@ narrow_floor_m = body_width + 2 × side_tight_m     # 0.47 + 2×0.055 = 0.58
 | 返航可靠性（4 类死锁 + 3 类接线修复） | ✅ 已验证（基线 4/4；近期 8 轮 7 PASS） |
 | **覆盖率型终止判据（NCR）** | ✅ 已验证（模拟侧，实测省 76% 时长） |
 | 车体画像 + 阈值派生（构型无关的**数据层**） | ✅ 已验证（差速 profile 0 容差等价） |
-| 扫掠可通行性内核 | ✅ 已实现，**影子模式默认关闭**（数据不支持切换口径） |
-| 区域级（几何分解）调度 | ❌ 未实施（仅计划，`docs/S5_构型无关适配层_实施计划.md`） |
+| 扫掠可通行性内核 | ✅ 已实现，但**从未在真实轮次开启**（`sweep_shadow=false`，641 轮中 0 轮含 sweep 字段）。仅用合成栅格验证几何正确性（含 1.41× 斜向高估），**未在真实地图评估两种口径的分歧率** ⇒ 属“未做的实验”，不是“做过但结果不利” |
+| 区域级（几何分解）调度 | ❌ 未实施（仅计划） |
 | 全向 / 阿克曼构型 | ⚠️ 画像已建，**代码无实测验证**（只在差速上跑过） |
 | 跨会话地图续建 | ❌ 未实现（单会话模型） |
 | 异世界泛化 | ❌ 未验证（只测一个 world） |
@@ -338,10 +338,17 @@ narrow_floor_m = body_width + 2 × side_tight_m     # 0.47 + 2×0.055 = 0.58
 按严重程度排序，不隐瞒：
 
 1. **返航仍未 100%。** 近期 8 轮里 7 轮 PASS，1 轮（`p14x2_nomin`）FAIL 于
-   `return_home`。冻结基线 `p14x3` 是 4/4，但样本量小，不能当作稳定结论。
-2. **两套验收工具判定不一致。** `evaluate.py` 与 `report.py` 各自实现判据，
-   已出现同一轮 `evaluate.json` PASS 而 `report.md` FAIL 的情况
-   （`round_20261115-204738_s4manual`）。**在单一口径统一前，任何"通过率"都不宜对外引用。**
+   `return_home`。冻结基线 `p14x3` / `p14x4` 均为 4/4，但样本量小，不能当作稳定结论。
+   **另需注意**：地图原点被家具围住不可规划时，靠 `by_geometry` 位置兜底
+   （停在 1.03~2.0 m 且已静止）判定“到位”。写结论时须区分“到点”与“就近静止”。
+2. ~~两套验收工具判定不一致~~ → **已修复（2026-11-15）。**
+   历史问题：`evaluate.py` 与 `report.py` 各自实现判据，2026-10-22~11-15 期间
+   **166/955 轮（17.4%）判定相反**，最近 14 轮全部不一致。两个成因：
+   ① 硬倒车只判 `not assist` 不看倒车包络（126 轮）；
+   ② `done` 事件识别有 2 条死路径（50 轮）。
+   现已改为**直接读 `evaluate.json`**（单一来源），并新增
+   `harness/test_report_consistency.py` 13 条断言锁定。全量 1017 轮复扫：
+   返航到点但时间不可算的轮次 3 → **0**。
 3. **走廊分级修复只证明"没变坏"。** 4 轮基线里该路径未被触发，未构造出复现场景，
    不能宣称修好。
 4. **"先远后近"排序未通过验收。** 已实现但默认关闭（`frame_far_first=false`），
@@ -410,27 +417,218 @@ python3 harness/p13_stats.py 'logs/round_*myexp_a*' 'logs/round_*myexp_b*' # 配
 
 ---
 
-## 文档索引
+## 操作手册
 
-| 文档 | 主题 |
-|---|---|
-| `docs/S5_落实情况报告_20261115.md` | **最近一轮落地报告**（P0 返航、P2 覆盖率、P1 取消决策） |
-| `docs/S5_实施报告.md` | S5 各阶段实测过程（tick 性能、RobotProfile、扫掠影子） |
-| `docs/S5_构型无关适配层_实施计划.md` | 原计划（含 P1 取消的成本记录） |
-| `docs/探索建图_现状与设计框架.md` | 整体设计框架（架构、分层、参数面、数据流） |
-| `docs/P13_实施说明.md` | **主线全过程**：宽度测量修正 / 窄道硬门拆分 / 原地改向（S1~S4）与全部 A/B 数据 |
-| `docs/P13_基线.md` | 派发质量基线（含幻影到达的定义与剔除口径） |
-| `docs/P13_文献调研.md` | 7 个开源工作的跨层判决传递核验 |
-| `docs/P7_V2通道治理验证报告.md` | 把 manager 自采样收回仲裁（27% → 1%） |
-| `docs/P12_后置纠偏_GoalUpdater方案.md` | 后置纠偏与 BT 跨目标污染 |
-| `docs/P14_候选落点倾向.md` | 先远后近排序 + P0 每次失败的深度分析 |
-| `P1_候选生成缺陷清单.md` | 候选生成链路缺陷（含走廊测宽几何错误） |
-| `P6_V1候选闸门验证报告.md` | 一次完整的正面实验 + 回滚 |
-| `VISION_方案A落地记录.md` | 深度相机视觉障碍层 |
-| `docs/patches/nav2_goalupdater_fix.patch` | Nav2 上游缺陷修复 |
-| `docs/WORKFLOW.md` | 实验工作流与观测字段口径 |
+### 三条铁律
 
-根目录 `P0~P5`、`PROGRESS_*`、`S0_*` 是更早期的阶段记录，保留备查。
+1. **一次只跑一轮**（`flock /tmp/stemm_round.lock`）；批次也是串行。
+2. **改动可回退**：开关默认关，或 `--restore` 逐字节还原；改完立刻 `git commit`。
+3. **S0 零接触优先**：出现物理接触即回退该改动，即使别的指标变好。
+
+> 看到"点云/地图不贴合或像镜像"先跑判定，别猜：
+> `python3 harness/scan_map_align.py --frames 15 --tf-warm 5`
+> （as-is <30% 且 y-flip >90% ⇒ 地图行序错）。长跑挂 `python3 harness/align_guard.py --period 10 &`
+
+### 跑一轮
+
+```bash
+cd ~/stemm_exploration_sim_ws
+PASS_W=1.05 VISION_DECAY=20 RECOVERY_BT=replan VISION=1 RVIZ=false GUI=false ROUND_MARGIN=15 \
+  bash harness/round.sh <tag> 60          # 参数：<tag> <探索秒数>
+```
+
+起栈约 90 s，探索后按 `ROUND_MARGIN` 等返航。产物在 `logs/round_*_<tag>/`。
+
+### 跑一批（正式 A/B）
+
+```bash
+export PASS_W=1.05 VISION_DECAY=20 RECOVERY_BT=replan   # 与基线完全一致，只改被测开关
+export <被测开关>=1
+bash harness/batches/run_p0_shots.sh <前缀> 5           # 5 轮 180 s
+python3 harness/batches/compare_batches.py nosp <前缀>   # 与基线对照
+```
+
+批次每轮前自动清场：`stack_kill` → 删锁 → 等 `gzserver` 归零 → 清 `/dev/shm`。单批 5 轮 ≈ 23~25 分钟。
+
+### 不用 Gazebo 的快测（改 Nav2 参数时首选）
+
+```bash
+bash harness/nav_sim.sh                      # 调优配置
+NAV_ARGS_OFF=1 bash harness/nav_sim.sh       # 原厂参数对照
+python3 harness/bench_ab.py --configs orig,tuned --timeout 35
+```
+
+`fake_base` 吃 `/cmd_vel` 做运动学积分，用离线地图 raycast 出 `/scan`（含 110°~240° 盲区），
+发 `/odom_combined` + TF；起栈约 10 s，无物理引擎、无接触噪声。
+
+### 看数口径（固定，不要临时改）
+
+| 指标 | 来源 | 说明 |
+|---|---|---|
+| S0 零物理接触 | `evaluate.json → collision.physical_contacts` | **最高优先** |
+| S1 零"卡住" | `digest.md` | cmd≠0 且 ≥3 s 无位移 |
+| 最长原地挪动 | `digest.md` 卡死清单（**只取"有活跃目标"的行**） | 空等类会污染，必须剔除 |
+| ≥30 s 长停滞次数 | 同上 | 比"每轮事件数"稳健 |
+| 覆盖格 | `compare_batches.py` | 0.5 m 格覆盖数 |
+| 派发来源构成 | `digest.md` | rrt / manager / home |
+| 计划净宽 | `nav_plan_audit` / `plan_audit.jsonl` | 只在台架或开启 `PLAN_GUARD_LOG` 时有 |
+
+**判定：任一硬指标退化即回退；判"保留"必须同时满足"目标指标改善 + S0 不变 + 覆盖格下降 ≤15%"。**
+
+### 改参数的正确姿势
+
+```bash
+python3 harness/nav_params.py --check                 # 看当前注入状态
+python3 harness/nav_params.py --apply --vx-max 0.35 --allow-unknown false --motion REEDS_SHEPP
+python3 harness/nav_params.py --restore               # 逐字节还原
+```
+
+- `nav_params.py` 是**唯一**的 Nav2 参数注入器，不要再用 `patch_nav_speed.py` 等旧脚本（会互相覆盖）。
+- 布尔型开关**必须传 `true/false`**（传 `1` 会类型不匹配把节点打崩）。
+- 新增可执行文件后要 `colcon build --packages-select stemm_cartographer_exploration_sim`。
+
+### 提交前自检
+
+```bash
+python3 harness/test_arbiter_attrs.py && python3 harness/test_arbiter_static.py \
+ && python3 harness/test_param_types.py && python3 harness/test_driver_hooks.py \
+ && python3 harness/test_launch_dryrun.py && python3 harness/test_harness_setu.py \
+ && python3 harness/test_method_calls.py
+bash -n harness/round.sh && bash -n harness/batches/run_p0_shots.sh
+git status --porcelain          # 确认没有残留注入
+```
+
+提交信息模板：`fix/feat(<层>): 做了什么 —— 为什么(带数据) —— 开关与回退方式`
+
+**每轮产物里必看 `dead_nodes.txt`**：任何节点 Traceback 都会让整轮"安静地少一个节点"，
+该轮**不可作为实验数据**。
+
+### 收工检查
+
+```bash
+bash harness/stack_kill.sh term      # 整栈按可执行路径枚举清理，校验 0 残渣
+python3 harness/nav_params.py --restore
+python3 harness/vision_nav_params.py --restore
+rm -f /dev/shm/fastrtps_* /tmp/stemm_round.lock
+```
+
+### 已知环境陷阱
+
+ros2cli daemon 污染（每轮前 `ros2 daemon stop`）、`ROS_LOCALHOST_ONLY=1`、
+空 launch 参数、`bash -c` 行内注释、`pkill` 自伤、timeline 环境变量兜底、
+PGM 行号翻转、批次切换清场。
+
+---
+
+## 基线复现：三个必须知道的坑
+
+基线冻结成 jsonl 后，任何人可重算中位数与配对差值，不必相信文档里的数字。
+生成方式：`python3 harness/freeze_baseline.py <tag...> -o harness/baselines/<name>.jsonl`
+（缺失字段写 `null` 而非 `0`，以区分"没测到"与"测到 0"）。
+
+| 文件 | 批次 | 轮数 | 出生点 | 用途 |
+|---|---|---|---|---|
+| `p4_pre_p0.jsonl` | `p4base` × 10 + `p4far` × 10 | 20 | 随机（5 选 1） | P0 改造**前**历史留档 |
+| `p14vS_p0_smoke.jsonl` | `p14vS_far` × 4 + `p14vS_base` × 4 | 8 | 固定单点 | P0 中间冒烟 |
+| `p14vU_p0_paired.jsonl` | `p14vU_far` × 10 + `p14vU_base` × 10 | 20 | 5 点 × 各 2 轮，同点交替 | **P0 正式配对（结论来源）** |
+| `p14x3_cov_terminate.jsonl` | `p14x3_corr` | 4 | 4 固定点 | **当前回归基线** |
+| `p14x4_cons.jsonl` | `p14x4_cons` | 4 | 4 固定点 | 验收口径统一后的补充基线 |
+
+### 坑 1：`p4_pre_p0` 的"接触 323"不能当基线用
+
+323 次里 **313 集中在同一轮**，组均值被单轮灾难拉爆；且两组用**随机出生点、非配对**。
+**P0 正式结论只取 `p14vU`（固定出生点、同点交替、配对检验）。**
+
+### 坑 2：组中位数之差 ≠ 配对差值中位数
+
+`p14vU` 的两个数字容易混淆：
+- 组中位数之差 = 66,933 − 66,342 = **+591**
+- 配对差值中位数 = median(far_i − base_i) = **+157**
+
+前者把"不同出生点差异"也算进去了；**判定用配对值**（`harness/p0_paired.py`）。
+
+### 坑 3：`known` 末值不等于覆盖率
+
+`known` 是"已知格数（空闲 + 占据）"，随地图尺寸变化（本轮 233–236 × 385–387 @ 5 cm）。
+跨批次只能看**同批次内相对差异**，不要拿绝对值和别的世界比。
+
+### 复核
+
+```bash
+python3 harness/p0_paired.py --pairs /tmp/p14vU_pairs.txt --pattern p14vU
+```
+
+---
+
+## Nav2 补丁：GoalUpdater 跨目标污染
+
+### 为什么需要
+
+`nav2_behavior_tree` 的 `GoalUpdater` 装饰器用**实例成员** `last_goal_received_`
+缓存 `/goal_update`，该成员**永不清理**，且判断完全押在时间戳比较上。
+行为树里 `input_goal.header.stamp` 常常是 0，于是 `T > 0` 恒真 ⇒ **每个新目标都被
+替换成历史上那一次的纠偏点** ⇒ 车本就在附近 ⇒ `isGoalReached()` 立即命中 ⇒ 30 ms「假到达」。
+
+实测后果：**179/226 = 79.2% 的 reached 属于这一类**，而 inplace 未触发的五轮幻影数 = 0，
+相关性 100%。
+
+### 修复内容
+
+1. **换目标即清缓存**：`input_goal` 位置变化 > 5 cm 判定为新目标，清空缓存。
+2. **`prev` 记录输出而非输入**：BT 里 `output_goal` 会写回 `{goal}`，
+   下一拍输入恰等于上拍输出；若 `prev` 记输入，每两拍误判一次"换了新目标"，
+   纠偏点会在「应用 → 清空」之间抖动。
+
+### 应用
+
+```bash
+cd <ws>/src/navigation2-humble/nav2_behavior_tree
+git apply -p1 /path/to/docs/patches/nav2_goalupdater_fix.patch
+
+cd <ws>
+colcon build --packages-select nav2_behavior_tree --symlink-install \
+  --cmake-args -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+```
+
+`-DBUILD_TESTING=OFF` 必需：未装 `test_msgs` 时 `find_package(test_msgs)` 会让 cmake 直接失败。
+
+### 验证是否真生效
+
+```bash
+ls -l install/nav2_behavior_tree/lib/libnav2_goal_updater_node_bt_node.so
+ros2 topic info /goal_update
+# 必须看到 Subscription count: 1
+```
+
+**看参数值或看日志都不作数。** 只改 `bt_navigator.default_nav_to_pose_bt_xml` 无效 ——
+`stemm_cartographer_auto_mapping.launch.py` 会用 `exploration_behavior_tree` 参数
+把行为树显式传给 manager，绕过 `bt_navigator` 默认树。实测那时订阅者数 = 0。
+
+### 配套行为树
+
+需一份挂了 `GoalUpdater` 的行为树，见车端仓库：
+`src/stemm_cartographer_exploration/config/stemm_cartographer_nav_to_pose_goalupdater.xml`
+（与原树逐节点相同，唯一差异是把 `Fallback name="ComputePathIfNeeded"` 整段包进
+`GoalUpdater(input_goal="{goal}", output_goal="{goal}")`）。
+
+### 已知副作用
+
+启用 inplace 后，manager 的 `reached; ... error=(xy=X m)` 会**天然偏大**，
+因为仲裁器把目标 G 挪到 G*，controller 到 G* 即 succeeded，manager 仍按 G 记账。
+实测：车到 G\* 仅 0.122 m，manager 记录误差 2.875 m，存活 37.5 s（非 30 ms 幻觉）。
+
+**所以「到达误差」这一指标在启用 inplace 前后不可直接比较。**
+判断真伪用 `harness/s4_ghost_audit.py`：实测 10 轮 46 条到达，幻觉 0 条。
+
+---
+
+## 文档
+
+**本文件即全部说明。** 历史阶段记录（`P0`~`P14`、`S5` 系列、论文计划、
+交接文档、运行摘要）已从前端移除，需要追溯时查 git 历史。
+
+保留在仓库中的另一个 Markdown 是 `AGENTS.md`（16 行），内容是给 AI 协作助手的
+语言与工程纪律约定，与本文件不重复。
 
 ---
 
